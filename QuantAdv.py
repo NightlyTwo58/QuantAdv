@@ -715,6 +715,13 @@ def main():
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
+        
+        try:
+            int4_qat = prepare_qat(fp32, bits=4, finetune_loader=finetune_loader, epochs=3)
+            model_registry[f"{arch_key}_int4_QAT"] = (int4_qat, fp32)
+        except Exception as e:
+            print(f"  [FAIL] int4 QAT for {arch_key}: {e}")
+            traceback.print_exc()
 
     print("\nRegistry built:", list(model_registry.keys()))
 

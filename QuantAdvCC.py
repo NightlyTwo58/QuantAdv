@@ -212,6 +212,54 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
     set_ste_mode(m, False)
     print("[qat] QAT fine-tuning complete.")
     return m.eval()
+def prepare_qat_adv(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3, eps=8/255, alpha=2/255, steps=10):
+    print(f"[qat_adv] Preparing Adversarial QAT model (bits={bits}, epochs={epochs}, eps={eps:.4f})...")
+    m = convert_to_quant(fp32_model, bits, quant_weight=True, quant_act=True)
+    
+    raw_model = m
+    if torch.cuda.device_count() > 1:
+        print(f"[qat_adv] Wrapping weight-update model in DataParallel ({torch.cuda.device_count()} GPUs).")
+        m = nn.DataParallel(m)
+        raw_model = m.module
+        
+    opt = torch.optim.SGD(m.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    n_batches = len(finetune_loader)
+    
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for bi, (x, y) in enumerate(finetune_loader):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            
+            set_ste_mode(raw_model, True)
+            raw_model.eval() 
+            
+            x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+            x_adv = torch.clamp(x_adv, clip_min, clip_max).detach()
+            
+            for _ in range(steps):
+                x_adv.requires_grad_(True)
+                with torch.set_grad_enabled(True):
+                    loss_inner = F.cross_entropy(raw_model(x_adv), y)
+                grad = torch.autograd.grad(loss_inner, x_adv, retain_graph=False, create_graph=False)[0]
+                x_adv = x_adv.detach() + alpha * grad.sign()
+                x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+                x_adv = torch.clamp(x_adv, clip_min, clip_max).detach()
+            
+            m.train() 
+            set_ste_mode(raw_model, True)
+            
+            opt.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(m(x_adv), y)
+            loss.backward()
+            opt.step()
+            
+            running_loss += loss.item()
+            if (bi + 1) % 10 == 0 or (bi + 1) == n_batches:
+                print(f"  [qat_adv] epoch {epoch+1}/{epochs} batch {bi+1}/{n_batches} loss={loss.item():.4f} avg_loss={running_loss/(bi+1):.4f}")
+                
+    set_ste_mode(raw_model, False)
+    return m.eval()
 CIFAR_MEAN_T = torch.tensor(CIFAR_MEAN).view(1, 3, 1, 1)
 CIFAR_STD_T = torch.tensor(CIFAR_STD).view(1, 3, 1, 1)
 CLIP_MIN = ((0.0 - CIFAR_MEAN_T) / CIFAR_STD_T)
@@ -695,6 +743,7 @@ def parse_model_name(model_name):
         "_FP32",
         "_int8_PTQ",
         "_int8_QAT",
+        "_int8_QAT_AT",
     )
     for suffix in suffixes:
         if model_name.endswith(suffix):
@@ -717,6 +766,11 @@ def build_model(arch, mode, finetune_loader):
         print(f"[build] Applying quantization-aware training (QAT)...")
         m = prepare_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=3)
         print(f"[build] QAT model built.")
+        return m, fp32
+    if mode == "int8_QAT_AT":
+        print(f"[build] Applying adversarial quantization-aware training (QAT_AT)...")
+        m = prepare_qat_adv(fp32, bits=8, finetune_loader=finetune_loader, epochs=3)
+        print(f"[build] QAT_AT model built.")
         return m, fp32
     raise ValueError(f"Unknown mode: {mode}")
 def main():

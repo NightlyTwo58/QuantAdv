@@ -4,12 +4,12 @@ import os
 import sys
 
 MODELS = [
-    "ResNet20_FP32", "ResNet20_int8_PTQ", "ResNet20_int8_QAT",
-    "ResNet56_FP32", "ResNet56_int8_PTQ", "ResNet56_int8_QAT",
-    "MobileNetV2_FP32", "MobileNetV2_int8_PTQ", "MobileNetV2_int8_QAT",
-    "VGG16_BN_FP32", "VGG16_BN_int8_PTQ", "VGG16_BN_int8_QAT",
-    "ShuffleNetV2_FP32", "ShuffleNetV2_int8_PTQ", "ShuffleNetV2_int8_QAT",
-    "RepVGG_A0_FP32", "RepVGG_A0_int8_PTQ", "RepVGG_A0_int8_QAT"
+    "ResNet20_FP32", "ResNet20_int8_PTQ", "ResNet20_int8_QAT", "ResNet20_int8_QAT_AT",
+    "ResNet56_FP32", "ResNet56_int8_PTQ", "ResNet56_int8_QAT", "ResNet56_int8_QAT_AT",
+    "MobileNetV2_FP32", "MobileNetV2_int8_PTQ", "MobileNetV2_int8_QAT", "MobileNetV2_int8_QAT_AT",
+    "VGG16_BN_FP32", "VGG16_BN_int8_PTQ", "VGG16_BN_int8_QAT", "VGG16_BN_int8_QAT_AT",
+    "ShuffleNetV2_FP32", "ShuffleNetV2_int8_PTQ", "ShuffleNetV2_int8_QAT", "ShuffleNetV2_int8_QAT_AT",
+    "RepVGG_A0_FP32", "RepVGG_A0_int8_PTQ", "RepVGG_A0_int8_QAT", "RepVGG_A0_int8_QAT_AT"
 ]
 
 DATA_DIR = "data"
