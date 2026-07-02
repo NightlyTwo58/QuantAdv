@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import copy
 import os
+import json
 import traceback
 import sys
 import matplotlib.pyplot as plt
@@ -29,6 +30,25 @@ RESULTS_CSV = os.path.join(DATA_DIR, "results.csv")
 SWEEP_CSV = os.path.join(DATA_DIR, "results_sweep.csv")
 PLOT_PNG = os.path.join(DATA_DIR, "accuracy_plot.png")
 CIFAR10_ROOT = os.environ.get("CIFAR10_ROOT", "./")
+
+SEEDS = [0, 1, 2]
+
+"""
+Archived non-threaded single Python invocation analysis of metrics of attacks per model and eplison
+"""
+
+def ablation_csv_path(model_name):
+    return os.path.join(DATA_DIR, f"ablation_{model_name}.csv")
+
+def layerwise_csv_path(model_name):
+    return os.path.join(DATA_DIR, f"layerwise_{model_name}.csv")
+
+def trajectory_json_path(model_name):
+    return os.path.join(DATA_DIR, f"trajectory_{model_name}.json")
+
+# weight-only vs activation-only vs both quantization ablation
+def component_ablation_csv_path(model_name):
+    return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
 
 missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
 if missing:
@@ -177,6 +197,15 @@ def set_ste_mode(model, flag):
 def count_quant_layers(model):
     return sum(1 for m in model.modules() if isinstance(m, (QuantConv2d, QuantLinear)))
 
+# flip weight/activation quantization on an already-built quantized model
+# without rebuilding it, so one model object can be reused for all three
+# ablation configs instead of re-running convert_to_quant/QAT.
+def set_quant_components(model, quant_weight, quant_act):
+    for mod in model.modules():
+        if isinstance(mod, (QuantConv2d, QuantLinear)):
+            mod.quant_weight = quant_weight
+            mod.quant_act = quant_act
+
 def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
     m = convert_to_quant(fp32_model, bits, quant_weight=True, quant_act=True)
     if torch.cuda.device_count() > 1:
@@ -203,26 +232,43 @@ CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
 CLIP_MIN = ((0.0 - CIFAR_MEAN) / CIFAR_STD)
 CLIP_MAX = ((1.0 - CIFAR_MEAN) / CIFAR_STD)
 
-def run_fgsm_pgd(model, loader, eps=8/255):
+def run_fgsm_pgd(model, loader, eps=8/255, seeds=SEEDS):
     model.eval()
     fgsm = torchattacks.FGSM(model, eps=eps)
-    pgd = torchattacks.PGD(model, eps=eps, alpha=2/255, steps=20, random_start=True)
     out = {}
-    for name, atk in [("FGSM", fgsm), ("PGD", pgd)]:
+
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = fgsm(x, y)
+        with torch.no_grad():
+            pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    out["FGSM"] = correct / total
+
+    pgd_accs = []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        pgd = torchattacks.PGD(model, eps=eps, alpha=2/255, steps=20, random_start=True)
         correct, total = 0, 0
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            x_adv = atk(x, y)
+            x_adv = pgd(x, y)
             with torch.no_grad():
                 pred = model(x_adv).argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
-        out[name] = correct / total
+        pgd_accs.append(correct / total)
+    out["PGD"] = float(np.mean(pgd_accs))
+    out["PGD_mean"] = float(np.mean(pgd_accs))
+    out["PGD_std"] = float(np.std(pgd_accs))
     return out
 
 def run_autoattack(model, loader, eps=8/255):
     model.eval()
-    adversary = AutoAttack(model, norm="Linf", eps=eps, version="standard", device=device, verbose=False)
+    adversary = AutoAttack(model, norm="Linf", eps=eps, version="custom", device=device, verbose=False)
+    adversary.attacks_to_run = ["apgd-ce", "apgd-t"]
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -261,49 +307,254 @@ def bpda_pgd_attack(model, x, y, eps=8/255, alpha=2/255, steps=20):
     set_ste_mode(model, False)
     return x_adv.detach()
 
-def run_bpda(model, loader, eps=8/255):
-    correct, total = 0, 0
+def _run_bpda_once(model, loader, eps, n_restarts):
+    correct_masks = []
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        x_adv = bpda_pgd_attack(model, x, y, eps=eps)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+        worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
+        for _ in range(n_restarts):
+            x_adv = bpda_pgd_attack(model, x, y, eps=eps)
+            with torch.no_grad():
+                pred = model(x_adv).argmax(dim=1)
+            worst_correct &= (pred == y)
+        correct_masks.append(worst_correct)
+    all_correct = torch.cat(correct_masks)
+    return all_correct.float().mean().item()
 
-def gradient_diagnostics(model, loader, fp32_ref=None):
-    x, y = next(iter(loader))
-    x, y = x.to(device), y.to(device)
-
-    set_ste_mode(model, False)
-    x_in = x.clone().requires_grad_(True)
-    loss = F.cross_entropy(model(x_in), y)
-    g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
-
-    set_ste_mode(model, True)
-    x_in2 = x.clone().requires_grad_(True)
-    loss2 = F.cross_entropy(model(x_in2), y)
-    g_ste = torch.autograd.grad(loss2, x_in2)[0].flatten()
-    set_ste_mode(model, False)
-
-    diagnostics = {
-        "frac_zero_grad_hard": (g_hard.abs() < 1e-8).float().mean().item(),
-        "frac_zero_grad_ste": (g_ste.abs() < 1e-8).float().mean().item(),
-        "grad_norm_hard": g_hard.norm().item(),
-        "grad_norm_ste": g_ste.norm().item(),
+def run_bpda(model, loader, eps=8/255, n_restarts=1, seeds=SEEDS):
+    """
+    Runs the whole worst-case-over-n_restarts procedure once per seed and
+    reports mean/std across seeds, in addition to the original scalar
+    (mean of seeds) for backward-compat.
+    """
+    accs = []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        accs.append(_run_bpda_once(model, loader, eps, n_restarts))
+    return {
+        "BPDA_PGD": float(np.mean(accs)),
+        "BPDA_PGD_mean": float(np.mean(accs)),
+        "BPDA_PGD_std": float(np.std(accs)),
     }
 
-    if fp32_ref is not None:
-        fp32_ref.eval()
-        x_ref = x.clone().requires_grad_(True)
-        loss_ref = F.cross_entropy(fp32_ref(x_ref), y)
-        g_ref = torch.autograd.grad(loss_ref, x_ref)[0].flatten()
-        
-        cos_sim = F.cosine_similarity(g_ste.unsqueeze(0), g_ref.unsqueeze(0)).item()
-        diagnostics["grad_cosine_sim_with_FP32"] = cos_sim
+def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=5):
+    set_ste_mode(model, False)
+    frac_zero_hard, norm_hard = [], []
+    frac_zero_ste, norm_ste = [], []
+    cos_sims = []
 
+    for bi, (x, y) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x, y = x.to(device), y.to(device)
+
+        set_ste_mode(model, False)
+        x_in = x.clone().requires_grad_(True)
+        loss = F.cross_entropy(model(x_in), y)
+        g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+        frac_zero_hard.append((g_hard.abs() < 1e-8).float().mean().item())
+        norm_hard.append(g_hard.norm().item())
+
+        set_ste_mode(model, True)
+        x_in2 = x.clone().requires_grad_(True)
+        loss2 = F.cross_entropy(model(x_in2), y)
+        g_ste = torch.autograd.grad(loss2, x_in2)[0].flatten()
+        set_ste_mode(model, False)
+        frac_zero_ste.append((g_ste.abs() < 1e-8).float().mean().item())
+        norm_ste.append(g_ste.norm().item())
+
+        if fp32_ref is not None:
+            fp32_ref.eval()
+            x_ref = x.clone().requires_grad_(True)
+            loss_ref = F.cross_entropy(fp32_ref(x_ref), y)
+            g_ref = torch.autograd.grad(loss_ref, x_ref)[0].flatten()
+            cos_sims.append(F.cosine_similarity(g_ste.unsqueeze(0), g_ref.unsqueeze(0)).item())
+
+    diagnostics = {
+        "frac_zero_grad_hard": float(np.mean(frac_zero_hard)),
+        "frac_zero_grad_ste": float(np.mean(frac_zero_ste)),
+        "grad_norm_hard": float(np.mean(norm_hard)),
+        "grad_norm_ste": float(np.mean(norm_ste)),
+    }
+    if cos_sims:
+        diagnostics["grad_cosine_sim_with_FP32"] = float(np.mean(cos_sims))
     return diagnostics
+
+def random_noise_attack(model, loader, eps=8/255, n_restarts=1, seed=None):
+    if seed is not None:
+        torch.manual_seed(seed)
+    model.eval()
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
+            for _ in range(n_restarts):
+                noise = torch.empty_like(x).uniform_(-eps, eps)
+                x_adv = torch.max(torch.min(x + noise, clip_max), clip_min)
+                pred = model(x_adv).argmax(dim=1)
+                worst_correct &= (pred == y)
+            correct += worst_correct.sum().item()
+            total += y.size(0)
+    return correct / total
+
+def run_random_noise_seeded(model, loader, eps=8/255, seeds=SEEDS):
+    """Seed-averaged wrapper around random_noise_attack."""
+    accs = [random_noise_attack(model, loader, eps=eps, seed=s) for s in seeds]
+    return {
+        "Random_Noise": float(np.mean(accs)),
+        "Random_Noise_mean": float(np.mean(accs)),
+        "Random_Noise_std": float(np.std(accs)),
+    }
+
+def pgd_steps_ablation(model, loader, eps=8/255, step_list=(0, 1, 2, 5, 10, 20, 50)):
+    model.eval()
+    out = {}
+    for steps in step_list:
+        if steps == 0:
+            acc = random_noise_attack(model, loader, eps=eps, seed=0)
+        else:
+            pgd = torchattacks.PGD(model, eps=eps, alpha=2/255, steps=steps, random_start=True)
+            correct, total = 0, 0
+            for x, y in loader:
+                x, y = x.to(device), y.to(device)
+                x_adv = pgd(x, y)
+                with torch.no_grad():
+                    pred = model(x_adv).argmax(dim=1)
+                correct += (pred == y).sum().item()
+                total += y.size(0)
+            acc = correct / total
+        out[steps] = acc
+    return out
+
+def pgd_trajectory_diagnostics(model, loader, eps=8/255, alpha=2/255, steps=20, max_batches=5):
+    model.eval()
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    step_grad_norms = [0.0] * steps
+    step_movement = [0.0] * steps
+    n_batches = 0
+    for bi, (x, y) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x, y = x.to(device), y.to(device)
+        noise = torch.empty_like(x).uniform_(-eps, eps)
+        x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
+        x_adv = x_start.clone()
+        for s in range(steps):
+            x_adv.requires_grad_(True)
+            loss = F.cross_entropy(model(x_adv), y)
+            grad = torch.autograd.grad(loss, x_adv)[0]
+            step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
+            x_adv = x_adv.detach() + alpha * grad.sign()
+            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+            step_movement[s] += (x_adv - x_start).flatten(1).abs().max(dim=1).values.mean().item()
+        n_batches += 1
+    return {
+        "grad_norm_per_step": [g / n_batches for g in step_grad_norms],
+        "movement_from_random_start_per_step": [m / n_batches for m in step_movement],
+    }
+
+def layerwise_grad_profile(model, loader, use_ste, max_batches=3):
+    quant_layers = [(n, m) for n, m in model.named_modules() if isinstance(m, (QuantConv2d, QuantLinear))]
+    norms = {n: [] for n, _ in quant_layers}
+    handles = []
+
+    def make_hook(name):
+        def hook(module, grad_input, grad_output):
+            gi = grad_input[0]
+            if gi is not None:
+                norms[name].append(gi.flatten(1).norm(dim=1).mean().item())
+        return hook
+
+    for n, m in quant_layers:
+        handles.append(m.register_full_backward_hook(make_hook(n)))
+
+    set_ste_mode(model, use_ste)
+    model.eval()
+    for bi, (x, y) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x, y = x.to(device), y.to(device)
+        x = x.clone().requires_grad_(True)
+        loss = F.cross_entropy(model(x), y)
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+
+    for h in handles:
+        h.remove()
+    set_ste_mode(model, False)
+
+    ordered_names = [n for n, _ in quant_layers]
+    return {n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names}
+
+def staircase_diagnostic(model, loader, radius=1/255, n_points=40):
+    model.eval()
+    x, y = next(iter(loader))
+    x = x.to(device)
+    direction = torch.randn_like(x)
+    flat_norm = direction.flatten(1).norm(dim=1).view(-1, *([1] * (x.dim() - 1)))
+    direction = direction / flat_norm
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+
+    with torch.no_grad():
+        prev_logits = model(x)
+        plateau_hits = 0.0
+        for i in range(1, n_points + 1):
+            step = x + direction * (radius * i / n_points)
+            step = torch.max(torch.min(step, clip_max), clip_min)
+            logits = model(step)
+            plateau_hits += (logits == prev_logits).all(dim=1).float().mean().item()
+            prev_logits = logits
+    return {"plateau_fraction": plateau_hits / n_points}
+
+# weight-only vs activation-only vs both quantization ablation.
+# Cheap by design -- reuses the already-built quantized model, just flips
+# quant_weight/quant_act flags in place, and only computes clean_acc + a
+# single-seed 20-step PGD + frac_zero_grad_hard per config (not the full
+# AutoAttack/BPDA/trajectory suite). Restores the model to (True, True)
+# (its original state) before returning.
+def run_quant_component_ablation(model, loader, name, eps=8/255):
+    configs = [
+        ("weight_only", True, False),
+        ("act_only", False, True),
+        ("both", True, True),
+    ]
+    rows = []
+    for label, qw, qa in configs:
+        set_quant_components(model, qw, qa)
+        clean_acc = sanity_check_accuracy(model, loader)
+
+        torch.manual_seed(0)
+        pgd = torchattacks.PGD(model, eps=eps, alpha=2/255, steps=20, random_start=True)
+        correct, total = 0, 0
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            x_adv = pgd(x, y)
+            with torch.no_grad():
+                pred = model(x_adv).argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+        pgd_acc = correct / total
+
+        x, y = next(iter(loader))
+        x, y = x.to(device), y.to(device)
+        x_in = x.clone().requires_grad_(True)
+        loss = F.cross_entropy(model(x_in), y)
+        g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+        frac_zero = (g_hard.abs() < 1e-8).float().mean().item()
+
+        rows.append({
+            "model": name, "config": label,
+            "quant_weight": qw, "quant_act": qa,
+            "clean_acc": clean_acc, "PGD_acc": pgd_acc,
+            "frac_zero_grad_hard": frac_zero,
+        })
+
+    # restore original (both quantized) state
+    set_quant_components(model, True, True)
+    return rows
 
 def run_suite(model, loader, name, fp32_ref=None, eps=8/255):
     model.eval()
@@ -335,16 +586,58 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8/255):
             print(f"  [WARN] transfer_attack failed for {name}: {e}")
             results["Transfer_from_FP32"] = None
 
+    try:
+        results.update(run_random_noise_seeded(model, loader, eps=eps))
+    except Exception as e:
+        print(f"  [WARN] random_noise_attack failed for {name}: {e}")
+        results["Random_Noise"] = None
+
     if count_quant_layers(model) > 0:
         try:
-            results["BPDA_PGD"] = run_bpda(model, loader, eps=eps)
+            results.update(run_bpda(model, loader, eps=eps, n_restarts=5))
         except Exception as e:
             print(f"  [WARN] BPDA failed for {name}: {e}")
             results["BPDA_PGD"] = None
+
         try:
-            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref))
+            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=5))
         except Exception as e:
             print(f"  [WARN] gradient_diagnostics failed for {name}: {e}")
+
+        try:
+            results.update(staircase_diagnostic(model, loader))
+        except Exception as e:
+            print(f"  [WARN] staircase_diagnostic failed for {name}: {e}")
+
+        try:
+            ablation = pgd_steps_ablation(model, loader, eps=eps)
+            pd.DataFrame([{"model": name, "steps": k, "acc": v} for k, v in ablation.items()]) \
+              .to_csv(ablation_csv_path(name), index=False)
+        except Exception as e:
+            print(f"  [WARN] pgd_steps_ablation failed for {name}: {e}")
+
+        try:
+            traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=5)
+            with open(trajectory_json_path(name), "w") as f:
+                json.dump(traj, f, indent=2)
+        except Exception as e:
+            print(f"  [WARN] pgd_trajectory_diagnostics failed for {name}: {e}")
+
+        try:
+            prof_hard = layerwise_grad_profile(model, loader, use_ste=False)
+            prof_ste = layerwise_grad_profile(model, loader, use_ste=True)
+            rows = [{"model": name, "layer": n, "grad_norm_hard": prof_hard.get(n),
+                     "grad_norm_ste": prof_ste.get(n)} for n in prof_hard]
+            pd.DataFrame(rows).to_csv(layerwise_csv_path(name), index=False)
+        except Exception as e:
+            print(f"  [WARN] layerwise_grad_profile failed for {name}: {e}")
+
+        # weight-only / activation-only / both ablation
+        try:
+            rows = run_quant_component_ablation(model, loader, name, eps=eps)
+            pd.DataFrame(rows).to_csv(component_ablation_csv_path(name), index=False)
+        except Exception as e:
+            print(f"  [WARN] run_quant_component_ablation failed for {name}: {e}")
 
     return results
 
@@ -368,9 +661,15 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
             print(f"  [WARN] PGD sweep failed for {name} eps={eps:.4f}: {e}")
             row["PGD_acc"] = None
 
+        try:
+            row["Random_Noise_acc"] = random_noise_attack(model, loader, eps=eps)
+        except Exception as e:
+            print(f"  [WARN] random_noise sweep failed for {name} eps={eps:.4f}: {e}")
+            row["Random_Noise_acc"] = None
+
         if is_quant:
             try:
-                row["BPDA_acc"] = run_bpda(model, loader, eps=eps)
+                row["BPDA_acc"] = _run_bpda_once(model, loader, eps=eps, n_restarts=3)
             except Exception as e:
                 print(f"  [WARN] BPDA sweep failed for {name} eps={eps:.4f}: {e}")
                 row["BPDA_acc"] = None
@@ -454,7 +753,7 @@ def main():
     print("\nFinal results:")
     print(df_results)
 
-    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "AutoAttack", "Transfer_from_FP32", "BPDA_PGD"] if c in df_results.columns]
+    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "AutoAttack", "Transfer_from_FP32", "Random_Noise", "BPDA_PGD"] if c in df_results.columns]
 
     if len(acc_cols) > 0:
         df_plot = df_results.melt(id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy")

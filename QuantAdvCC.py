@@ -237,13 +237,6 @@ CLIP_MIN = ((0.0 - CIFAR_MEAN_T) / CIFAR_STD_T)
 CLIP_MAX = ((1.0 - CIFAR_MEAN_T) / CIFAR_STD_T)
 
 def run_fgsm_pgd(model, loader, eps=8/255, seeds=SEEDS):
-    """
-    NOTE (item 1): PGD is stochastic (random_start=True), so it's now
-    averaged over `seeds` independent runs. FGSM has no randomness, so it's
-    still a single deterministic pass. Returns PGD_mean/PGD_std alongside the
-    original PGD key (set to the mean, for backward-compat with plotting code
-    that expects a scalar "PGD" column).
-    """
     model.eval()
     fgsm = torchattacks.FGSM(model, eps=eps)
     out = {}
