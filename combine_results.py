@@ -170,13 +170,13 @@ def plot_accuracy(df_results):
     acc_cols = [
         c
         for c in [
-            "clean_acc",
-            "FGSM",
-            "PGD",
-            "AutoAttack",
-            "Transfer_from_FP32",
-            "Random_Noise",   # NEW
-            "BPDA_PGD",
+            "No Attack",
+            "Random_Noise",
+            "FGSM (W)",
+            "PGD (W)",
+            "AutoAttack (W/B)",
+            "Transfer_from_FP32 (B)",
+            "BPDA_PGD (W)",
         ]
         if c in df_results.columns
     ]
@@ -195,7 +195,7 @@ def plot_accuracy(df_results):
     plt.figure(figsize=(14, 6))
     sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Attack")
     plt.xticks(rotation=45, ha="right")
-    plt.title("Model Accuracy under Various Adversarial Attacks")
+    plt.title("Model Accuracy under Adversarial Attacks")
     plt.ylim(0, 1.0)
     plt.grid(axis="y", linestyle="--", alpha=0.7)
     plt.tight_layout()

@@ -7,7 +7,7 @@ from torchao.quantization import (
     Int8DynamicActivationIntxWeightConfig,
 )
 from torchao.quantization.granularity import PerGroup
-from torchao.quantization.qat import QATConfig
+from torchao.quantization.qat import QATConfig, IntxFakeQuantizeConfig
 import copy
 import time
 
@@ -25,7 +25,10 @@ _BITWIDTH_TO_CONFIG = {
     4: {
         "ptq": lambda: Int4WeightOnlyConfig(group_size=32),
         "qat_prepare": lambda: QATConfig(
-            Int4WeightOnlyConfig(group_size=32), step="prepare"
+            weight_config=IntxFakeQuantizeConfig(
+                torch.int4, group_size=32, is_symmetric=True
+            ),
+            step="prepare",
         ),
         "qat_convert": lambda: QATConfig(
             Int4WeightOnlyConfig(group_size=32), step="convert"

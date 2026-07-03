@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import logging
+logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
+
 import importlib.util
 import torch
 import torch.nn as nn
@@ -26,7 +29,6 @@ from autoattack import AutoAttack
 from quantize import Model as QuantModel
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print("device:", device)
 
 USE_AMP = torch.cuda.is_available()
 
@@ -79,15 +81,14 @@ def trajectory_json_path(model_name):
 def component_ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
 
-
-missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
-if missing:
-    raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
-print("All required packages are available.")
-
-expected = os.path.join(CIFAR10_ROOT, "cifar-10-batches-py")
-if not os.path.isdir(expected):
-    raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
+def _startup_checks():
+    missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
+    if missing:
+        raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
+    print("All required packages are available.")
+    expected = os.path.join(CIFAR10_ROOT, "cifar-10-batches-py")
+    if not os.path.isdir(expected):
+        raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
 
 
 def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
@@ -161,44 +162,62 @@ CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
 CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
 CLIP_MIN = ((0.0 - CIFAR_MEAN) / CIFAR_STD)
 CLIP_MAX = ((1.0 - CIFAR_MEAN) / CIFAR_STD)
+CLIP_MIN_DEV = CLIP_MIN.to(device)
+CLIP_MAX_DEV = CLIP_MAX.to(device)
+
+
+def pgd_step(model, x_adv, x, y, eps, alpha, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV, return_grad=False):
+    x_adv = x_adv.clone().requires_grad_(True)
+    with amp_ctx():
+        loss = F.cross_entropy(model(x_adv), y)
+    grad = torch.autograd.grad(loss, x_adv)[0]
+    x_adv = x_adv.detach() + alpha * grad.sign()
+    x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    if return_grad:
+        return x_adv, grad
+    return x_adv
+
+
+def seeded_average(fn, seeds, key):
+    vals = [fn(s) for s in seeds]
+    return {key: float(np.mean(vals)), f"{key}_mean": float(np.mean(vals)), f"{key}_std": float(np.std(vals))}
+
+
+def evaluate_under_attack(model, loader, attack_fn):
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        with amp_ctx():
+            x_adv = attack_fn(x, y)
+            with torch.no_grad():
+                pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / total
+
+
+def safe_run(fn, name, label):
+    try:
+        return fn(), None
+    except Exception as e:
+        print(f"  [WARN] {label} failed for {name}: {e}")
+        traceback.print_exc()
+        return None, e
 
 
 def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     model.eval()
     fgsm = torchattacks.FGSM(model, eps=eps)
-    out = {}
+    out = {"FGSM": evaluate_under_attack(model, loader, lambda x, y: fgsm(x, y))}
 
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        with amp_ctx():
-            x_adv = fgsm(x, y)
-            with torch.no_grad():
-                pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    out["FGSM"] = correct / total
-
-    pgd_accs = []
-    # PGD's random start is drawn at call-time (from the global RNG), not at
-    # construction time, so the attack object can be built once and reused
-    # across seeds -- we just need to reseed before each call.
     pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-    for seed in seeds:
+
+    def run_seed(seed):
         torch.manual_seed(seed)
-        correct, total = 0, 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            with amp_ctx():
-                x_adv = pgd(x, y)
-                with torch.no_grad():
-                    pred = model(x_adv).argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-        pgd_accs.append(correct / total)
-    out["PGD"] = float(np.mean(pgd_accs))
-    out["PGD_mean"] = float(np.mean(pgd_accs))
-    out["PGD_std"] = float(np.std(pgd_accs))
+        return evaluate_under_attack(model, loader, lambda x, y: pgd(x, y))
+
+    out.update(seeded_average(run_seed, seeds, "PGD"))
     return out
 
 
@@ -222,31 +241,14 @@ def run_autoattack(model, loader, eps=8 / 255, aa_batch_size=256):
 
 def transfer_attack(source_model, target_model, loader, eps=8 / 255):
     pgd = torchattacks.PGD(source_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        with amp_ctx():
-            x_adv = pgd(x, y)
-            with torch.no_grad():
-                pred = target_model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+    return evaluate_under_attack(target_model, loader, lambda x, y: pgd(x, y))
 
 
 def bpda_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=20):
-    clip_min = CLIP_MIN.to(device)
-    clip_max = CLIP_MAX.to(device)
     x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    x_adv = torch.max(torch.min(x_adv, CLIP_MAX_DEV), CLIP_MIN_DEV).detach()
     for _ in range(steps):
-        x_adv.requires_grad_(True)
-        with amp_ctx():
-            loss = F.cross_entropy(model(x_adv), y)
-        grad = torch.autograd.grad(loss, x_adv)[0]
-        x_adv = x_adv.detach() + alpha * grad.sign()
-        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+        x_adv = pgd_step(model, x_adv, x, y, eps, alpha)
     return x_adv.detach()
 
 
@@ -266,20 +268,11 @@ def _run_bpda_once(model, loader, eps, n_restarts):
 
 
 def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
-    """
-    Runs the whole worst-case-over-n_restarts procedure once per seed and
-    reports mean/std across seeds, in addition to the original scalar
-    (mean of seeds) for backward-compat.
-    """
-    accs = []
-    for seed in seeds:
+    def run_seed(seed):
         torch.manual_seed(seed)
-        accs.append(_run_bpda_once(model, loader, eps, n_restarts))
-    return {
-        "BPDA_PGD": float(np.mean(accs)),
-        "BPDA_PGD_mean": float(np.mean(accs)),
-        "BPDA_PGD_std": float(np.std(accs)),
-    }
+        return _run_bpda_once(model, loader, eps, n_restarts)
+
+    return seeded_average(run_seed, seeds, "BPDA_PGD")
 
 
 def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max_batches=5):
@@ -360,7 +353,6 @@ def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
     if seed is not None:
         torch.manual_seed(seed)
     model.eval()
-    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     correct, total = 0, 0
     with torch.no_grad():
         for x, y in loader:
@@ -368,7 +360,7 @@ def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
             worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
             for _ in range(n_restarts):
                 noise = torch.empty_like(x).uniform_(-eps, eps)
-                x_adv = torch.max(torch.min(x + noise, clip_max), clip_min)
+                x_adv = torch.max(torch.min(x + noise, CLIP_MAX_DEV), CLIP_MIN_DEV)
                 with amp_ctx():
                     pred = model(x_adv).argmax(dim=1)
                 worst_correct &= (pred == y)
@@ -378,13 +370,7 @@ def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
 
 
 def run_random_noise_seeded(model, loader, eps=8 / 255, seeds=SEEDS):
-    """Seed-averaged wrapper around random_noise_attack."""
-    accs = [random_noise_attack(model, loader, eps=eps, seed=s) for s in seeds]
-    return {
-        "Random_Noise": float(np.mean(accs)),
-        "Random_Noise_mean": float(np.mean(accs)),
-        "Random_Noise_std": float(np.std(accs)),
-    }
+    return seeded_average(lambda s: random_noise_attack(model, loader, eps=eps, seed=s), seeds, "Random_Noise")
 
 
 def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20, 50)):
@@ -395,23 +381,13 @@ def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20
             acc = random_noise_attack(model, loader, eps=eps, seed=0)
         else:
             pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
-            correct, total = 0, 0
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
-                with amp_ctx():
-                    x_adv = pgd(x, y)
-                    with torch.no_grad():
-                        pred = model(x_adv).argmax(dim=1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-            acc = correct / total
+            acc = evaluate_under_attack(model, loader, lambda x, y: pgd(x, y))
         out[steps] = acc
     return out
 
 
 def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=20, max_batches=5):
     model.eval()
-    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     step_grad_norms = [0.0] * steps
     step_movement = [0.0] * steps
     n_batches = 0
@@ -420,17 +396,11 @@ def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=
             break
         x, y = x.to(device), y.to(device)
         noise = torch.empty_like(x).uniform_(-eps, eps)
-        x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
+        x_start = torch.max(torch.min(x + noise, CLIP_MAX_DEV), CLIP_MIN_DEV).detach()
         x_adv = x_start.clone()
         for s in range(steps):
-            x_adv.requires_grad_(True)
-            with amp_ctx():
-                loss = F.cross_entropy(model(x_adv), y)
-            grad = torch.autograd.grad(loss, x_adv)[0]
+            x_adv, grad = pgd_step(model, x_adv, x, y, eps, alpha, return_grad=True)
             step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
-            x_adv = x_adv.detach() + alpha * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
             step_movement[s] += (x_adv - x_start).flatten(1).abs().max(dim=1).values.mean().item()
         n_batches += 1
     return {
@@ -446,14 +416,13 @@ def staircase_diagnostic(model, loader, radius=1 / 255, n_points=40):
     direction = torch.randn_like(x)
     flat_norm = direction.flatten(1).norm(dim=1).view(-1, *([1] * (x.dim() - 1)))
     direction = direction / flat_norm
-    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
 
     with torch.no_grad(), amp_ctx():
         prev_logits = model(x)
         plateau_hits = 0.0
         for i in range(1, n_points + 1):
             step = x + direction * (radius * i / n_points)
-            step = torch.max(torch.min(step, clip_max), clip_min)
+            step = torch.max(torch.min(step, CLIP_MAX_DEV), CLIP_MIN_DEV)
             logits = model(step)
             plateau_hits += (logits == prev_logits).all(dim=1).float().mean().item()
             prev_logits = logits
@@ -491,16 +460,7 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
 
         torch.manual_seed(0)
         pgd = torchattacks.PGD(qat_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-        correct, total = 0, 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            with amp_ctx():
-                x_adv = pgd(x, y)
-                with torch.no_grad():
-                    pred = qat_model(x_adv).argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-        pgd_acc = correct / total
+        pgd_acc = evaluate_under_attack(qat_model, loader, lambda x, y: pgd(x, y))
 
         x, y = next(iter(loader))
         x, y = x.to(device), y.to(device)
@@ -527,13 +487,7 @@ def parallelize(model):
 
 def maybe_compile(model, name=""):
     """
-    Wrap with torch.compile for faster CNN inference (item #13, typically
-    10-40% faster once warmed up). This is best-effort: torch.compile can
-    be fragile with custom/quantized ops (torchao) and with the backward
-    hooks used by gradient_diagnostics_and_layerwise_profile, so a failed
-    or unstable compile falls back to the eager model instead of crashing
-    the whole run. Skipped on CPU, where it rarely helps and adds startup
-    overhead.
+    Safe wrap with torch.compile for faster CNN inference.
     """
     if device != "cuda" or not hasattr(torch, "compile"):
         return model
@@ -550,86 +504,70 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
     model.eval()
     results = {"model": name}
 
-    try:
-        results["clean_acc"] = sanity_check_accuracy(model, loader)
-    except Exception as e:
-        print(f"  [WARN] clean_acc failed for {name}: {e}")
-        results["clean_acc"] = None
+    clean_acc, _ = safe_run(lambda: sanity_check_accuracy(model, loader), name, "clean_acc")
+    results["clean_acc"] = clean_acc
 
-    try:
-        results.update(run_fgsm_pgd(model, loader, eps=eps))
-    except Exception as e:
-        print(f"  [WARN] FGSM/PGD failed for {name}: {e}")
+    fgsm_pgd, _ = safe_run(lambda: run_fgsm_pgd(model, loader, eps=eps), name, "FGSM/PGD")
+    if fgsm_pgd is not None:
+        results.update(fgsm_pgd)
+    else:
         results["FGSM"] = results.get("FGSM", None)
         results["PGD"] = results.get("PGD", None)
 
-    try:
-        results["AutoAttack"] = run_autoattack(model, loader, eps=eps)
-    except Exception as e:
-        print(f"  [WARN] AutoAttack failed for {name}: {e}")
-        results["AutoAttack"] = None
+    results["AutoAttack"], _ = safe_run(lambda: run_autoattack(model, loader, eps=eps), name, "AutoAttack")
 
     if fp32_ref is not None:
-        try:
-            results["Transfer_from_FP32"] = transfer_attack(fp32_ref, model, loader, eps=eps)
-        except Exception as e:
-            print(f"  [WARN] transfer_attack failed for {name}: {e}")
-            results["Transfer_from_FP32"] = None
+        results["Transfer_from_FP32"], _ = safe_run(
+            lambda: transfer_attack(fp32_ref, model, loader, eps=eps), name, "transfer_attack")
 
-    try:
-        results.update(run_random_noise_seeded(model, loader, eps=eps))
-    except Exception as e:
-        print(f"  [WARN] random_noise_attack failed for {name}: {e}")
+    random_noise, _ = safe_run(lambda: run_random_noise_seeded(model, loader, eps=eps), name, "random_noise_attack")
+    if random_noise is not None:
+        results.update(random_noise)
+    else:
         results["Random_Noise"] = None
 
     if count_quant_layers(model) > 0:
-        try:
-            results.update(run_bpda(model, loader, eps=eps, n_restarts=5))
-        except Exception as e:
-            print(f"  [WARN] BPDA failed for {name}: {e}")
+        bpda, _ = safe_run(lambda: run_bpda(model, loader, eps=eps, n_restarts=5), name, "BPDA")
+        if bpda is not None:
+            results.update(bpda)
+        else:
             results["BPDA_PGD"] = None
 
-        try:
-            # Single pass now produces both the whole-input gradient stats
-            # and the per-layer profile (previously two independent
-            # forward+backward passes over the same batches).
-            diag, layer_profile = gradient_diagnostics_and_layerwise_profile(
-                model, loader, fp32_ref=fp32_ref, max_batches=5)
+        diag_result, _ = safe_run(
+            lambda: gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=fp32_ref, max_batches=5),
+            name, "gradient_diagnostics_and_layerwise_profile")
+        if diag_result is not None:
+            diag, layer_profile = diag_result
             results.update(diag)
             rows = [{"model": name, "layer": n, "grad_norm_hard": v, "grad_norm_ste": v}
                     for n, v in layer_profile.items()]
             pd.DataFrame(rows).to_csv(layerwise_csv_path(name), index=False)
-        except Exception as e:
-            print(f"  [WARN] gradient_diagnostics_and_layerwise_profile failed for {name}: {e}")
 
-        try:
-            results.update(staircase_diagnostic(model, loader))
-        except Exception as e:
-            print(f"  [WARN] staircase_diagnostic failed for {name}: {e}")
+        staircase, _ = safe_run(lambda: staircase_diagnostic(model, loader), name, "staircase_diagnostic")
+        if staircase is not None:
+            results.update(staircase)
 
-        try:
-            ablation = pgd_steps_ablation(model, loader, eps=eps)
+        ablation, _ = safe_run(lambda: pgd_steps_ablation(model, loader, eps=eps), name, "pgd_steps_ablation")
+        if ablation is not None:
             pd.DataFrame([{"model": name, "steps": k, "acc": v} for k, v in ablation.items()]) \
                 .to_csv(ablation_csv_path(name), index=False)
-        except Exception as e:
-            print(f"  [WARN] pgd_steps_ablation failed for {name}: {e}")
 
-        try:
-            traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=5)
+        traj, _ = safe_run(
+            lambda: pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=5),
+            name, "pgd_trajectory_diagnostics")
+        if traj is not None:
             with open(trajectory_json_path(name), "w") as f:
                 json.dump(traj, f, indent=2)
-        except Exception as e:
-            print(f"  [WARN] pgd_trajectory_diagnostics failed for {name}: {e}")
 
-        # weight-only / activation-only / both ablation
-        try:
-            # model_qat_instance is the QuantModel that owns this model
+        def _component_ablation():
             qat_instance = _get_qat_instance_for_model(model)
             if qat_instance is not None:
-                rows = run_quant_component_ablation(qat_instance, loader, name, eps=eps)
-                pd.DataFrame(rows).to_csv(component_ablation_csv_path(name), index=False)
-        except Exception as e:
-            print(f"  [WARN] run_quant_component_ablation failed for {name}: {e}")
+                return run_quant_component_ablation(qat_instance, loader, name, eps=eps)
+            return None
+
+        component_rows, _ = safe_run(_component_ablation, name, "run_quant_component_ablation")
+        if component_rows is not None:
+            pd.DataFrame(component_rows).to_csv(component_ablation_csv_path(name), index=False)
 
     return results
 
@@ -658,20 +596,8 @@ def run_pgd_epsilon_sweep_shared(model, loader, epsilons, alpha=2 / 255, steps=2
     smaller epsilon in `epsilons`, projects the final perturbation onto
     that epsilon's L_inf ball. This is the amortized epsilon-sweep
     approximation used by several robustness libraries.
-
-    CAVEAT: this is an approximation, not equivalent to independently
-    running PGD from scratch at each epsilon. The trajectory's step
-    directions and intermediate clipping are computed w.r.t. eps_max, so
-    the projected point for a smaller epsilon is not necessarily where PGD
-    would have ended up if optimized within that smaller ball from the
-    start. In practice this tends to make the attack for eps < eps_max
-    slightly weaker (reported accuracy slightly optimistic) than a
-    from-scratch run. If you need exact per-epsilon PGD numbers (e.g. for
-    a paper's headline result), fall back to running PGD independently per
-    epsilon for that specific epsilon.
     """
     eps_max = max(epsilons)
-    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
 
     correct_per_eps = {eps: 0 for eps in epsilons}
     total = 0
@@ -679,21 +605,15 @@ def run_pgd_epsilon_sweep_shared(model, loader, epsilons, alpha=2 / 255, steps=2
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps_max, eps_max)
-        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+        x_adv = torch.max(torch.min(x_adv, CLIP_MAX_DEV), CLIP_MIN_DEV).detach()
 
         for _ in range(steps):
-            x_adv.requires_grad_(True)
-            with amp_ctx():
-                loss = F.cross_entropy(model(x_adv), y)
-            grad = torch.autograd.grad(loss, x_adv)[0]
-            x_adv = x_adv.detach() + alpha * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x - eps_max), x + eps_max)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+            x_adv = pgd_step(model, x_adv, x, y, eps_max, alpha)
 
         with torch.no_grad(), amp_ctx():
             for eps in epsilons:
                 delta = torch.clamp(x_adv - x, -eps, eps)
-                x_eps = torch.max(torch.min(x + delta, clip_max), clip_min)
+                x_eps = torch.max(torch.min(x + delta, CLIP_MAX_DEV), CLIP_MIN_DEV)
                 pred = model(x_eps).argmax(dim=1)
                 correct_per_eps[eps] += (pred == y).sum().item()
         total += y.size(0)
@@ -705,30 +625,33 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     rows = []
     is_quant = count_quant_layers(model) > 0
 
-    try:
-        pgd_acc_by_eps = run_pgd_epsilon_sweep_shared(model, loader, epsilons)
-    except Exception as e:
-        print(f"  [WARN] shared-trajectory PGD sweep failed for {name}: {e}")
-        pgd_acc_by_eps = {}
+    pgd_acc_by_eps, _ = safe_run(
+        lambda: run_pgd_epsilon_sweep_shared(model, loader, epsilons), name, "shared-trajectory PGD sweep")
+    pgd_acc_by_eps = pgd_acc_by_eps or {}
 
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
         row["PGD_acc"] = pgd_acc_by_eps.get(eps)
-
-        try:
-            row["Random_Noise_acc"] = random_noise_attack(model, loader, eps=eps)
-        except Exception as e:
-            print(f"  [WARN] random_noise sweep failed for {name} eps={eps:.4f}: {e}")
-            row["Random_Noise_acc"] = None
+        row["Random_Noise_acc"], _ = safe_run(
+            lambda: random_noise_attack(model, loader, eps=eps), name, f"random_noise sweep eps={eps:.4f}")
 
         if is_quant:
-            try:
-                row["BPDA_acc"] = _run_bpda_once(model, loader, eps=eps, n_restarts=3)
-            except Exception as e:
-                print(f"  [WARN] BPDA sweep failed for {name} eps={eps:.4f}: {e}")
-                row["BPDA_acc"] = None
+            row["BPDA_acc"], _ = safe_run(
+                lambda: _run_bpda_once(model, loader, eps=eps, n_restarts=3), name, f"BPDA sweep eps={eps:.4f}")
         rows.append(row)
     return rows
+
+
+def load_resumable_csv(path, key_fn, empty_columns=("model",)):
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        done = set(key_fn(row) for row in df.to_dict("records"))
+        rows = df.to_dict("records")
+    else:
+        df = pd.DataFrame(columns=list(empty_columns))
+        done = set()
+        rows = []
+    return df, done, rows
 
 
 def _merge_worker_csvs(arch_keys, pattern, merged_path):
@@ -751,20 +674,8 @@ def _merge_worker_csvs(arch_keys, pattern, merged_path):
 
 def dispatch_multi_gpu():
     """
-    Multi-GPU parallel evaluation of independent models (item #15). Every
-    model architecture is evaluated completely independently of the
-    others, so rather than relying only on DataParallel (which splits ONE
-    model's batch across GPUs, leaving GPUs idle while ResNet20 finishes
-    before ResNet56 starts), this spins up one subprocess per architecture
-    and pins each to its own GPU via CUDA_VISIBLE_DEVICES -- set in the
-    child's environment *before* that child process even starts, so
-    nothing in the rest of this file needs to change: each worker only
-    ever sees one GPU, which it addresses as "cuda" exactly like the
-    single-GPU code path already does.
-
-    Workers write to per-arch-key CSVs (see the RESULTS_CSV/SWEEP_CSV
-    override above); once all workers finish, results are merged back
-    into the shared CSVs. Only used when >1 GPU is visible; a single-GPU
+    Multi-GPU parallel evaluation of independent models.
+    Only used when >1 GPU is visible; a single-GPU
     or CPU machine just runs main() directly, unchanged.
     """
     import time
@@ -880,14 +791,8 @@ def main():
                 _model_to_qat_instance[id(model)] = all_qat_instances[arch_key]
                 break
 
-    if os.path.exists(RESULTS_CSV):
-        df_results = pd.read_csv(RESULTS_CSV)
-        done = set(df_results["model"].astype(str))
-        results_rows = df_results.to_dict("records")
-    else:
-        df_results = pd.DataFrame(columns=["model"])
-        done = set()
-        results_rows = []
+    df_results, done, results_rows = load_resumable_csv(
+        RESULTS_CSV, key_fn=lambda row: str(row["model"]), empty_columns=["model"])
 
     for name, (model, ref) in list(model_registry.items()):
         if name in done:
@@ -935,14 +840,8 @@ def main():
 
     SWEEP_EPSILONS = [1 / 255, 2 / 255, 4 / 255, 8 / 255, 16 / 255]
 
-    if os.path.exists(SWEEP_CSV):
-        df_sweep = pd.read_csv(SWEEP_CSV)
-        sweep_done = set(zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6)))
-        sweep_rows = df_sweep.to_dict("records")
-    else:
-        df_sweep = pd.DataFrame()
-        sweep_done = set()
-        sweep_rows = []
+    df_sweep, sweep_done, sweep_rows = load_resumable_csv(
+        SWEEP_CSV, key_fn=lambda row: (str(row["model"]), round(row["epsilon"], 6)), empty_columns=[])
 
     for name, (model, ref) in model_registry.items():
         print(f"\nSweeping {name} ...")
@@ -966,6 +865,10 @@ def main():
 
 if __name__ == '__main__':
     if _ARGS.arch_key is None and torch.cuda.device_count() > 1:
+        print("device:", device)
+        _startup_checks()
         dispatch_multi_gpu()
     else:
+        print("device:", device)
+        _startup_checks()
         main()
