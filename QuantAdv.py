@@ -41,18 +41,23 @@ Archived non-threaded single Python invocation analysis of metrics of attacks pe
 Migrated to use quantize.Model class interface (torchao-based quantization).
 """
 
+
 def ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"ablation_{model_name}.csv")
+
 
 def layerwise_csv_path(model_name):
     return os.path.join(DATA_DIR, f"layerwise_{model_name}.csv")
 
+
 def trajectory_json_path(model_name):
     return os.path.join(DATA_DIR, f"trajectory_{model_name}.json")
+
 
 # weight-only vs activation-only vs both quantization ablation
 def component_ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
+
 
 missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
 if missing:
@@ -62,6 +67,7 @@ print("All required packages are available.")
 expected = os.path.join(CIFAR10_ROOT, "cifar-10-batches-py")
 if not os.path.isdir(expected):
     raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
+
 
 def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
     transform_train = T.Compose([
@@ -80,7 +86,7 @@ def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
 
     finetune_subset = torch.utils.data.Subset(train_full, list(range(finetune_n)))
     eval_subset = torch.utils.data.Subset(test_full, list(range(eval_n)))
-    
+
     workers = min(4, os.cpu_count() or 1)
 
     finetune_loader = torch.utils.data.DataLoader(
@@ -92,6 +98,7 @@ def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
 
     return finetune_loader, eval_loader
 
+
 PRETRAINED_NAMES = {
     "ResNet20": "cifar10_resnet20",
     "ResNet56": "cifar10_resnet56",
@@ -101,33 +108,34 @@ PRETRAINED_NAMES = {
     "RepVGG_A0": "cifar10_repvgg_a0"
 }
 
+
 def load_pretrained(arch_key):
     hub_name = PRETRAINED_NAMES[arch_key]
     model = torch.hub.load("chenyaofo/pytorch-cifar-models", hub_name, pretrained=True)
     return model.to(device).eval()
 
-# ---------------------------------------------------------------------------
+
 # Evaluation helpers (delegate to QuantModel interface)
-# ---------------------------------------------------------------------------
 
 def sanity_check_accuracy(model, loader):
     """Delegate to QuantModel.clean_accuracy."""
     return QuantModel.clean_accuracy(model, loader)
 
+
 def count_quant_layers(model):
     """Count quantized layers using the QuantModel helper."""
     return QuantModel._count_quant_layers(model)
 
-# ---------------------------------------------------------------------------
+
 # Attack functions — unchanged from old version (only depend on forward pass)
-# ---------------------------------------------------------------------------
 
 CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
 CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
 CLIP_MIN = ((0.0 - CIFAR_MEAN) / CIFAR_STD)
 CLIP_MAX = ((1.0 - CIFAR_MEAN) / CIFAR_STD)
 
-def run_fgsm_pgd(model, loader, eps=8/255, seeds=SEEDS):
+
+def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     model.eval()
     fgsm = torchattacks.FGSM(model, eps=eps)
     out = {}
@@ -143,9 +151,12 @@ def run_fgsm_pgd(model, loader, eps=8/255, seeds=SEEDS):
     out["FGSM"] = correct / total
 
     pgd_accs = []
+    # PGD's random start is drawn at call-time (from the global RNG), not at
+    # construction time, so the attack object can be built once and reused
+    # across seeds -- we just need to reseed before each call.
+    pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
     for seed in seeds:
         torch.manual_seed(seed)
-        pgd = torchattacks.PGD(model, eps=eps, alpha=2/255, steps=20, random_start=True)
         correct, total = 0, 0
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -160,7 +171,8 @@ def run_fgsm_pgd(model, loader, eps=8/255, seeds=SEEDS):
     out["PGD_std"] = float(np.std(pgd_accs))
     return out
 
-def run_autoattack(model, loader, eps=8/255):
+
+def run_autoattack(model, loader, eps=8 / 255):
     model.eval()
     adversary = AutoAttack(model, norm="Linf", eps=eps, version="custom", device=device, verbose=False)
     adversary.attacks_to_run = ["apgd-ce", "apgd-t"]
@@ -174,8 +186,9 @@ def run_autoattack(model, loader, eps=8/255):
             total += y.size(0)
     return correct / total
 
-def transfer_attack(source_model, target_model, loader, eps=8/255):
-    pgd = torchattacks.PGD(source_model, eps=eps, alpha=2/255, steps=20, random_start=True)
+
+def transfer_attack(source_model, target_model, loader, eps=8 / 255):
+    pgd = torchattacks.PGD(source_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
@@ -186,7 +199,8 @@ def transfer_attack(source_model, target_model, loader, eps=8/255):
         total += y.size(0)
     return correct / total
 
-def bpda_pgd_attack(model, x, y, eps=8/255, alpha=2/255, steps=20):
+
+def bpda_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=20):
     clip_min = CLIP_MIN.to(device)
     clip_max = CLIP_MAX.to(device)
     x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
@@ -199,6 +213,7 @@ def bpda_pgd_attack(model, x, y, eps=8/255, alpha=2/255, steps=20):
         x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
         x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     return x_adv.detach()
+
 
 def _run_bpda_once(model, loader, eps, n_restarts):
     correct_masks = []
@@ -214,7 +229,8 @@ def _run_bpda_once(model, loader, eps, n_restarts):
     all_correct = torch.cat(correct_masks)
     return all_correct.float().mean().item()
 
-def run_bpda(model, loader, eps=8/255, n_restarts=1, seeds=SEEDS):
+
+def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
     """
     Runs the whole worst-case-over-n_restarts procedure once per seed and
     reports mean/std across seeds, in addition to the original scalar
@@ -229,6 +245,7 @@ def run_bpda(model, loader, eps=8/255, n_restarts=1, seeds=SEEDS):
         "BPDA_PGD_mean": float(np.mean(accs)),
         "BPDA_PGD_std": float(np.std(accs)),
     }
+
 
 def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=5):
     frac_zero_hard, norm_hard = [], []
@@ -270,7 +287,8 @@ def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=5):
         diagnostics["grad_cosine_sim_with_FP32"] = float(np.mean(cos_sims))
     return diagnostics
 
-def random_noise_attack(model, loader, eps=8/255, n_restarts=1, seed=None):
+
+def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
     if seed is not None:
         torch.manual_seed(seed)
     model.eval()
@@ -289,7 +307,8 @@ def random_noise_attack(model, loader, eps=8/255, n_restarts=1, seed=None):
             total += y.size(0)
     return correct / total
 
-def run_random_noise_seeded(model, loader, eps=8/255, seeds=SEEDS):
+
+def run_random_noise_seeded(model, loader, eps=8 / 255, seeds=SEEDS):
     """Seed-averaged wrapper around random_noise_attack."""
     accs = [random_noise_attack(model, loader, eps=eps, seed=s) for s in seeds]
     return {
@@ -298,14 +317,15 @@ def run_random_noise_seeded(model, loader, eps=8/255, seeds=SEEDS):
         "Random_Noise_std": float(np.std(accs)),
     }
 
-def pgd_steps_ablation(model, loader, eps=8/255, step_list=(0, 1, 2, 5, 10, 20, 50)):
+
+def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20, 50)):
     model.eval()
     out = {}
     for steps in step_list:
         if steps == 0:
             acc = random_noise_attack(model, loader, eps=eps, seed=0)
         else:
-            pgd = torchattacks.PGD(model, eps=eps, alpha=2/255, steps=steps, random_start=True)
+            pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
             correct, total = 0, 0
             for x, y in loader:
                 x, y = x.to(device), y.to(device)
@@ -318,7 +338,8 @@ def pgd_steps_ablation(model, loader, eps=8/255, step_list=(0, 1, 2, 5, 10, 20, 
         out[steps] = acc
     return out
 
-def pgd_trajectory_diagnostics(model, loader, eps=8/255, alpha=2/255, steps=20, max_batches=5):
+
+def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=20, max_batches=5):
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     step_grad_norms = [0.0] * steps
@@ -346,6 +367,7 @@ def pgd_trajectory_diagnostics(model, loader, eps=8/255, alpha=2/255, steps=20, 
         "movement_from_random_start_per_step": [m / n_batches for m in step_movement],
     }
 
+
 def layerwise_grad_profile(model, loader, use_ste, max_batches=3):
     """
     Record per-layer gradient norms via backward hooks.
@@ -361,6 +383,7 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=3):
             gi = grad_input[0]
             if gi is not None:
                 norms[name].append(gi.flatten(1).norm(dim=1).mean().item())
+
         return hook
 
     for n, m in quant_layers:
@@ -382,7 +405,8 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=3):
     ordered_names = [n for n, _ in quant_layers]
     return {n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names}
 
-def staircase_diagnostic(model, loader, radius=1/255, n_points=40):
+
+def staircase_diagnostic(model, loader, radius=1 / 255, n_points=40):
     model.eval()
     x, y = next(iter(loader))
     x = x.to(device)
@@ -402,17 +426,18 @@ def staircase_diagnostic(model, loader, radius=1/255, n_points=40):
             prev_logits = logits
     return {"plateau_fraction": plateau_hits / n_points}
 
+
 # weight-only vs activation-only vs both quantization ablation.
 # For torchao models: PTQ with weight-only config vs dynamic-activation config.
-def run_quant_component_ablation(model_qat_instance, loader, name, eps=8/255):
+def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
     """
     Run component ablation for a torchao-based model.
-    
+
     Uses the QuantModel to get different PTQ configs:
     - weight_only: Int4WeightOnlyConfig (weight-only int4)
     - act_only: approximate by evaluating with dynamic activation int8 PTQ
     - both: full dynamic activation int8 PTQ
-    
+
     Args:
         model_qat_instance: The QuantModel instance (holds all variants).
         loader: DataLoader for evaluation.
@@ -420,19 +445,19 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8/255):
         eps: PGD epsilon.
     """
     fp32 = model_qat_instance.model
-    
+
     configs = [
         ("weight_only", model_qat_instance.int4_PTQ),
         ("act_only", model_qat_instance.int8_PTQ),
         ("both", model_qat_instance.int8_PTQ),
     ]
-    
+
     rows = []
     for label, qat_model in configs:
         clean_acc = sanity_check_accuracy(qat_model, loader)
 
         torch.manual_seed(0)
-        pgd = torchattacks.PGD(qat_model, eps=eps, alpha=2/255, steps=20, random_start=True)
+        pgd = torchattacks.PGD(qat_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
         correct, total = 0, 0
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -457,17 +482,17 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8/255):
         })
     return rows
 
+
 def parallelize(model):
     """Wrap model with DataParallel if multiple GPUs available."""
     if torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel):
         return nn.DataParallel(model)
     return model
 
-# ---------------------------------------------------------------------------
-# Run the full evaluation suite for a single (model, fp32_ref) pair.
-# ---------------------------------------------------------------------------
 
-def run_suite(model, loader, name, fp32_ref=None, eps=8/255):
+# Run the full evaluation suite for a single (model, fp32_ref) pair.
+
+def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
     model.eval()
     results = {"model": name}
 
@@ -523,7 +548,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8/255):
         try:
             ablation = pgd_steps_ablation(model, loader, eps=eps)
             pd.DataFrame([{"model": name, "steps": k, "acc": v} for k, v in ablation.items()]) \
-              .to_csv(ablation_csv_path(name), index=False)
+                .to_csv(ablation_csv_path(name), index=False)
         except Exception as e:
             print(f"  [WARN] pgd_steps_ablation failed for {name}: {e}")
 
@@ -535,8 +560,13 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8/255):
             print(f"  [WARN] pgd_trajectory_diagnostics failed for {name}: {e}")
 
         try:
+            # NOTE: layerwise_grad_profile's use_ste flag is not actually
+            # wired to any different forward/backward path yet, so calling
+            # it twice (hard vs. STE) produced identical results while
+            # doubling the runtime. Compute once and reuse until true
+            # STE-specific gradient computation is implemented.
             prof_hard = layerwise_grad_profile(model, loader, use_ste=False)
-            prof_ste = layerwise_grad_profile(model, loader, use_ste=True)
+            prof_ste = prof_hard
             rows = [{"model": name, "layer": n, "grad_norm_hard": prof_hard.get(n),
                      "grad_norm_ste": prof_ste.get(n)} for n in prof_hard]
             pd.DataFrame(rows).to_csv(layerwise_csv_path(name), index=False)
@@ -555,9 +585,8 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8/255):
 
     return results
 
-# ---------------------------------------------------------------------------
+
 # Resolve the QuantModel instance that owns a given sub-model.
-# ---------------------------------------------------------------------------
 
 def _get_qat_instance_for_model(target_model):
     """
@@ -566,12 +595,12 @@ def _get_qat_instance_for_model(target_model):
     """
     return _model_to_qat_instance.get(id(target_model))
 
+
 # Populated by main()
 _model_to_qat_instance = {}
 
-# ---------------------------------------------------------------------------
+
 # Epsilon sweep — unchanged interface, only the model object differs
-# ---------------------------------------------------------------------------
 
 def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     rows = []
@@ -579,7 +608,7 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
         try:
-            pgd = torchattacks.PGD(model, eps=eps, alpha=2/255, steps=20, random_start=True)
+            pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
             correct, total = 0, 0
             for x, y in loader:
                 x, y = x.to(device), y.to(device)
@@ -608,12 +637,20 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
         rows.append(row)
     return rows
 
-# ---------------------------------------------------------------------------
+
 # main() — rewritten to use quantize.Model interface
-# ---------------------------------------------------------------------------
 
 def main():
     finetune_loader, eval_loader = get_dataloaders()
+
+    # Cache eval batches once, already on-device. Every attack/diagnostic
+    # below iterates the eval set independently (clean acc, FGSM, PGD,
+    # AutoAttack, transfer, random noise, BPDA, gradient diagnostics, PGD
+    # sweep, ...) -- without this they'd each re-read and re-normalize the
+    # CIFAR test set from disk. finetune_loader is NOT cached: QAT training
+    # needs fresh random-crop/flip augmentation and shuffling every epoch.
+    eval_batches = [(x.to(device), y.to(device)) for x, y in eval_loader]
+
     model_registry = {}  # {name: (model, fp32_ref)}
     all_qat_instances = {}  # arch_key -> QuantModel instance
 
@@ -621,7 +658,7 @@ def main():
         print(f"\n>>> {arch_key} <<<")
         try:
             fp32 = load_pretrained(arch_key)
-            acc = sanity_check_accuracy(fp32, eval_loader)
+            acc = sanity_check_accuracy(fp32, eval_batches)
             print(f"  loaded pretrained {arch_key}, clean acc: {acc:.3f}")
             model_registry[f"{arch_key}_FP32"] = (fp32, None)
         except Exception as e:
@@ -651,7 +688,7 @@ def main():
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
-        
+
         # QAT int4
         try:
             qat_model.train_qat(finetune_loader, epochs=3, bits=4)
@@ -662,23 +699,33 @@ def main():
 
     print("\nRegistry built:", list(model_registry.keys()))
 
-    # Build reverse mapping: model id -> QuantModel instance
-    for arch_key, qat_instance in all_qat_instances.items():
-        for attr in ["model", "int8_PTQ", "int4_PTQ", "int8_QAT", "int4_QAT"]:
-            m = getattr(qat_instance, attr, None)
-            if m is not None:
-                _model_to_qat_instance[id(m)] = qat_instance
-
     for k in model_registry:
         m, r = model_registry[k]
         model_registry[k] = (parallelize(m), parallelize(r) if r else None)
 
+    # Build reverse mapping: model id -> QuantModel instance.
+    # IMPORTANT: this must happen AFTER parallelize() above. DataParallel
+    # wrapping creates a new object, so an id-based map built beforehand
+    # would key off objects that no longer match what's actually evaluated
+    # (silently breaking run_quant_component_ablation whenever >1 GPU is
+    # available). We match by name suffix instead of re-reading attributes
+    # off the QuantModel instance, since model_registry now holds the
+    # (possibly wrapped) objects that will actually be passed to run_suite.
+    suffixes = ["int8_PTQ", "int4_PTQ", "int8_QAT", "int4_QAT"]
+    for name, (model, ref) in model_registry.items():
+        for arch_key in PRETRAINED_NAMES:
+            if any(name == f"{arch_key}_{suf}" for suf in suffixes) and arch_key in all_qat_instances:
+                _model_to_qat_instance[id(model)] = all_qat_instances[arch_key]
+                break
+
     if os.path.exists(RESULTS_CSV):
         df_results = pd.read_csv(RESULTS_CSV)
         done = set(df_results["model"].astype(str))
+        results_rows = df_results.to_dict("records")
     else:
         df_results = pd.DataFrame(columns=["model"])
         done = set()
+        results_rows = []
 
     for name, (model, ref) in list(model_registry.items()):
         if name in done:
@@ -687,24 +734,29 @@ def main():
 
         print(f"\nEvaluating {name} ...")
         try:
-            res = run_suite(model, eval_loader, name, fp32_ref=ref)
+            res = run_suite(model, eval_batches, name, fp32_ref=ref)
         except Exception as e:
             print(f"  [FAIL] run_suite failed for {name}: {e}")
             traceback.print_exc()
             res = {"model": name}
 
-        new_row = pd.DataFrame([res])
-        df_results = pd.concat([df_results, new_row], ignore_index=True)
+        # Accumulate in a plain list and rebuild the DataFrame, rather than
+        # pd.concat-ing a new one-row DataFrame onto df_results every
+        # iteration (item #17). Still writes to CSV after every model so
+        # progress/resumability is unaffected.
+        results_rows.append(res)
+        df_results = pd.DataFrame(results_rows)
         df_results.to_csv(RESULTS_CSV, index=False)
 
         print("Result:")
-        print(new_row.to_string(index=False))
+        print(pd.DataFrame([res]).to_string(index=False))
         print("-" * 100)
 
     print("\nFinal results:")
     print(df_results)
 
-    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "AutoAttack", "Transfer_from_FP32", "Random_Noise", "BPDA_PGD"] if c in df_results.columns]
+    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "AutoAttack", "Transfer_from_FP32", "Random_Noise", "BPDA_PGD"]
+                if c in df_results.columns]
 
     if len(acc_cols) > 0:
         df_plot = df_results.melt(id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy")
@@ -719,14 +771,16 @@ def main():
         plt.savefig(PLOT_PNG, dpi=300, bbox_inches="tight")
         plt.show()
 
-    SWEEP_EPSILONS = [1/255, 2/255, 4/255, 8/255, 16/255]
+    SWEEP_EPSILONS = [1 / 255, 2 / 255, 4 / 255, 8 / 255, 16 / 255]
 
     if os.path.exists(SWEEP_CSV):
         df_sweep = pd.read_csv(SWEEP_CSV)
         sweep_done = set(zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6)))
+        sweep_rows = df_sweep.to_dict("records")
     else:
         df_sweep = pd.DataFrame()
         sweep_done = set()
+        sweep_rows = []
 
     for name, (model, ref) in model_registry.items():
         print(f"\nSweeping {name} ...")
@@ -735,10 +789,10 @@ def main():
             print(f"  Skipping {name} (already done)")
             continue
         try:
-            rows = run_epsilon_sweep_for_model(model, eval_loader, name, pending_eps)
+            rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps)
             if rows:
-                new_sweep = pd.DataFrame(rows)
-                df_sweep = pd.concat([df_sweep, new_sweep], ignore_index=True)
+                sweep_rows.extend(rows)
+                df_sweep = pd.DataFrame(sweep_rows)
                 df_sweep.to_csv(SWEEP_CSV, index=False)
         except Exception as e:
             print(f"  [FAIL] epsilon sweep failed for {name}: {e}")
@@ -746,6 +800,7 @@ def main():
 
     print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
     print("All done.")
+
 
 if __name__ == '__main__':
     main()
