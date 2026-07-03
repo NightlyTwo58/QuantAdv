@@ -436,7 +436,6 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
     Run component ablation for a torchao-based model.
 
     Uses the QuantModel to get different PTQ configs:
-    - weight_only: Int4WeightOnlyConfig (weight-only int4)
     - act_only: approximate by evaluating with dynamic activation int8 PTQ
     - both: full dynamic activation int8 PTQ
 
@@ -449,7 +448,6 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
     fp32 = model_qat_instance.model
 
     configs = [
-        ("weight_only", model_qat_instance.int4_PTQ),
         ("act_only", model_qat_instance.int8_PTQ),
         ("both", model_qat_instance.int8_PTQ),
     ]
@@ -724,14 +722,17 @@ def dispatch_multi_gpu():
 
 
 # main() — rewritten to use quantize.Model interface
+# Processes one architecture at a time: load, build variants, evaluate, free memory, next.
 
 def main():
     finetune_loader, eval_loader = get_dataloaders()
 
     eval_batches = [(x.to(device), y.to(device)) for x, y in eval_loader]
 
-    model_registry = {}  # {name: (model, fp32_ref)}
-    all_qat_instances = {}  # arch_key -> QuantModel instance
+    import gc
+
+    df_results, done, results_rows = load_resumable_csv(
+        RESULTS_CSV, key_fn=lambda row: str(row["model"]), empty_columns=["model"])
 
     for arch_key in PRETRAINED_NAMES:
         print(f"\n>>> {arch_key} <<<")
@@ -739,85 +740,82 @@ def main():
             fp32 = load_pretrained(arch_key)
             acc = sanity_check_accuracy(fp32, eval_batches)
             print(f"  loaded pretrained {arch_key}, clean acc: {acc:.3f}")
-            model_registry[f"{arch_key}_FP32"] = (fp32, None)
         except Exception as e:
             print(f"  [FAIL] could not load {arch_key}: {e}")
             traceback.print_exc()
             continue
 
-        # Build the QuantModel wrapper this auto-constructs PTQ models
+        # Build the QuantModel wrapper (auto-constructs int8_PTQ)
         try:
             qat_model = QuantModel(fp32)
-            all_qat_instances[arch_key] = qat_model
         except Exception as e:
             print(f"  [FAIL] QuantModel wrapper for {arch_key}: {e}")
             traceback.print_exc()
             continue
 
-        # PTQ int8 (auto-built in QuantModel.__init__)
-        model_registry[f"{arch_key}_int8_PTQ"] = (qat_model.int8_PTQ, fp32)
+        # --- Build model registry entries for this architecture ---
+        # (We compile/parallelize just before each run_suite, then free the model after.)
 
-        # PTQ int4 (auto-built in QuantModel.__init__)
-        model_registry[f"{arch_key}_int4_PTQ"] = (qat_model.int4_PTQ, fp32)
+        variants = {
+            f"{arch_key}_FP32": (fp32, None),
+        }
+
+        variants[f"{arch_key}_int8_PTQ"] = (qat_model.int8_PTQ, fp32)
 
         # QAT int8
+        qat_int8 = None
         try:
-            qat_model.train_qat(finetune_loader, epochs=3, bits=8)
-            model_registry[f"{arch_key}_int8_QAT"] = (qat_model.int8_QAT, fp32)
+            qat_int8 = qat_model.train_qat(finetune_loader, epochs=3, bits=8)
+            variants[f"{arch_key}_int8_QAT"] = (qat_int8, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
 
-        # QAT int4
-        try:
-            qat_model.train_qat(finetune_loader, epochs=3, bits=4)
-            model_registry[f"{arch_key}_int4_QAT"] = (qat_model.int4_QAT, fp32)
-        except Exception as e:
-            print(f"  [FAIL] int4 QAT for {arch_key}: {e}")
-            traceback.print_exc()
-
-    print("\nRegistry built:", list(model_registry.keys()))
-
-    for k in model_registry:
-        m, r = model_registry[k]
-        m = maybe_compile(m, name=k)
-        r = maybe_compile(r, name=f"{k}_ref") if r is not None else None
-        model_registry[k] = (parallelize(m), parallelize(r) if r else None)
-
-    suffixes = ["int8_PTQ", "int4_PTQ", "int8_QAT", "int4_QAT"]
-    for name, (model, ref) in model_registry.items():
-        for arch_key in PRETRAINED_NAMES:
-            if any(name == f"{arch_key}_{suf}" for suf in suffixes) and arch_key in all_qat_instances:
-                _model_to_qat_instance[id(model)] = all_qat_instances[arch_key]
+        suffixes = ["int8_PTQ", "int8_QAT"]
+        for name in variants:
+            if any(name == f"{arch_key}_{suf}" for suf in suffixes):
+                _model_to_qat_instance[id(variants[name][0])] = qat_model
                 break
 
-    df_results, done, results_rows = load_resumable_csv(
-        RESULTS_CSV, key_fn=lambda row: str(row["model"]), empty_columns=["model"])
+        # --- Evaluate each variant one at a time ---
+        for name, (model, ref) in variants.items():
+            if name in done:
+                print(f"  Skipping {name} (already in {RESULTS_CSV})")
+                continue
 
-    for name, (model, ref) in list(model_registry.items()):
-        if name in done:
-            print(f"Skipping {name} (already in {RESULTS_CSV})")
-            continue
+            # Compile / parallelize for this run
+            model = maybe_compile(model, name=name)
+            model = parallelize(model)
+            ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
+            ref = parallelize(ref) if ref is not None else None
 
-        print(f"\nEvaluating {name} ...")
-        try:
-            res = run_suite(model, eval_batches, name, fp32_ref=ref)
-        except Exception as e:
-            print(f"  [FAIL] run_suite failed for {name}: {e}")
-            traceback.print_exc()
-            res = {"model": name}
+            print(f"\n  Evaluating {name} ...")
+            try:
+                res = run_suite(model, eval_batches, name, fp32_ref=ref)
+            except Exception as e:
+                print(f"  [FAIL] run_suite failed for {name}: {e}")
+                traceback.print_exc()
+                res = {"model": name}
 
-        # Accumulate in a plain list and rebuild the DataFrame, rather than
-        # pd.concat-ing a new one-row DataFrame onto df_results every
-        # iteration (item #17). Still writes to CSV after every model so
-        # progress/resumability is unaffected.
-        results_rows.append(res)
-        df_results = pd.DataFrame(results_rows)
-        df_results.to_csv(RESULTS_CSV, index=False)
+            results_rows.append(res)
+            df_results = pd.DataFrame(results_rows)
+            df_results.to_csv(RESULTS_CSV, index=False)
 
-        print("Result:")
-        print(pd.DataFrame([res]).to_string(index=False))
-        print("-" * 100)
+            print("  Result:")
+            print(pd.DataFrame([res]).to_string(index=False))
+            print("-" * 100)
+
+            # Free memory before moving to next variant
+            del model
+            if ref is not None:
+                del ref
+            gc.collect()
+
+        # Free this architecture's models and registry entries before next arch
+        del variants
+        del fp32
+        del qat_model
+        gc.collect()
 
     print("\nFinal results:")
     print(df_results)
@@ -838,26 +836,58 @@ def main():
         plt.savefig(PLOT_PNG, dpi=300, bbox_inches="tight")
         plt.show()
 
+    # Epsilon sweep — one architecture at a time (reuses same load→build→evaluate→free pattern)
     SWEEP_EPSILONS = [1 / 255, 2 / 255, 4 / 255, 8 / 255, 16 / 255]
 
     df_sweep, sweep_done, sweep_rows = load_resumable_csv(
         SWEEP_CSV, key_fn=lambda row: (str(row["model"]), round(row["epsilon"], 6)), empty_columns=[])
 
-    for name, (model, ref) in model_registry.items():
-        print(f"\nSweeping {name} ...")
-        pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done]
-        if not pending_eps:
-            print(f"  Skipping {name} (already done)")
-            continue
+    for arch_key in PRETRAINED_NAMES:
+        print(f"\n>>> Sweep: {arch_key} <<<")
         try:
-            rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps)
-            if rows:
-                sweep_rows.extend(rows)
-                df_sweep = pd.DataFrame(sweep_rows)
-                df_sweep.to_csv(SWEEP_CSV, index=False)
+            fp32 = load_pretrained(arch_key)
+            qat_model = QuantModel(fp32)
         except Exception as e:
-            print(f"  [FAIL] epsilon sweep failed for {name}: {e}")
-            traceback.print_exc()
+            print(f"  [FAIL] could not build for sweep {arch_key}: {e}")
+            continue
+
+        sweep_variants = {
+            f"{arch_key}_FP32": (fp32, None),
+            f"{arch_key}_int8_PTQ": (qat_model.int8_PTQ, fp32),
+        }
+
+        for name in sweep_variants:
+            if any(name == f"{arch_key}_{suf}" for suf in ["int8_PTQ", "int8_QAT"]):
+                _model_to_qat_instance[id(sweep_variants[name][0])] = qat_model
+
+        # Evaluate each variant in this architecture
+        for name, (model, ref) in sweep_variants.items():
+            pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done]
+            if not pending_eps:
+                print(f"  Sweep already done for {name}")
+                continue
+            if model is None:
+                print(f"  Skipping {name} (QAT not trained, skip sweep)")
+                continue
+
+            print(f"\n  Sweeping {name} ...")
+            model = maybe_compile(model, name=name)
+            model = parallelize(model)
+            ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
+            ref = parallelize(ref) if ref is not None else None
+            try:
+                rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps)
+                if rows:
+                    sweep_rows.extend(rows)
+                    df_sweep = pd.DataFrame(sweep_rows)
+                    df_sweep.to_csv(SWEEP_CSV, index=False)
+            except Exception as e:
+                print(f"  [FAIL] epsilon sweep failed for {name}: {e}")
+                traceback.print_exc()
+            del model
+            if ref is not None:
+                del ref
+            gc.collect()
 
     print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
     print("All done.")
