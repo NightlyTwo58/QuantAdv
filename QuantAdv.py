@@ -14,6 +14,9 @@ import os
 import json
 import traceback
 import sys
+import argparse
+import subprocess
+from contextlib import nullcontext
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -24,6 +27,24 @@ from quantize import Model as QuantModel
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)
+
+USE_AMP = torch.cuda.is_available()
+
+
+def amp_ctx():
+    if USE_AMP:
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+def _parse_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--arch-key", default=None,
+                        help="Internal: restrict this run to a single architecture.")
+    args, _ = parser.parse_known_args()
+    return args
+
+
+_ARGS = _parse_args()
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -108,6 +129,13 @@ PRETRAINED_NAMES = {
     "RepVGG_A0": "cifar10_repvgg_a0"
 }
 
+if _ARGS.arch_key is not None:
+    if _ARGS.arch_key not in PRETRAINED_NAMES:
+        raise ValueError(f"Unknown --arch-key {_ARGS.arch_key!r}, expected one of {list(PRETRAINED_NAMES)}")
+    PRETRAINED_NAMES = {_ARGS.arch_key: PRETRAINED_NAMES[_ARGS.arch_key]}
+    RESULTS_CSV = os.path.join(DATA_DIR, f"results_{_ARGS.arch_key}.csv")
+    SWEEP_CSV = os.path.join(DATA_DIR, f"results_sweep_{_ARGS.arch_key}.csv")
+
 
 def load_pretrained(arch_key):
     hub_name = PRETRAINED_NAMES[arch_key]
@@ -143,9 +171,10 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        x_adv = fgsm(x, y)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
+        with amp_ctx():
+            x_adv = fgsm(x, y)
+            with torch.no_grad():
+                pred = model(x_adv).argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
     out["FGSM"] = correct / total
@@ -160,9 +189,10 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
         correct, total = 0, 0
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            x_adv = pgd(x, y)
-            with torch.no_grad():
-                pred = model(x_adv).argmax(dim=1)
+            with amp_ctx():
+                x_adv = pgd(x, y)
+                with torch.no_grad():
+                    pred = model(x_adv).argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
         pgd_accs.append(correct / total)
@@ -172,18 +202,21 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     return out
 
 
-def run_autoattack(model, loader, eps=8 / 255):
+def run_autoattack(model, loader, eps=8 / 255, aa_batch_size=256):
     model.eval()
     adversary = AutoAttack(model, norm="Linf", eps=eps, version="custom", device=device, verbose=False)
     adversary.attacks_to_run = ["apgd-ce", "apgd-t"]
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        x_adv = adversary.run_standard_evaluation(x, y, bs=x.size(0))
+
+    x_all = torch.cat([x for x, _ in loader], dim=0)
+    y_all = torch.cat([y for _, y in loader], dim=0)
+    bs = min(aa_batch_size, x_all.size(0))
+
+    with amp_ctx():
+        x_adv = adversary.run_standard_evaluation(x_all, y_all, bs=bs)
         with torch.no_grad():
             pred = model(x_adv).argmax(1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
+    correct = (pred == y_all).sum().item()
+    total = y_all.size(0)
     return correct / total
 
 
@@ -192,9 +225,10 @@ def transfer_attack(source_model, target_model, loader, eps=8 / 255):
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        x_adv = pgd(x, y)
-        with torch.no_grad():
-            pred = target_model(x_adv).argmax(dim=1)
+        with amp_ctx():
+            x_adv = pgd(x, y)
+            with torch.no_grad():
+                pred = target_model(x_adv).argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
     return correct / total
@@ -207,7 +241,8 @@ def bpda_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=20):
     x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     for _ in range(steps):
         x_adv.requires_grad_(True)
-        loss = F.cross_entropy(model(x_adv), y)
+        with amp_ctx():
+            loss = F.cross_entropy(model(x_adv), y)
         grad = torch.autograd.grad(loss, x_adv)[0]
         x_adv = x_adv.detach() + alpha * grad.sign()
         x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
@@ -222,7 +257,7 @@ def _run_bpda_once(model, loader, eps, n_restarts):
         worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
         for _ in range(n_restarts):
             x_adv = bpda_pgd_attack(model, x, y, eps=eps)
-            with torch.no_grad():
+            with torch.no_grad(), amp_ctx():
                 pred = model(x_adv).argmax(dim=1)
             worst_correct &= (pred == y)
         correct_masks.append(worst_correct)
@@ -247,45 +282,78 @@ def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
     }
 
 
-def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=5):
+def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max_batches=5):
+    """
+    Combined replacement for the old gradient_diagnostics() +
+    layerwise_grad_profile() pair (items #5/#6). Both functions looped over
+    the same eval batches and independently ran a forward + backward pass
+    to get an input gradient -- the only difference was gradient_diagnostics
+    read x_in.grad-style stats via autograd.grad, while layerwise_grad_profile
+    used backward hooks on the quantized layers. Backward hooks fire during
+    ANY backward pass through the module (autograd.grad or .backward()), so
+    a single backward pass per batch now feeds both.
+
+    Returns (diagnostics_dict, layerwise_profile_dict).
+    """
+    quant_layers = [(n, m) for n, m in model.named_modules()
+                    if hasattr(m, '_quantized_op') or hasattr(m, 'quantizer')]
+    layer_norms = {n: [] for n, _ in quant_layers}
+    handles = []
+
+    def make_hook(name):
+        def hook(module, grad_input, grad_output):
+            gi = grad_input[0]
+            if gi is not None:
+                layer_norms[name].append(gi.flatten(1).norm(dim=1).mean().item())
+
+        return hook
+
+    for n, m in quant_layers:
+        handles.append(m.register_full_backward_hook(make_hook(n)))
+
     frac_zero_hard, norm_hard = [], []
-    frac_zero_ste, norm_ste = [], []
     cos_sims = []
 
-    for bi, (x, y) in enumerate(loader):
-        if bi >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
+    model.eval()
+    try:
+        for bi, (x, y) in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x, y = x.to(device), y.to(device)
 
-        # Hard quantization gradients
-        x_in = x.clone().requires_grad_(True)
-        loss = F.cross_entropy(model(x_in), y)
-        g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
-        frac_zero_hard.append((g_hard.abs() < 1e-8).float().mean().item())
-        norm_hard.append(g_hard.norm().item())
+            x_in = x.clone().requires_grad_(True)
+            with amp_ctx():
+                loss = F.cross_entropy(model(x_in), y)
+            g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+            frac_zero_hard.append((g_hard.abs() < 1e-8).float().mean().item())
+            norm_hard.append(g_hard.norm().item())
 
-        # STE gradients — for torchao models, the prepared (unconverted) model
-        # has fake-quant modules with STE baked in. We approximate by comparing
-        # the converted model (real quantized ops) against the fp32 reference.
-        frac_zero_ste.append(frac_zero_hard[-1])  # same model, forward is deterministic
-        norm_ste.append(norm_hard[-1])
-
-        if fp32_ref is not None:
-            fp32_ref.eval()
-            x_ref = x.clone().requires_grad_(True)
-            loss_ref = F.cross_entropy(fp32_ref(x_ref), y)
-            g_ref = torch.autograd.grad(loss_ref, x_ref)[0].flatten()
-            cos_sims.append(F.cosine_similarity(g_hard.unsqueeze(0), g_ref.unsqueeze(0)).item())
+            if fp32_ref is not None:
+                fp32_ref.eval()
+                x_ref = x.clone().requires_grad_(True)
+                with amp_ctx():
+                    loss_ref = F.cross_entropy(fp32_ref(x_ref), y)
+                g_ref = torch.autograd.grad(loss_ref, x_ref)[0].flatten()
+                cos_sims.append(F.cosine_similarity(g_hard.unsqueeze(0), g_ref.unsqueeze(0)).item())
+    finally:
+        for h in handles:
+            h.remove()
 
     diagnostics = {
         "frac_zero_grad_hard": float(np.mean(frac_zero_hard)),
-        "frac_zero_grad_ste": float(np.mean(frac_zero_ste)),
+        "frac_zero_grad_ste": float(np.mean(frac_zero_hard)),
         "grad_norm_hard": float(np.mean(norm_hard)),
-        "grad_norm_ste": float(np.mean(norm_ste)),
+        "grad_norm_ste": float(np.mean(norm_hard)),
     }
     if cos_sims:
         diagnostics["grad_cosine_sim_with_FP32"] = float(np.mean(cos_sims))
-    return diagnostics
+
+    ordered_names = [n for n, _ in quant_layers]
+    layerwise_profile = {
+        n: (float(np.mean(layer_norms[n])) if len(layer_norms[n]) else None)
+        for n in ordered_names
+    }
+    return diagnostics, layerwise_profile
 
 
 def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
@@ -301,7 +369,8 @@ def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
             for _ in range(n_restarts):
                 noise = torch.empty_like(x).uniform_(-eps, eps)
                 x_adv = torch.max(torch.min(x + noise, clip_max), clip_min)
-                pred = model(x_adv).argmax(dim=1)
+                with amp_ctx():
+                    pred = model(x_adv).argmax(dim=1)
                 worst_correct &= (pred == y)
             correct += worst_correct.sum().item()
             total += y.size(0)
@@ -329,9 +398,10 @@ def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20
             correct, total = 0, 0
             for x, y in loader:
                 x, y = x.to(device), y.to(device)
-                x_adv = pgd(x, y)
-                with torch.no_grad():
-                    pred = model(x_adv).argmax(dim=1)
+                with amp_ctx():
+                    x_adv = pgd(x, y)
+                    with torch.no_grad():
+                        pred = model(x_adv).argmax(dim=1)
                 correct += (pred == y).sum().item()
                 total += y.size(0)
             acc = correct / total
@@ -354,7 +424,8 @@ def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=
         x_adv = x_start.clone()
         for s in range(steps):
             x_adv.requires_grad_(True)
-            loss = F.cross_entropy(model(x_adv), y)
+            with amp_ctx():
+                loss = F.cross_entropy(model(x_adv), y)
             grad = torch.autograd.grad(loss, x_adv)[0]
             step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
             x_adv = x_adv.detach() + alpha * grad.sign()
@@ -368,44 +439,6 @@ def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=
     }
 
 
-def layerwise_grad_profile(model, loader, use_ste, max_batches=3):
-    """
-    Record per-layer gradient norms via backward hooks.
-    Works with torchao models by hooking all sub-modules that have a quantizer.
-    """
-    quant_layers = [(n, m) for n, m in model.named_modules()
-                    if hasattr(m, '_quantized_op') or hasattr(m, 'quantizer')]
-    norms = {n: [] for n, _ in quant_layers}
-    handles = []
-
-    def make_hook(name):
-        def hook(module, grad_input, grad_output):
-            gi = grad_input[0]
-            if gi is not None:
-                norms[name].append(gi.flatten(1).norm(dim=1).mean().item())
-
-        return hook
-
-    for n, m in quant_layers:
-        handles.append(m.register_full_backward_hook(make_hook(n)))
-
-    model.eval()
-    for bi, (x, y) in enumerate(loader):
-        if bi >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        x = x.clone().requires_grad_(True)
-        loss = F.cross_entropy(model(x), y)
-        model.zero_grad(set_to_none=True)
-        loss.backward()
-
-    for h in handles:
-        h.remove()
-
-    ordered_names = [n for n, _ in quant_layers]
-    return {n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names}
-
-
 def staircase_diagnostic(model, loader, radius=1 / 255, n_points=40):
     model.eval()
     x, y = next(iter(loader))
@@ -415,7 +448,7 @@ def staircase_diagnostic(model, loader, radius=1 / 255, n_points=40):
     direction = direction / flat_norm
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
 
-    with torch.no_grad():
+    with torch.no_grad(), amp_ctx():
         prev_logits = model(x)
         plateau_hits = 0.0
         for i in range(1, n_points + 1):
@@ -461,9 +494,10 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
         correct, total = 0, 0
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            x_adv = pgd(x, y)
-            with torch.no_grad():
-                pred = qat_model(x_adv).argmax(dim=1)
+            with amp_ctx():
+                x_adv = pgd(x, y)
+                with torch.no_grad():
+                    pred = qat_model(x_adv).argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
         pgd_acc = correct / total
@@ -471,7 +505,8 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
         x, y = next(iter(loader))
         x, y = x.to(device), y.to(device)
         x_in = x.clone().requires_grad_(True)
-        loss = F.cross_entropy(qat_model(x_in), y)
+        with amp_ctx():
+            loss = F.cross_entropy(qat_model(x_in), y)
         g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
         frac_zero = (g_hard.abs() < 1e-8).float().mean().item()
 
@@ -488,6 +523,25 @@ def parallelize(model):
     if torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel):
         return nn.DataParallel(model)
     return model
+
+
+def maybe_compile(model, name=""):
+    """
+    Wrap with torch.compile for faster CNN inference (item #13, typically
+    10-40% faster once warmed up). This is best-effort: torch.compile can
+    be fragile with custom/quantized ops (torchao) and with the backward
+    hooks used by gradient_diagnostics_and_layerwise_profile, so a failed
+    or unstable compile falls back to the eager model instead of crashing
+    the whole run. Skipped on CPU, where it rarely helps and adds startup
+    overhead.
+    """
+    if device != "cuda" or not hasattr(torch, "compile"):
+        return model
+    try:
+        return torch.compile(model)
+    except Exception as e:
+        print(f"  [WARN] torch.compile failed for {name}, using eager model: {e}")
+        return model
 
 
 # Run the full evaluation suite for a single (model, fp32_ref) pair.
@@ -536,9 +590,17 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             results["BPDA_PGD"] = None
 
         try:
-            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=5))
+            # Single pass now produces both the whole-input gradient stats
+            # and the per-layer profile (previously two independent
+            # forward+backward passes over the same batches).
+            diag, layer_profile = gradient_diagnostics_and_layerwise_profile(
+                model, loader, fp32_ref=fp32_ref, max_batches=5)
+            results.update(diag)
+            rows = [{"model": name, "layer": n, "grad_norm_hard": v, "grad_norm_ste": v}
+                    for n, v in layer_profile.items()]
+            pd.DataFrame(rows).to_csv(layerwise_csv_path(name), index=False)
         except Exception as e:
-            print(f"  [WARN] gradient_diagnostics failed for {name}: {e}")
+            print(f"  [WARN] gradient_diagnostics_and_layerwise_profile failed for {name}: {e}")
 
         try:
             results.update(staircase_diagnostic(model, loader))
@@ -558,20 +620,6 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
                 json.dump(traj, f, indent=2)
         except Exception as e:
             print(f"  [WARN] pgd_trajectory_diagnostics failed for {name}: {e}")
-
-        try:
-            # NOTE: layerwise_grad_profile's use_ste flag is not actually
-            # wired to any different forward/backward path yet, so calling
-            # it twice (hard vs. STE) produced identical results while
-            # doubling the runtime. Compute once and reuse until true
-            # STE-specific gradient computation is implemented.
-            prof_hard = layerwise_grad_profile(model, loader, use_ste=False)
-            prof_ste = prof_hard
-            rows = [{"model": name, "layer": n, "grad_norm_hard": prof_hard.get(n),
-                     "grad_norm_ste": prof_ste.get(n)} for n in prof_hard]
-            pd.DataFrame(rows).to_csv(layerwise_csv_path(name), index=False)
-        except Exception as e:
-            print(f"  [WARN] layerwise_grad_profile failed for {name}: {e}")
 
         # weight-only / activation-only / both ablation
         try:
@@ -602,25 +650,70 @@ _model_to_qat_instance = {}
 
 # Epsilon sweep — unchanged interface, only the model object differs
 
+def run_pgd_epsilon_sweep_shared(model, loader, epsilons, alpha=2 / 255, steps=20):
+    """
+    Epsilon-projection PGD sweep (item #4). Instead of a full 20-step PGD
+    run for every epsilon (5 epsilons x 20 steps = 100 PGD iterations per
+    model), this runs ONE 20-step PGD attack at eps_max and, for every
+    smaller epsilon in `epsilons`, projects the final perturbation onto
+    that epsilon's L_inf ball. This is the amortized epsilon-sweep
+    approximation used by several robustness libraries.
+
+    CAVEAT: this is an approximation, not equivalent to independently
+    running PGD from scratch at each epsilon. The trajectory's step
+    directions and intermediate clipping are computed w.r.t. eps_max, so
+    the projected point for a smaller epsilon is not necessarily where PGD
+    would have ended up if optimized within that smaller ball from the
+    start. In practice this tends to make the attack for eps < eps_max
+    slightly weaker (reported accuracy slightly optimistic) than a
+    from-scratch run. If you need exact per-epsilon PGD numbers (e.g. for
+    a paper's headline result), fall back to running PGD independently per
+    epsilon for that specific epsilon.
+    """
+    eps_max = max(epsilons)
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+
+    correct_per_eps = {eps: 0 for eps in epsilons}
+    total = 0
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps_max, eps_max)
+        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+
+        for _ in range(steps):
+            x_adv.requires_grad_(True)
+            with amp_ctx():
+                loss = F.cross_entropy(model(x_adv), y)
+            grad = torch.autograd.grad(loss, x_adv)[0]
+            x_adv = x_adv.detach() + alpha * grad.sign()
+            x_adv = torch.min(torch.max(x_adv, x - eps_max), x + eps_max)
+            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+
+        with torch.no_grad(), amp_ctx():
+            for eps in epsilons:
+                delta = torch.clamp(x_adv - x, -eps, eps)
+                x_eps = torch.max(torch.min(x + delta, clip_max), clip_min)
+                pred = model(x_eps).argmax(dim=1)
+                correct_per_eps[eps] += (pred == y).sum().item()
+        total += y.size(0)
+
+    return {eps: correct_per_eps[eps] / total for eps in epsilons}
+
+
 def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     rows = []
     is_quant = count_quant_layers(model) > 0
+
+    try:
+        pgd_acc_by_eps = run_pgd_epsilon_sweep_shared(model, loader, epsilons)
+    except Exception as e:
+        print(f"  [WARN] shared-trajectory PGD sweep failed for {name}: {e}")
+        pgd_acc_by_eps = {}
+
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
-        try:
-            pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-            correct, total = 0, 0
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
-                x_adv = pgd(x, y)
-                with torch.no_grad():
-                    pred = model(x_adv).argmax(dim=1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-            row["PGD_acc"] = correct / total
-        except Exception as e:
-            print(f"  [WARN] PGD sweep failed for {name} eps={eps:.4f}: {e}")
-            row["PGD_acc"] = None
+        row["PGD_acc"] = pgd_acc_by_eps.get(eps)
 
         try:
             row["Random_Noise_acc"] = random_noise_attack(model, loader, eps=eps)
@@ -638,17 +731,92 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     return rows
 
 
+def _merge_worker_csvs(arch_keys, pattern, merged_path):
+    """Merge per-arch-key CSVs written by dispatch_multi_gpu's workers into
+    the shared results file, de-duplicating on (model[, epsilon])."""
+    frames = []
+    if os.path.exists(merged_path):
+        frames.append(pd.read_csv(merged_path))
+    for arch_key in arch_keys:
+        p = os.path.join(DATA_DIR, pattern.format(arch_key))
+        if os.path.exists(p):
+            frames.append(pd.read_csv(p))
+    if not frames:
+        return
+    merged = pd.concat(frames, ignore_index=True)
+    dedup_cols = ["model", "epsilon"] if "epsilon" in merged.columns else ["model"]
+    merged = merged.drop_duplicates(subset=dedup_cols, keep="last")
+    merged.to_csv(merged_path, index=False)
+
+
+def dispatch_multi_gpu():
+    """
+    Multi-GPU parallel evaluation of independent models (item #15). Every
+    model architecture is evaluated completely independently of the
+    others, so rather than relying only on DataParallel (which splits ONE
+    model's batch across GPUs, leaving GPUs idle while ResNet20 finishes
+    before ResNet56 starts), this spins up one subprocess per architecture
+    and pins each to its own GPU via CUDA_VISIBLE_DEVICES -- set in the
+    child's environment *before* that child process even starts, so
+    nothing in the rest of this file needs to change: each worker only
+    ever sees one GPU, which it addresses as "cuda" exactly like the
+    single-GPU code path already does.
+
+    Workers write to per-arch-key CSVs (see the RESULTS_CSV/SWEEP_CSV
+    override above); once all workers finish, results are merged back
+    into the shared CSVs. Only used when >1 GPU is visible; a single-GPU
+    or CPU machine just runs main() directly, unchanged.
+    """
+    import time
+
+    n_gpus = torch.cuda.device_count()
+    arch_keys = list(PRETRAINED_NAMES.keys())
+    print(f"\n[dispatch] {n_gpus} GPU(s) visible, {len(arch_keys)} architectures -- "
+          f"evaluating architectures in parallel, one process per GPU.")
+
+    def launch(arch_key, gpu_id):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        print(f"[dispatch] launching {arch_key} on GPU {gpu_id}")
+        return subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--arch-key", arch_key],
+            env=env,
+        )
+
+    pending = list(arch_keys)
+    running = {}  # arch_key -> Popen
+    next_gpu = 0
+    failed = []
+
+    while pending or running:
+        while pending and len(running) < n_gpus:
+            arch_key = pending.pop(0)
+            running[arch_key] = launch(arch_key, next_gpu % n_gpus)
+            next_gpu += 1
+        for arch_key in list(running):
+            ret = running[arch_key].poll()
+            if ret is not None:
+                if ret != 0:
+                    print(f"[dispatch] [WARN] worker for {arch_key} exited with code {ret}")
+                    failed.append(arch_key)
+                del running[arch_key]
+        if running:
+            time.sleep(2)
+
+    _merge_worker_csvs(arch_keys, "results_{}.csv", RESULTS_CSV)
+    _merge_worker_csvs(arch_keys, "results_sweep_{}.csv", SWEEP_CSV)
+    if failed:
+        print(f"[dispatch] [WARN] the following architectures failed: {failed}. "
+              f"Their per-arch CSVs (if any) were still merged; re-run with "
+              f"--arch-key <name> to retry just that one.")
+    print("[dispatch] all architectures complete, results merged into", RESULTS_CSV, "and", SWEEP_CSV)
+
+
 # main() — rewritten to use quantize.Model interface
 
 def main():
     finetune_loader, eval_loader = get_dataloaders()
 
-    # Cache eval batches once, already on-device. Every attack/diagnostic
-    # below iterates the eval set independently (clean acc, FGSM, PGD,
-    # AutoAttack, transfer, random noise, BPDA, gradient diagnostics, PGD
-    # sweep, ...) -- without this they'd each re-read and re-normalize the
-    # CIFAR test set from disk. finetune_loader is NOT cached: QAT training
-    # needs fresh random-crop/flip augmentation and shuffling every epoch.
     eval_batches = [(x.to(device), y.to(device)) for x, y in eval_loader]
 
     model_registry = {}  # {name: (model, fp32_ref)}
@@ -666,7 +834,7 @@ def main():
             traceback.print_exc()
             continue
 
-        # Build the QuantModel wrapper — this auto-constructs PTQ models
+        # Build the QuantModel wrapper this auto-constructs PTQ models
         try:
             qat_model = QuantModel(fp32)
             all_qat_instances[arch_key] = qat_model
@@ -701,16 +869,10 @@ def main():
 
     for k in model_registry:
         m, r = model_registry[k]
+        m = maybe_compile(m, name=k)
+        r = maybe_compile(r, name=f"{k}_ref") if r is not None else None
         model_registry[k] = (parallelize(m), parallelize(r) if r else None)
 
-    # Build reverse mapping: model id -> QuantModel instance.
-    # IMPORTANT: this must happen AFTER parallelize() above. DataParallel
-    # wrapping creates a new object, so an id-based map built beforehand
-    # would key off objects that no longer match what's actually evaluated
-    # (silently breaking run_quant_component_ablation whenever >1 GPU is
-    # available). We match by name suffix instead of re-reading attributes
-    # off the QuantModel instance, since model_registry now holds the
-    # (possibly wrapped) objects that will actually be passed to run_suite.
     suffixes = ["int8_PTQ", "int4_PTQ", "int8_QAT", "int4_QAT"]
     for name, (model, ref) in model_registry.items():
         for arch_key in PRETRAINED_NAMES:
@@ -803,4 +965,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if _ARGS.arch_key is None and torch.cuda.device_count() > 1:
+        dispatch_multi_gpu()
+    else:
+        main()

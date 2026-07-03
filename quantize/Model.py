@@ -19,9 +19,7 @@ def _get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ---------------------------------------------------------------------------
 # Mapping from bitwidth string to torchao base config & QAT config
-# ---------------------------------------------------------------------------
 
 _BITWIDTH_TO_CONFIG = {
     4: {
@@ -71,9 +69,7 @@ def _config_for_bits(bits):
     )
 
 
-# ---------------------------------------------------------------------------
 # Model
-# ---------------------------------------------------------------------------
 
 
 class Model:
@@ -107,7 +103,7 @@ class Model:
         self.model = model
         self._device = _get_device()
 
-        # ---- PTQ models (built immediately) --------------------------------
+        #- PTQ models (built immediately)-----------------------------
         # int4 PTQ would require mslk >= 1.0.0 or CUDA+bf16, so we defer it.
         self.int4_PTQ = None
 
@@ -119,7 +115,7 @@ class Model:
             ),
         )
 
-        # ---- QAT models (in "untrained" state) ----------------------------
+        #- QAT models (in "untrained" state)-------------------------
         # These start as plain deepcopies; they become "QAT" after train_qat().
         self.int4_QAT_untrained = None  # built on first train_qat(4) call
         self.int8_QAT_untrained = copy.deepcopy(model)
@@ -129,9 +125,7 @@ class Model:
             8: False,
         }  # tracks whether prepare+convert has run
 
-    # ------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------
 
     def _apply_qat_prepare(self, qat_model, bits):
         """
@@ -167,9 +161,7 @@ class Model:
         else:
             return self.int8_QAT_untrained
 
-    # ------------------------------------------------------------------
     # QAT preparation
-    # ------------------------------------------------------------------
 
     def prepare_qat(self, bits):
         """
@@ -205,9 +197,7 @@ class Model:
         )
         return qat_model
 
-    # ------------------------------------------------------------------
     # Standard QAT training (clean data)
-    # ------------------------------------------------------------------
 
     def train_qat(
         self,
@@ -286,9 +276,7 @@ class Model:
         print(f"[qat] Standard QAT training complete ({name}).")
         return getattr(self, name)
 
-    # ------------------------------------------------------------------
     # Adversarial QAT training (PGD-based)
-    # ------------------------------------------------------------------
 
     def train_qat_adv(
         self,
@@ -361,7 +349,7 @@ class Model:
             for bi, (x, y) in enumerate(finetune_loader):
                 x, y = x.to(device), y.to(device)
 
-                # --- Inner PGD (adv example crafting) ---
+                # Inner PGD (adv example crafting)
                 x_adv = x.clone() + torch.empty_like(x).uniform_(-eps, eps)
                 x_adv = torch.clamp(x_adv, clip_min, clip_max).detach()
 
@@ -378,7 +366,7 @@ class Model:
                         clip_max,
                     ).detach()
 
-                # --- Outer weight update ---
+                # Outer weight update
                 opt.zero_grad(set_to_none=True)
                 loss = F.cross_entropy(qat_model(x_adv), y)
                 loss.backward()
@@ -408,9 +396,7 @@ class Model:
         print(f"[qat_adv] Adversarial QAT training complete ({name}).")
         return getattr(self, name)
 
-    # ------------------------------------------------------------------
     # Inference helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def clean_accuracy(model, loader):
@@ -496,9 +482,7 @@ class Model:
             "clean_acc": acc,
         }
 
-    # ------------------------------------------------------------------
     # Summary / inspection
-    # ------------------------------------------------------------------
 
     def summary(self):
         """
@@ -514,7 +498,7 @@ class Model:
 
         for bits in (4, 8):
             label_prefix = f"int{bits}"
-            lines.append(f"--- {label_prefix} ---")
+            lines.append(f"--- {label_prefix}")
             ptq_ref = getattr(self, f"{label_prefix}_PTQ", None)
             lines.append(f"  PTQ built: {ptq_ref is not None}")
             lines.append(f"  QAT prepared: {self._qat_initialized[bits]}")

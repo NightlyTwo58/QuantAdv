@@ -43,3 +43,6 @@ cifar-100-python
 .tar.gz*
 .idea/
 __pycache__
+
+data
+benchmarking
