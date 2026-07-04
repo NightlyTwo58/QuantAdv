@@ -7,6 +7,7 @@ from torchao.quantization import (
 )
 from torchao.quantization.granularity import PerGroup
 from torchao.quantization.qat import QATConfig
+from torchao.quantization.qat.linear import FakeQuantizedLinear
 import copy
 import time
 
@@ -117,10 +118,17 @@ class Model:
         quantize_(qat_model, qat_convert_config)
 
     def _count_quant_layers(self, model):
-        """Count quantized layers in a model (modules with quantized params)."""
+        """Count quantized layers in a model.
+
+        Detects:
+          - FakeQuantizedLinear / FakeQuantizedConv2d (QAT prepare state)
+          - Modules with _quantized_op (QAT convert state, torchao >= 0.8)
+        """
         count = 0
         for mod in model.modules():
-            if hasattr(mod, "_quantized_op"):
+            if isinstance(mod, (FakeQuantizedLinear,)):
+                count += 1
+            elif hasattr(mod, "_quantized_op") and mod._quantized_op is not None:
                 count += 1
         return count
 
@@ -332,7 +340,8 @@ class Model:
             "===== Model Summary =====",
             f"Device: {device}",
             f"Base model: {type(self.model).__name__}",
-            "",
+            f"Input shape: {self.model.weight.shape}",
+            f"Output shape: {self.model.forward(torch.zeros(self.model.weight.shape)).shape}",
         ]
 
         for bits in (8,):
@@ -340,8 +349,14 @@ class Model:
             lines.append(f"--- {label_prefix}")
             ptq_ref = getattr(self, f"{label_prefix}_PTQ", None)
             lines.append(f"  PTQ built: {ptq_ref is not None}")
+            if ptq_ref is not None:
+                lines.append(f"PTQ Input shape: {self.int8_PTQ[0].weight.shape}")
+                lines.append(f"PTQ Output shape: {self.int8_PTQ.forward(torch.zeros(self.int8_PTQ[0].weight.shape)).shape}")
+            
             lines.append(f"  QAT prepared: {self._qat_initialized[bits]}")
-
+            if self._qat_initialized[bits] is not None:
+                lines.append(f"QAT Input shape: {self.int8_QAT_untrained[0].weight.shape}")
+                lines.append(f"QAT Output shape: {self.int8_QAT_untrained.forward(torch.zeros(self.int8_QAT_untrained[0].weight.shape)).shape}")
             lines.append(f"  QAT (clean) built: {getattr(self, f'{label_prefix}_QAT', None) is not None}")
             lines.append("")
 

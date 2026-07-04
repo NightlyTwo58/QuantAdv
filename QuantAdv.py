@@ -27,6 +27,7 @@ import torchattacks
 from autoattack import AutoAttack
 
 from quantize import Model as QuantModel
+from torchao.quantization.qat.linear import FakeQuantizedLinear
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -50,6 +51,14 @@ _ARGS = _parse_args()
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
+
+def results_csv_path(model_name):
+    return os.path.join(DATA_DIR, f"results_{model_name}.csv")
+
+
+def sweep_csv_path(model_name):
+    return os.path.join(DATA_DIR, f"sweep_{model_name}.csv")
+
 
 RESULTS_CSV = os.path.join(DATA_DIR, "results.csv")
 SWEEP_CSV = os.path.join(DATA_DIR, "results_sweep.csv")
@@ -134,6 +143,7 @@ if _ARGS.arch_key is not None:
     if _ARGS.arch_key not in PRETRAINED_NAMES:
         raise ValueError(f"Unknown --arch-key {_ARGS.arch_key!r}, expected one of {list(PRETRAINED_NAMES)}")
     PRETRAINED_NAMES = {_ARGS.arch_key: PRETRAINED_NAMES[_ARGS.arch_key]}
+    # Per-arch paths are now derived from model names; keep these for backward compat.
     RESULTS_CSV = os.path.join(DATA_DIR, f"results_{_ARGS.arch_key}.csv")
     SWEEP_CSV = os.path.join(DATA_DIR, f"results_sweep_{_ARGS.arch_key}.csv")
 
@@ -289,7 +299,9 @@ def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max
     Returns (diagnostics_dict, layerwise_profile_dict).
     """
     quant_layers = [(n, m) for n, m in model.named_modules()
-                    if hasattr(m, '_quantized_op') or hasattr(m, 'quantizer')]
+                    if isinstance(m, FakeQuantizedLinear)
+                    or hasattr(m, '_quantized_op') and m._quantized_op is not None
+                    or hasattr(m, 'quantizer')]
     layer_norms = {n: [] for n, _ in quant_layers}
     handles = []
 
@@ -490,7 +502,8 @@ def maybe_compile(model, name=""):
     if device != "cuda" or not hasattr(torch, "compile"):
         return model
     try:
-        return torch.compile(model)
+        print(f"[INFO] Compiling model")
+        return torch.compile(model, backend="cudagraphs")
     except Exception as e:
         print(f"  [WARN] torch.compile failed for {name}, using eager model: {e}")
         return model
@@ -712,13 +725,13 @@ def dispatch_multi_gpu():
         if running:
             time.sleep(2)
 
-    _merge_worker_csvs(arch_keys, "results_{}.csv", RESULTS_CSV)
-    _merge_worker_csvs(arch_keys, "results_sweep_{}.csv", SWEEP_CSV)
+    # Per-model CSVs are already separate; no merging needed.
+    # (The shared RESULTS_CSV and SWEEP_CSV still get created if --arch-key is used.)
     if failed:
         print(f"[dispatch] [WARN] the following architectures failed: {failed}. "
-              f"Their per-arch CSVs (if any) were still merged; re-run with "
+              f"Their per-model CSVs (if any) remain in the data directory; re-run with "
               f"--arch-key <name> to retry just that one.")
-    print("[dispatch] all architectures complete, results merged into", RESULTS_CSV, "and", SWEEP_CSV)
+    print("[dispatch] all architectures complete. Per-model results written to", DATA_DIR)
 
 
 # main() — rewritten to use quantize.Model interface
@@ -731,8 +744,8 @@ def main():
 
     import gc
 
-    df_results, done, results_rows = load_resumable_csv(
-        RESULTS_CSV, key_fn=lambda row: str(row["model"]), empty_columns=["model"])
+    # We no longer need a shared results_df; each model writes its own file.
+    df_results = pd.DataFrame()
 
     for arch_key in PRETRAINED_NAMES:
         print(f"\n>>> {arch_key} <<<")
@@ -777,11 +790,18 @@ def main():
                 _model_to_qat_instance[id(variants[name][0])] = qat_model
                 break
 
+        # qat_model.summary()
+
         # --- Evaluate each variant one at a time ---
         for name, (model, ref) in variants.items():
-            if name in done:
-                print(f"  Skipping {name} (already in {RESULTS_CSV})")
-                continue
+            model_csv = results_csv_path(name)
+            if os.path.exists(model_csv):
+                df_check = pd.read_csv(model_csv)
+                if not df_check.empty and str(df_check.iloc[0].get("model")) == name:
+                    print(f"  Skipping {name} (results already in {model_csv})")
+                    # Still track it for the final plot
+                    df_results = pd.concat([df_results, pd.read_csv(model_csv)], ignore_index=True)
+                    continue
 
             # Compile / parallelize for this run
             model = maybe_compile(model, name=name)
@@ -797,9 +817,9 @@ def main():
                 traceback.print_exc()
                 res = {"model": name}
 
-            results_rows.append(res)
-            df_results = pd.DataFrame(results_rows)
-            df_results.to_csv(RESULTS_CSV, index=False)
+            # Write this model's results to its own CSV file
+            pd.DataFrame([res]).to_csv(model_csv, index=False)
+            df_results = pd.concat([df_results, pd.DataFrame([res])], ignore_index=True)
 
             print("  Result:")
             print(pd.DataFrame([res]).to_string(index=False))
@@ -816,6 +836,17 @@ def main():
         del fp32
         del qat_model
         gc.collect()
+
+    # Collect all per-model result CSVs for plotting
+    result_files = [f for f in os.listdir(DATA_DIR) if f.startswith("results_") and f.endswith(".csv") and f != "results.csv"]
+    if result_files:
+        frames = []
+        for rf in result_files:
+            fp = os.path.join(DATA_DIR, rf)
+            df_tmp = pd.read_csv(fp)
+            frames.append(df_tmp)
+        if frames:
+            df_results = pd.concat(frames, ignore_index=True)
 
     print("\nFinal results:")
     print(df_results)
@@ -839,8 +870,8 @@ def main():
     # Epsilon sweep — one architecture at a time (reuses same load→build→evaluate→free pattern)
     SWEEP_EPSILONS = [1 / 255, 2 / 255, 4 / 255, 8 / 255, 16 / 255]
 
-    df_sweep, sweep_done, sweep_rows = load_resumable_csv(
-        SWEEP_CSV, key_fn=lambda row: (str(row["model"]), round(row["epsilon"], 6)), empty_columns=[])
+    # Per-model sweep files
+    sweep_rows = []
 
     for arch_key in PRETRAINED_NAMES:
         print(f"\n>>> Sweep: {arch_key} <<<")
@@ -862,12 +893,32 @@ def main():
 
         # Evaluate each variant in this architecture
         for name, (model, ref) in sweep_variants.items():
-            pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done]
-            if not pending_eps:
-                print(f"  Sweep already done for {name}")
-                continue
+            model_sweep_csv = sweep_csv_path(name)
+            # Check if this model already has sweep results
             if model is None:
-                print(f"  Skipping {name} (QAT not trained, skip sweep)")
+                print(f"  Skipping sweep for {name} (QAT not trained)")
+                continue
+
+            existing_rows = []
+            if os.path.exists(model_sweep_csv):
+                existing_df = pd.read_csv(model_sweep_csv)
+                if not existing_df.empty:
+                    sweep_done_existing = set(
+                        (str(row["model"]), round(row["epsilon"], 6))
+                        for _, row in existing_df.iterrows()
+                        if "model" in row and "epsilon" in row
+                    )
+                    existing_rows = existing_df.to_dict("records")
+                else:
+                    sweep_done_existing = set()
+            else:
+                sweep_done_existing = set()
+
+            pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done_existing]
+            if not pending_eps:
+                if existing_rows:
+                    sweep_rows.extend(existing_rows)
+                print(f"  Sweep already done for {name}")
                 continue
 
             print(f"\n  Sweeping {name} ...")
@@ -876,11 +927,11 @@ def main():
             ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
             ref = parallelize(ref) if ref is not None else None
             try:
-                rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps)
-                if rows:
-                    sweep_rows.extend(rows)
-                    df_sweep = pd.DataFrame(sweep_rows)
-                    df_sweep.to_csv(SWEEP_CSV, index=False)
+                new_rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps)
+                if new_rows:
+                    sweep_rows.extend(existing_rows + new_rows)
+                    all_new = existing_rows + new_rows
+                    pd.DataFrame(all_new).to_csv(model_sweep_csv, index=False)
             except Exception as e:
                 print(f"  [FAIL] epsilon sweep failed for {name}: {e}")
                 traceback.print_exc()
@@ -889,7 +940,10 @@ def main():
                 del ref
             gc.collect()
 
-    print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
+    # Save combined sweep if any rows exist
+    if sweep_rows:
+        pd.DataFrame(sweep_rows).to_csv(SWEEP_CSV, index=False)
+    print("\nEpsilon sweep completed. Per-model results saved to individual sweep CSVs.")
     print("All done.")
 
 
