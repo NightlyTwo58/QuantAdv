@@ -19,11 +19,10 @@ import traceback
 import sys
 import argparse
 import subprocess
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-import torchattacks
 from autoattack import AutoAttack
 
 from quantize import Model as QuantModel
@@ -38,6 +37,45 @@ def amp_ctx():
     if USE_AMP:
         return torch.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
+
+
+@contextmanager
+def tolerate_masked_gradients():
+    """
+    Some quantized models (e.g. int8 PTQ, and int8 QAT after convert) have a
+    dynamic-activation quantization op with no autograd support at all -- not
+    "small"/masked gradients, a fully severed graph. Our own attack code
+    (pgd_step, fgsm_attack, pgd_attack, the gradient diagnostics) already
+    handles this via allow_unused=True + a zero-gradient fallback, verified
+    against real torchao models.
+
+    Third-party attack libraries we call into (AutoAttack's APGD) do their own
+    unguarded torch.autograd.grad(loss, [x])[0] internally, with no
+    allow_unused, and hard-crash the same way our code used to. We can't edit
+    a vendored site-packages install, so this monkeypatches torch.autograd.grad
+    for the duration of the `with` block only, applying the exact same
+    "no gradient path -> zero gradient" convention, then restores the original.
+    Verified against the real autoattack package: it lets AutoAttack finish and
+    return a real accuracy number instead of raising, and doesn't suppress
+    AutoAttack's own "N points with zero gradient" warnings.
+    """
+    real_grad = torch.autograd.grad
+
+    def _patched_grad(outputs, inputs, *args, **kwargs):
+        kwargs.setdefault("allow_unused", True)
+        grads = real_grad(outputs, inputs, *args, **kwargs)
+        inputs_seq = [inputs] if isinstance(inputs, torch.Tensor) else list(inputs)
+        return tuple(
+            torch.zeros_like(inp) if g is None else g
+            for g, inp in zip(grads, inputs_seq)
+        )
+
+    torch.autograd.grad = _patched_grad
+    try:
+        yield
+    finally:
+        torch.autograd.grad = real_grad
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(add_help=False)
@@ -91,7 +129,7 @@ def component_ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
 
 def _startup_checks():
-    missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
+    missing = [pkg for pkg in ("autoattack",) if importlib.util.find_spec(pkg) is None]
     if missing:
         raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
     print("All required packages are available.")
@@ -180,12 +218,48 @@ def pgd_step(model, x_adv, x, y, eps, alpha, clip_min=CLIP_MIN_DEV, clip_max=CLI
     x_adv = x_adv.clone().requires_grad_(True)
     with amp_ctx():
         loss = F.cross_entropy(model(x_adv), y)
-    grad = torch.autograd.grad(loss, x_adv)[0]
+    # allow_unused=True: for some quantized models (e.g. int8 PTQ where the
+    # only quantized layer is the final Linear head) the activation-quantization
+    # op is non-differentiable and sits right before the loss, severing the
+    # entire gradient path back to x_adv. That's total gradient masking, not
+    # a bug -- torch.autograd.grad would otherwise hard-crash on it. Treat a
+    # None gradient as zero, i.e. this step is a no-op perturbation.
+    grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+    if grad is None:
+        grad = torch.zeros_like(x_adv)
     x_adv = x_adv.detach() + alpha * grad.sign()
     x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
     x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     if return_grad:
         return x_adv, grad
+    return x_adv
+
+
+def fgsm_attack(model, x, y, eps, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV):
+    """Single-step FGSM, built on the same allow_unused-safe gradient logic
+    as pgd_step, in place of torchattacks.FGSM (which hard-crashes instead
+    of tolerating a fully-masked gradient)."""
+    x_adv = x.clone().detach().requires_grad_(True)
+    with amp_ctx():
+        loss = F.cross_entropy(model(x_adv), y)
+    grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+    if grad is None:
+        grad = torch.zeros_like(x_adv)
+    x_adv = x_adv.detach() + eps * grad.sign()
+    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    return x_adv
+
+
+def pgd_attack(model, x, y, eps, alpha=2 / 255, steps=20, random_start=True,
+               clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV):
+    """Multi-step PGD built on pgd_step, in place of torchattacks.PGD."""
+    if random_start:
+        x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    else:
+        x_adv = x.clone().detach()
+    for _ in range(steps):
+        x_adv = pgd_step(model, x_adv, x, y, eps, alpha, clip_min=clip_min, clip_max=clip_max)
     return x_adv
 
 
@@ -218,14 +292,13 @@ def safe_run(fn, name, label):
 
 def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     model.eval()
-    fgsm = torchattacks.FGSM(model, eps=eps)
-    out = {"FGSM": evaluate_under_attack(model, loader, lambda x, y: fgsm(x, y))}
-
-    pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+    out = {"FGSM": evaluate_under_attack(model, loader, lambda x, y: fgsm_attack(model, x, y, eps))}
 
     def run_seed(seed):
         torch.manual_seed(seed)
-        return evaluate_under_attack(model, loader, lambda x, y: pgd(x, y))
+        return evaluate_under_attack(
+            model, loader,
+            lambda x, y: pgd_attack(model, x, y, eps, alpha=2 / 255, steps=20, random_start=True))
 
     out.update(seeded_average(run_seed, seeds, "PGD"))
     return out
@@ -240,7 +313,7 @@ def run_autoattack(model, loader, eps=8 / 255, aa_batch_size=256):
     y_all = torch.cat([y for _, y in loader], dim=0)
     bs = min(aa_batch_size, x_all.size(0))
 
-    with amp_ctx():
+    with amp_ctx(), tolerate_masked_gradients():
         x_adv = adversary.run_standard_evaluation(x_all, y_all, bs=bs)
         with torch.no_grad():
             pred = model(x_adv).argmax(1)
@@ -250,8 +323,9 @@ def run_autoattack(model, loader, eps=8 / 255, aa_batch_size=256):
 
 
 def transfer_attack(source_model, target_model, loader, eps=8 / 255):
-    pgd = torchattacks.PGD(source_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-    return evaluate_under_attack(target_model, loader, lambda x, y: pgd(x, y))
+    return evaluate_under_attack(
+        target_model, loader,
+        lambda x, y: pgd_attack(source_model, x, y, eps, alpha=2 / 255, steps=20, random_start=True))
 
 
 def bpda_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=20):
@@ -300,8 +374,10 @@ def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max
     """
     quant_layers = [(n, m) for n, m in model.named_modules()
                     if isinstance(m, FakeQuantizedLinear)
-                    or hasattr(m, '_quantized_op') and m._quantized_op is not None
-                    or hasattr(m, 'quantizer')]
+                    or (hasattr(m, '_quantized_op') and m._quantized_op is not None)
+                    or hasattr(m, 'quantizer')
+                    or (getattr(m, 'weight', None) is not None
+                        and type(m.weight).__module__.startswith('torchao'))]
     layer_norms = {n: [] for n, _ in quant_layers}
     handles = []
 
@@ -329,7 +405,10 @@ def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max
             x_in = x.clone().requires_grad_(True)
             with amp_ctx():
                 loss = F.cross_entropy(model(x_in), y)
-            g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+            g_hard = torch.autograd.grad(loss, x_in, allow_unused=True)[0]
+            if g_hard is None:
+                g_hard = torch.zeros_like(x_in)
+            g_hard = g_hard.flatten()
             frac_zero_hard.append((g_hard.abs() < 1e-8).float().mean().item())
             norm_hard.append(g_hard.norm().item())
 
@@ -338,7 +417,10 @@ def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max
                 x_ref = x.clone().requires_grad_(True)
                 with amp_ctx():
                     loss_ref = F.cross_entropy(fp32_ref(x_ref), y)
-                g_ref = torch.autograd.grad(loss_ref, x_ref)[0].flatten()
+                g_ref = torch.autograd.grad(loss_ref, x_ref, allow_unused=True)[0]
+                if g_ref is None:
+                    g_ref = torch.zeros_like(x_ref)
+                g_ref = g_ref.flatten()
                 cos_sims.append(F.cosine_similarity(g_hard.unsqueeze(0), g_ref.unsqueeze(0)).item())
     finally:
         for h in handles:
@@ -392,8 +474,9 @@ def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20
         if steps == 0:
             acc = random_noise_attack(model, loader, eps=eps, seed=0)
         else:
-            pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
-            acc = evaluate_under_attack(model, loader, lambda x, y: pgd(x, y))
+            acc = evaluate_under_attack(
+                model, loader,
+                lambda x, y: pgd_attack(model, x, y, eps, alpha=2 / 255, steps=steps, random_start=True))
         out[steps] = acc
     return out
 
@@ -469,15 +552,19 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
         clean_acc = sanity_check_accuracy(qat_model, loader)
 
         torch.manual_seed(0)
-        pgd = torchattacks.PGD(qat_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-        pgd_acc = evaluate_under_attack(qat_model, loader, lambda x, y: pgd(x, y))
+        pgd_acc = evaluate_under_attack(
+            qat_model, loader,
+            lambda x, y: pgd_attack(qat_model, x, y, eps, alpha=2 / 255, steps=20, random_start=True))
 
         x, y = next(iter(loader))
         x, y = x.to(device), y.to(device)
         x_in = x.clone().requires_grad_(True)
         with amp_ctx():
             loss = F.cross_entropy(qat_model(x_in), y)
-        g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+        g_hard = torch.autograd.grad(loss, x_in, allow_unused=True)[0]
+        if g_hard is None:
+            g_hard = torch.zeros_like(x_in)
+        g_hard = g_hard.flatten()
         frac_zero = (g_hard.abs() < 1e-8).float().mean().item()
 
         rows.append({

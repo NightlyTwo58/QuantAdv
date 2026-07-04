@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torchao.quantization import (
     quantize_,
     Int8DynamicActivationIntxWeightConfig,
+    IntxWeightOnlyConfig,
 )
 from torchao.quantization.granularity import PerGroup
 from torchao.quantization.qat import QATConfig
@@ -95,6 +96,12 @@ class Model:
             ),
         )
 
+        self.int8_PTQ_weight_only = copy.deepcopy(model)
+        quantize_(
+            self.int8_PTQ_weight_only,
+            IntxWeightOnlyConfig(weight_dtype=torch.int8, granularity=PerGroup(32)),
+        )
+
         #- QAT models (in "untrained" state)-------------------------
         # These start as plain deepcopies; they become "QAT" after prepare_qat().
         self.int8_QAT_untrained = copy.deepcopy(model)
@@ -117,18 +124,29 @@ class Model:
         _, _, qat_convert_config = _config_for_bits(bits)
         quantize_(qat_model, qat_convert_config)
 
-    def _count_quant_layers(self, model):
+    @staticmethod
+    def _count_quant_layers(model):
         """Count quantized layers in a model.
 
         Detects:
           - FakeQuantizedLinear / FakeQuantizedConv2d (QAT prepare state)
-          - Modules with _quantized_op (QAT convert state, torchao >= 0.8)
+          - Modules with _quantized_op (older torchao QAT-convert representation)
+          - Modules whose .weight has been replaced by a torchao tensor-subclass
+            (current torchao's PTQ and QAT-convert representation, e.g.
+            IntxUnpackedToInt8Tensor for Int8DynamicActivationIntxWeightConfig).
+            Without this branch, PTQ and post-convert QAT models silently report
+            0 quantized layers even though they are quantized.
         """
         count = 0
         for mod in model.modules():
             if isinstance(mod, (FakeQuantizedLinear,)):
                 count += 1
-            elif hasattr(mod, "_quantized_op") and mod._quantized_op is not None:
+                continue
+            if hasattr(mod, "_quantized_op") and mod._quantized_op is not None:
+                count += 1
+                continue
+            weight = getattr(mod, "weight", None)
+            if weight is not None and type(weight).__module__.startswith("torchao"):
                 count += 1
         return count
 
@@ -336,28 +354,42 @@ class Model:
         Print a summary of all built models and their QAT state.
         """
         device = _get_device()
+
+        def _num_params(m):
+            return sum(p.numel() for p in m.parameters())
+
         lines = [
             "===== Model Summary =====",
             f"Device: {device}",
             f"Base model: {type(self.model).__name__}",
-            f"Input shape: {self.model.weight.shape}",
-            f"Output shape: {self.model.forward(torch.zeros(self.model.weight.shape)).shape}",
+            f"Base model parameters: {_num_params(self.model):,}",
         ]
 
         for bits in (8,):
             label_prefix = f"int{bits}"
             lines.append(f"--- {label_prefix}")
+
             ptq_ref = getattr(self, f"{label_prefix}_PTQ", None)
-            lines.append(f"  PTQ built: {ptq_ref is not None}")
+            lines.append(f"  PTQ (activation+weight) built: {ptq_ref is not None}")
             if ptq_ref is not None:
-                lines.append(f"PTQ Input shape: {self.int8_PTQ[0].weight.shape}")
-                lines.append(f"PTQ Output shape: {self.int8_PTQ.forward(torch.zeros(self.int8_PTQ[0].weight.shape)).shape}")
-            
-            lines.append(f"  QAT prepared: {self._qat_initialized[bits]}")
-            if self._qat_initialized[bits] is not None:
-                lines.append(f"QAT Input shape: {self.int8_QAT_untrained[0].weight.shape}")
-                lines.append(f"QAT Output shape: {self.int8_QAT_untrained.forward(torch.zeros(self.int8_QAT_untrained[0].weight.shape)).shape}")
-            lines.append(f"  QAT (clean) built: {getattr(self, f'{label_prefix}_QAT', None) is not None}")
+                lines.append(f"    quantized layers: {self._count_quant_layers(ptq_ref)}")
+
+            ptq_wo_ref = getattr(self, f"{label_prefix}_PTQ_weight_only", None)
+            lines.append(f"  PTQ (weight-only) built: {ptq_wo_ref is not None}")
+            if ptq_wo_ref is not None:
+                lines.append(f"    quantized layers: {self._count_quant_layers(ptq_wo_ref)}")
+
+            qat_prepared = self._qat_initialized[bits]
+            lines.append(f"  QAT prepared: {qat_prepared}")
+            qat_untrained_ref = getattr(self, f"{label_prefix}_QAT_untrained", None)
+            if qat_prepared and qat_untrained_ref is not None:
+                lines.append(f"    fake-quantized layers: {self._count_quant_layers(qat_untrained_ref)}")
+
+            qat_trained_ref = getattr(self, f"{label_prefix}_QAT", None)
+            lines.append(f"  QAT (clean, trained+converted) built: {qat_trained_ref is not None}")
+            if qat_trained_ref is not None:
+                lines.append(f"    quantized layers: {self._count_quant_layers(qat_trained_ref)}")
+
             lines.append("")
 
         return "\n".join(lines)
