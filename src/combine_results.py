@@ -10,9 +10,9 @@ Per-model files (all in DATA_DIR), one set per model:
                               plateau_fraction)
   sweep_<model>.csv        -- epsilon sweep (PGD_acc, BPDA_acc, now also
                               Random_Noise_acc)
-  ablation_<model>.csv     -- NEW: PGD accuracy at step counts 0/1/2/5/10/20/50
-  layerwise_<model>.csv    -- NEW: per-layer input-gradient norm, hard vs STE
-  trajectory_<model>.json  -- NEW: per-step grad norm / movement during PGD
+  ablation_<model>.csv     -- PGD accuracy at step counts 0/1/2/5/10/20/50
+  layerwise_<model>.csv    -- per-layer input-gradient norm, hard vs STE
+  trajectory_<model>.json  -- per-step grad norm / movement during PGD
 
 Run this after launcher.py finishes all subprocesses:
 
@@ -21,16 +21,18 @@ Run this after launcher.py finishes all subprocesses:
 Safe to re-run at any time since it only reads whatever per-model files
 currently exist and never mutates them.
 """
-
 import glob
 import json
 import os
+from pathlib import Path
 
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-DATA_DIR = "data"
+PROJECT_ROOT = Path(__file__).parent.parent
+
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 RESULTS_GLOB = os.path.join(DATA_DIR, "results_*.csv")
 SWEEP_GLOB = os.path.join(DATA_DIR, "sweep_*.csv")

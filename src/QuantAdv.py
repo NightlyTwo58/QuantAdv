@@ -20,18 +20,63 @@ import sys
 import argparse
 import subprocess
 from contextlib import nullcontext, contextmanager
+from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 from autoattack import AutoAttack
 
-from quantize import Model as QuantModel
+from Model import Model as QuantModel
 from torchao.quantization.qat.linear import FakeQuantizedLinear
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_AMP = torch.cuda.is_available()
 
+PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+def _parse_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--arch-key", default=None,
+                        help="Internal: restrict this run to a single architecture.")
+    args, _ = parser.parse_known_args()
+    return args
+
+_ARGS = _parse_args()
+
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+RESULTS_CSV = os.path.join(DATA_DIR, "results.csv")
+SWEEP_CSV = os.path.join(DATA_DIR, "results_sweep.csv")
+PLOT_PNG = os.path.join(DATA_DIR, "accuracy_plot.png")
+
+SEEDS = [0, 1, 2]
+
+PRETRAINED_NAMES = {
+    "ResNet20": "cifar10_resnet20",
+    "ResNet56": "cifar10_resnet56",
+    "MobileNetV2": "cifar10_mobilenetv2_x1_0",
+    "VGG16_BN": "cifar10_vgg16_bn",
+    "ShuffleNetV2": "cifar10_shufflenetv2_x1_0",
+    "RepVGG_A0": "cifar10_repvgg_a0"
+}
+
+CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
+CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
+CLIP_MIN = ((0.0 - CIFAR_MEAN) / CIFAR_STD)
+CLIP_MAX = ((1.0 - CIFAR_MEAN) / CIFAR_STD)
+CLIP_MIN_DEV = CLIP_MIN.to(device)
+CLIP_MAX_DEV = CLIP_MAX.to(device)
+
+
+"""
+Single Python invocation analysis of metrics of attacks per model and eplison
+
+Migrated to use quantize.Model class interface (torchao-based quantization).
+"""
 
 def amp_ctx():
     if USE_AMP:
@@ -41,24 +86,6 @@ def amp_ctx():
 
 @contextmanager
 def tolerate_masked_gradients():
-    """
-    Some quantized models (e.g. int8 PTQ, and int8 QAT after convert) have a
-    dynamic-activation quantization op with no autograd support at all -- not
-    "small"/masked gradients, a fully severed graph. Our own attack code
-    (pgd_step, fgsm_attack, pgd_attack, the gradient diagnostics) already
-    handles this via allow_unused=True + a zero-gradient fallback, verified
-    against real torchao models.
-
-    Third-party attack libraries we call into (AutoAttack's APGD) do their own
-    unguarded torch.autograd.grad(loss, [x])[0] internally, with no
-    allow_unused, and hard-crash the same way our code used to. We can't edit
-    a vendored site-packages install, so this monkeypatches torch.autograd.grad
-    for the duration of the `with` block only, applying the exact same
-    "no gradient path -> zero gradient" convention, then restores the original.
-    Verified against the real autoattack package: it lets AutoAttack finish and
-    return a real accuracy number instead of raising, and doesn't suppress
-    AutoAttack's own "N points with zero gradient" warnings.
-    """
     real_grad = torch.autograd.grad
 
     def _patched_grad(outputs, inputs, *args, **kwargs):
@@ -76,40 +103,12 @@ def tolerate_masked_gradients():
     finally:
         torch.autograd.grad = real_grad
 
-
-def _parse_args():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--arch-key", default=None,
-                        help="Internal: restrict this run to a single architecture.")
-    args, _ = parser.parse_known_args()
-    return args
-
-
-_ARGS = _parse_args()
-
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-
 def results_csv_path(model_name):
     return os.path.join(DATA_DIR, f"results_{model_name}.csv")
 
 
 def sweep_csv_path(model_name):
     return os.path.join(DATA_DIR, f"sweep_{model_name}.csv")
-
-
-RESULTS_CSV = os.path.join(DATA_DIR, "results.csv")
-SWEEP_CSV = os.path.join(DATA_DIR, "results_sweep.csv")
-PLOT_PNG = os.path.join(DATA_DIR, "accuracy_plot.png")
-CIFAR10_ROOT = os.environ.get("CIFAR10_ROOT", "./")
-
-SEEDS = [0, 1, 2]
-
-"""
-Archived non-threaded single Python invocation analysis of metrics of attacks per model and eplison
-
-Migrated to use quantize.Model class interface (torchao-based quantization).
-"""
 
 
 def ablation_csv_path(model_name):
@@ -133,7 +132,7 @@ def _startup_checks():
     if missing:
         raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
     print("All required packages are available.")
-    expected = os.path.join(CIFAR10_ROOT, "cifar-10-batches-py")
+    expected = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
     if not os.path.isdir(expected):
         raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
 
@@ -150,8 +149,8 @@ def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
         T.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.2023, 0.1994, 0.2010))
     ])
 
-    train_full = torchvision.datasets.CIFAR10(root=CIFAR10_ROOT, train=True, download=False, transform=transform_train)
-    test_full = torchvision.datasets.CIFAR10(root=CIFAR10_ROOT, train=False, download=False, transform=transform_test)
+    train_full = torchvision.datasets.CIFAR10(root=PROJECT_ROOT, train=True, download=False, transform=transform_train)
+    test_full = torchvision.datasets.CIFAR10(root=PROJECT_ROOT, train=False, download=False, transform=transform_test)
 
     finetune_subset = torch.utils.data.Subset(train_full, list(range(finetune_n)))
     eval_subset = torch.utils.data.Subset(test_full, list(range(eval_n)))
@@ -166,16 +165,6 @@ def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
     )
 
     return finetune_loader, eval_loader
-
-
-PRETRAINED_NAMES = {
-    "ResNet20": "cifar10_resnet20",
-    "ResNet56": "cifar10_resnet56",
-    "MobileNetV2": "cifar10_mobilenetv2_x1_0",
-    "VGG16_BN": "cifar10_vgg16_bn",
-    "ShuffleNetV2": "cifar10_shufflenetv2_x1_0",
-    "RepVGG_A0": "cifar10_repvgg_a0"
-}
 
 if _ARGS.arch_key is not None:
     if _ARGS.arch_key not in PRETRAINED_NAMES:
@@ -203,27 +192,10 @@ def count_quant_layers(model):
     """Count quantized layers using the QuantModel helper."""
     return QuantModel._count_quant_layers(model)
 
-
-# Attack functions — unchanged from old version (only depend on forward pass)
-
-CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
-CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
-CLIP_MIN = ((0.0 - CIFAR_MEAN) / CIFAR_STD)
-CLIP_MAX = ((1.0 - CIFAR_MEAN) / CIFAR_STD)
-CLIP_MIN_DEV = CLIP_MIN.to(device)
-CLIP_MAX_DEV = CLIP_MAX.to(device)
-
-
 def pgd_step(model, x_adv, x, y, eps, alpha, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV, return_grad=False):
     x_adv = x_adv.clone().requires_grad_(True)
     with amp_ctx():
         loss = F.cross_entropy(model(x_adv), y)
-    # allow_unused=True: for some quantized models (e.g. int8 PTQ where the
-    # only quantized layer is the final Linear head) the activation-quantization
-    # op is non-differentiable and sits right before the loss, severing the
-    # entire gradient path back to x_adv. That's total gradient masking, not
-    # a bug -- torch.autograd.grad would otherwise hard-crash on it. Treat a
-    # None gradient as zero, i.e. this step is a no-op perturbation.
     grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
     if grad is None:
         grad = torch.zeros_like(x_adv)
@@ -361,15 +333,6 @@ def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
 
 def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max_batches=5):
     """
-    Combined replacement for the old gradient_diagnostics() +
-    layerwise_grad_profile() pair (items #5/#6). Both functions looped over
-    the same eval batches and independently ran a forward + backward pass
-    to get an input gradient -- the only difference was gradient_diagnostics
-    read x_in.grad-style stats via autograd.grad, while layerwise_grad_profile
-    used backward hooks on the quantized layers. Backward hooks fire during
-    ANY backward pass through the module (autograd.grad or .backward()), so
-    a single backward pass per batch now feeds both.
-
     Returns (diagnostics_dict, layerwise_profile_dict).
     """
     quant_layers = [(n, m) for n, m in model.named_modules()
@@ -773,8 +736,6 @@ def _merge_worker_csvs(arch_keys, pattern, merged_path):
 def dispatch_multi_gpu():
     """
     Multi-GPU parallel evaluation of independent models.
-    Only used when >1 GPU is visible; a single-GPU
-    or CPU machine just runs main() directly, unchanged.
     """
     import time
 
@@ -788,7 +749,7 @@ def dispatch_multi_gpu():
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         print(f"[dispatch] launching {arch_key} on GPU {gpu_id}")
         return subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--arch-key", arch_key],
+            [sys.executable, os.path.join(PROJECT_ROOT, "src", os.path.basename(__file__)), "--arch-key", arch_key],
             env=env,
         )
 
@@ -820,8 +781,6 @@ def dispatch_multi_gpu():
               f"--arch-key <name> to retry just that one.")
     print("[dispatch] all architectures complete. Per-model results written to", DATA_DIR)
 
-
-# main() — rewritten to use quantize.Model interface
 # Processes one architecture at a time: load, build variants, evaluate, free memory, next.
 
 def main():
