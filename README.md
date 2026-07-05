@@ -14,12 +14,12 @@ To run
 Parallelized (obselete)  
 `python archive/launcher.py`
 
-> **FYI:** You may need to adjust pathing or move the scripts to root for the archived files.
+> **Notice:** You may need to adjust pathing or move the scripts to root for the archived files.
 
 Results are in ./data
 
-![Attack Accuracy](data/demo/accuracy_plot.png)
-![Elipson](data/demo/accuracyperturb.png)
+![Attack Accuracy](demo/accuracy_plot.png)
+![Elipson](demo/accuracyperturb.png)
 
 <!-- <p align="center">
   <img src="data/demo/accuracy_plot.png" alt="Attack Accuracy" width="400"/>
