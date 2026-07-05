@@ -72,7 +72,8 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
         results["Random_Noise"] = None
 
     if count_quant_layers(model) > 0:
-        bpda, _ = safe_run(lambda: run_bpda(model, loader, eps=eps, n_restarts=5), name, "BPDA")
+        bpda, _ = safe_run(
+            lambda: run_bpda(model, loader, eps=eps, n_restarts=5, backward_model=fp32_ref), name, "BPDA")
         if bpda is not None:
             results.update(bpda)
         else:

@@ -83,13 +83,13 @@ def run_autoattack(model, loader, eps=8 / 255, aa_batch_size=256):
     return correct / total
 
 
-def _run_bpda_once(model, loader, eps, n_restarts):
+def _run_bpda_once(model, loader, eps, n_restarts, backward_model=None):
     correct_masks = []
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
         for _ in range(n_restarts):
-            x_adv = bpda_pgd_attack(model, x, y, eps=eps)
+            x_adv = bpda_pgd_attack(model, x, y, eps=eps, backward_model=backward_model)
             with torch.no_grad(), amp_ctx():
                 pred = model(x_adv).argmax(dim=1)
             worst_correct &= (pred == y)
@@ -98,10 +98,24 @@ def _run_bpda_once(model, loader, eps, n_restarts):
     return all_correct.float().mean().item()
 
 
-def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
+def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS, backward_model=None):
+    """
+    backward_model: differentiable surrogate used to compute BPDA gradients
+    (see quantadv.attacks.bpda_pgd_attack). For a quantized `model`, this
+    should be the full-precision shadow network it was derived from -- e.g.
+    the `fp32_ref` / `ref` model already tracked in experiment.py -- so the
+    hard round()/quantization step doesn't just zero out the gradient.
+
+    If omitted, this call degrades to plain PGD against `model`'s own
+    forward pass, and any masked-gradient RuntimeWarnings raised by
+    attacks.py apply: a quantized model's true int8 kernels commonly have
+    no (or a zeroed) backward, so an unset backward_model here typically
+    means "BPDA_acc" is not actually BPDA, just PGD with little or no
+    gradient signal.
+    """
     def run_seed(seed):
         torch.manual_seed(seed)
-        return _run_bpda_once(model, loader, eps, n_restarts)
+        return _run_bpda_once(model, loader, eps, n_restarts, backward_model=backward_model)
 
     return seeded_average(run_seed, seeds, "BPDA_PGD")
 
@@ -143,9 +157,20 @@ def run_pgd_epsilon_sweep_shared(model, loader, epsilons, alpha=2 / 255, steps=2
     return {eps: correct_per_eps[eps] / total for eps in epsilons}
 
 
-def run_epsilon_sweep_for_model(model, loader, name, epsilons):
+def run_epsilon_sweep_for_model(model, loader, name, epsilons, backward_model=None):
+    """
+    backward_model: fp32 shadow network (see `run_bpda`), forwarded into
+    the per-epsilon BPDA_acc calls below when `model` is quantized. Callers
+    (experiment.py) already build and compile this reference model
+    alongside each quantized variant -- pass it in here, don't drop it.
+    """
     rows = []
     is_quant = count_quant_layers(model) > 0
+    if is_quant and backward_model is None:
+        print(f"  [WARN] {name} is quantized but no backward_model/fp32 shadow was supplied "
+              f"for BPDA. Gradients through the quantization step are likely masked, so "
+              f"BPDA_acc below will silently degrade toward plain-PGD accuracy rather than "
+              f"reflecting a real BPDA attack.")
 
     pgd_acc_by_eps, _ = safe_run(
         lambda: run_pgd_epsilon_sweep_shared(model, loader, epsilons), name, "shared-trajectory PGD sweep")
@@ -159,7 +184,8 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
 
         if is_quant:
             row["BPDA_acc"], _ = safe_run(
-                lambda: _run_bpda_once(model, loader, eps=eps, n_restarts=3), name, f"BPDA sweep eps={eps:.4f}")
+                lambda: _run_bpda_once(model, loader, eps=eps, n_restarts=3, backward_model=backward_model),
+                name, f"BPDA sweep eps={eps:.4f}")
         rows.append(row)
     return rows
 

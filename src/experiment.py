@@ -317,7 +317,7 @@ def main():
             ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
             ref = parallelize(ref) if ref is not None else None
             try:
-                new_rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps)
+                new_rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps, backward_model=ref)
                 if new_rows:
                     sweep_rows.extend(existing_rows + new_rows)
                     all_new = existing_rows + new_rows
