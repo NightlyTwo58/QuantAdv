@@ -1,14 +1,11 @@
-# Install torch separately first, matched to your hardware, e.g.:
-#   CUDA GPU:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-#   CPU only:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-# Then install the rest:
-#   pip install -r requirements.txt
-
+# Runtime dependencies used by ./src.
+# For CUDA/CPU-specific wheels, install torch and torchvision with the
+# appropriate PyTorch index URL for your hardware.
+torch
+torchvision
+torchao
 numpy
 pandas
 matplotlib
 seaborn
-ipykernel
-torchattacks
 git+https://github.com/fra31/auto-attack
-torchao

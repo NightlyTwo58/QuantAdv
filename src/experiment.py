@@ -156,7 +156,7 @@ def main():
             traceback.print_exc()
             continue
 
-        # --- Build model registry entries for this architecture ---
+        # Build model registry entries for this architecture
         # (We compile/parallelize just before each run_suite, then free the model after.)
 
         variants = {

@@ -202,7 +202,7 @@ class Model:
     def train_qat(
         self,
         finetune_loader,
-        epochs=3,
+        epochs=5,
         lr=1e-3,
         weight_decay=5e-4,
         bits=8,
