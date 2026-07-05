@@ -1,3 +1,8 @@
+"""
+Quantization wrapper around a plain PyTorch model, exposing torchao-based
+int8 PTQ (post-training quantization) and int8 QAT (quantization-aware
+training) variants through a single `Model` class.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
