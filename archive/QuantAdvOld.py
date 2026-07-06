@@ -16,6 +16,7 @@ import traceback
 import sys
 import matplotlib.pyplot as plt
 import seaborn as sns
+from torch.amp import autocast, GradScaler
 
 import torchattacks
 from autoattack import AutoAttack
@@ -69,7 +70,7 @@ if not os.path.isdir(expected):
     raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
 
 
-def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
+def get_dataloaders(batch_size=1024, eval_n=2000, finetune_n=4000):
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
         T.RandomHorizontalFlip(),
@@ -87,7 +88,7 @@ def get_dataloaders(batch_size=100, eval_n=500, finetune_n=4000):
     finetune_subset = torch.utils.data.Subset(train_full, list(range(finetune_n)))
     eval_subset = torch.utils.data.Subset(test_full, list(range(eval_n)))
 
-    workers = min(4, os.cpu_count() or 1)
+    workers = min(16, os.cpu_count() or 1)
 
     finetune_loader = torch.utils.data.DataLoader(
         finetune_subset, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True
@@ -121,7 +122,8 @@ def sanity_check_accuracy(model, loader):
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            pred = model(x).argmax(dim=1)
+            with autocast():
+                pred = model(x).argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
     return correct / total
@@ -239,16 +241,19 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
     set_ste_mode(m, True)
     m.train()
     opt = torch.optim.SGD(m.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
+    scaler = GradScaler()
     for epoch in range(epochs):
         running = 0.0
         for x, y in finetune_loader:
             x, y = x.to(device), y.to(device)
-            opt.zero_grad()
-            loss = F.cross_entropy(m(x), y)
-            loss.backward()
-            opt.step()
+            opt.zero_grad(set_to_none=True)
+            with autocast():
+                loss = F.cross_entropy(m(x), y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             running += loss.item()
-        print(f"  QAT epoch {epoch + 1}/{epochs} avg loss {running / len(finetune_loader):.4f}")
+        print(f"  QAT epoch {epoch+1}/{epochs} avg loss {running/len(finetune_loader):.4f}")
     set_ste_mode(m, False)
     return m.eval()
 
@@ -295,8 +300,9 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
 
 def run_autoattack(model, loader, eps=8 / 255):
     model.eval()
-    adversary = AutoAttack(model, norm="Linf", eps=eps, version="custom", device=device, verbose=False)
-    adversary.attacks_to_run = ["apgd-ce", "apgd-t"]
+    adversary = AutoAttack(model, norm="Linf", eps=eps, version="standard", device=device, verbose=False)
+    # adversary.attacks_to_run = ["apgd-ce", "apgd-t"]
+    adversary.seed = 0
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -370,7 +376,7 @@ def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
     }
 
 
-def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=5):
+def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=3):
     set_ste_mode(model, False)
     frac_zero_hard, norm_hard = [], []
     frac_zero_ste, norm_ste = [], []
@@ -465,7 +471,7 @@ def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20
     return out
 
 
-def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=20, max_batches=5):
+def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=20, max_batches=3):
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     step_grad_norms = [0.0] * steps
@@ -636,13 +642,13 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
 
     if count_quant_layers(model) > 0:
         try:
-            results.update(run_bpda(model, loader, eps=eps, n_restarts=5))
+            results.update(run_bpda(model, loader, eps=eps, n_restarts=2))
         except Exception as e:
             print(f"  [WARN] BPDA failed for {name}: {e}")
             results["BPDA_PGD"] = None
 
         try:
-            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=5))
+            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=3))
         except Exception as e:
             print(f"  [WARN] gradient_diagnostics failed for {name}: {e}")
 
@@ -659,7 +665,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             print(f"  [WARN] pgd_steps_ablation failed for {name}: {e}")
 
         try:
-            traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=5)
+            traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=3)
             with open(trajectory_json_path(name), "w") as f:
                 json.dump(traj, f, indent=2)
         except Exception as e:
@@ -755,7 +761,7 @@ def main():
             print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
 
         try:
-            int8_qat = prepare_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=3)
+            int8_qat = prepare_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=5)
             model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
