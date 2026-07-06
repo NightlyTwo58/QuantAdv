@@ -27,6 +27,31 @@ def amp_ctx():
     return nullcontext()
 
 
+def attack_precision_ctx():
+    """
+    Attack generation is intentionally full precision.
+
+    The archived reference generated FGSM/PGD/BPDA gradients without AMP.
+    Autocast can change gradients enough to mask failures, especially around
+    hard quantization. Keep AMP for cheap inference paths, but not for the
+    optimization loop that constructs adversarial examples.
+    """
+    return nullcontext()
+
+
+def set_ste_mode(model, flag):
+    """
+    Toggle straight-through fake-quantization modules when the model exposes
+    the archived `use_ste` convention. Returns the number of modules toggled.
+    """
+    toggled = 0
+    for mod in model.modules():
+        if hasattr(mod, "use_ste"):
+            mod.use_ste = flag
+            toggled += 1
+    return toggled
+
+
 @contextmanager
 def tolerate_masked_gradients():
     real_grad = torch.autograd.grad
@@ -111,10 +136,9 @@ def pgd_step(model, x_adv, x, y, eps, alpha, clip_min=CLIP_MIN_DEV, clip_max=CLI
     """One PGD update: gradient-sign ascent step, L_inf projection onto the
     eps-ball around `x`, and a clip to the valid data range."""
     x_adv = x_adv.clone().requires_grad_(True)
-    with amp_ctx():
+    with attack_precision_ctx():
         loss = F.cross_entropy(model(x_adv), y)
-    scale = AMP_GRAD_SCALE if USE_AMP else 1.0
-    grad = _compute_gradient(loss, x_adv, name="pgd_step", scale=scale)
+    grad = _compute_gradient(loss, x_adv, name="pgd_step")
     x_adv = x_adv.detach() + alpha * grad.sign()
     x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
     x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
@@ -126,17 +150,16 @@ def pgd_step(model, x_adv, x, y, eps, alpha, clip_min=CLIP_MIN_DEV, clip_max=CLI
 def fgsm_attack(model, x, y, eps, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV):
     """Single-step FGSM."""
     x_adv = x.clone().detach().requires_grad_(True)
-    with amp_ctx():
+    with attack_precision_ctx():
         loss = F.cross_entropy(model(x_adv), y)
-    scale = AMP_GRAD_SCALE if USE_AMP else 1.0
-    grad = _compute_gradient(loss, x_adv, name="fgsm_attack", scale=scale)
+    grad = _compute_gradient(loss, x_adv, name="fgsm_attack")
     x_adv = x_adv.detach() + eps * grad.sign()
     x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     return x_adv
 
 
 def pgd_attack(model, x, y, eps, alpha=2 / 255, steps=20, random_start=True,
-               clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV, n_restarts=2):
+               clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV, n_restarts=1):
     best_adv, best_score = None, None
     for _ in range(n_restarts):
         if random_start:
@@ -194,31 +217,42 @@ def bpda_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=20, n_restart
     instead -- this function only earns its name when `backward_model`
     is a genuine substitute for a non-differentiable component.
     """
-    backward_model = backward_model if backward_model is not None else model
+    # Prefer the archived behavior when available: use the true quantized model
+    # for both forward and backward, but turn on its STE path during gradient
+    # construction. Torchao converted models do not expose `use_ste`, so those
+    # fall back to the supplied differentiable fp32 shadow model.
+    use_model_ste = set_ste_mode(model, True) > 0
+    if use_model_ste:
+        backward_model = model
+    else:
+        backward_model = backward_model if backward_model is not None else model
 
     def _bpda_step(x_adv):
         x_adv = x_adv.clone().requires_grad_(True)
-        with amp_ctx():
+        with attack_precision_ctx():
             loss = F.cross_entropy(backward_model(x_adv), y)
-        scale = AMP_GRAD_SCALE if USE_AMP else 1.0
-        grad = _compute_gradient(loss, x_adv, name="bpda_pgd_attack", scale=scale)
+        grad = _compute_gradient(loss, x_adv, name="bpda_pgd_attack")
         x_adv = x_adv.detach() + alpha * grad.sign()
         x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
         x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
         return x_adv
 
-    best_adv, best_score = None, None
-    for _ in range(n_restarts):
-        x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-        for _ in range(steps):
-            x_adv = _bpda_step(x_adv)
-        x_adv = x_adv.detach()
-        if n_restarts == 1:
-            return x_adv
-        # Success is judged against the real model, not the backward surrogate.
-        best_adv, best_score = _worst_of_restarts(x, y, model, x_adv, best_adv, best_score)
-    return best_adv.detach()
+    try:
+        best_adv, best_score = None, None
+        for _ in range(n_restarts):
+            x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+            for _ in range(steps):
+                x_adv = _bpda_step(x_adv)
+            x_adv = x_adv.detach()
+            if n_restarts == 1:
+                return x_adv
+            # Success is judged against the real model, not the backward surrogate.
+            best_adv, best_score = _worst_of_restarts(x, y, model, x_adv, best_adv, best_score)
+        return best_adv.detach()
+    finally:
+        if use_model_ste:
+            set_ste_mode(model, False)
 
 
 def evaluate_under_attack(model, loader, attack_fn):
@@ -258,7 +292,7 @@ def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
     return correct / total
 
 
-def transfer_attack(source_model, target_model, loader, eps=8 / 255, n_restarts=2):
+def transfer_attack(source_model, target_model, loader, eps=8 / 255, n_restarts=1):
     """Black-box transfer attack: craft adversarial examples with PGD
     against `source_model` only, then evaluate them against `target_model`
     (which is never queried for gradients)."""

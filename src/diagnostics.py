@@ -152,9 +152,14 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
     """
     Run component ablation for a torchao-based model.
 
-    Uses the QuantModel to get different PTQ configs:
-    - act_only: approximate by evaluating with dynamic activation int8 PTQ
-    - both: full dynamic activation int8 PTQ
+    Uses the QuantModel to get the PTQ variants that exist in the newer
+    torchao implementation:
+    - weight_only: int8 weight-only PTQ
+    - both: dynamic-activation + int8-weight PTQ
+
+    Torchao does not expose an activation-only PTQ variant for these modules,
+    so that row is emitted as unsupported instead of duplicating the `both`
+    model and reporting misleading numbers.
 
     Args:
         model_qat_instance: The QuantModel instance (holds all variants).
@@ -162,15 +167,25 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
         name: Model display name.
         eps: PGD epsilon.
     """
-    fp32 = model_qat_instance.model
-
     configs = [
-        ("act_only", model_qat_instance.int8_PTQ),
+        ("weight_only", getattr(model_qat_instance, "int8_PTQ_weight_only", None)),
+        ("act_only", None),
         ("both", model_qat_instance.int8_PTQ),
     ]
 
     rows = []
     for label, qat_model in configs:
+        if qat_model is None:
+            rows.append({
+                "model": name,
+                "config": label,
+                "clean_acc": None,
+                "PGD_acc": None,
+                "frac_zero_grad_hard": None,
+                "supported": False,
+            })
+            continue
+
         clean_acc = sanity_check_accuracy(qat_model, loader)
 
         torch.manual_seed(0)
@@ -193,5 +208,6 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
             "model": name, "config": label,
             "clean_acc": clean_acc, "PGD_acc": pgd_acc,
             "frac_zero_grad_hard": frac_zero,
+            "supported": True,
         })
     return rows

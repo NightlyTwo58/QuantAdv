@@ -6,6 +6,21 @@ Quantized models introduce discrete rounding operations into the computational g
 To install (most) dependencies  
 `pip install -r requirements.txt`
 
+To download datasets (should be placed at root)  
+*CIFAR-10*
+```
+wget https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz
+curl -O https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz
+```
+
+*CIFAR-100*
+```
+wget https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
+curl -O https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
+```
+
+or set Download=true
+
 To run  
 `python src/run_experiment.py`  
 `python src/combine_results`  

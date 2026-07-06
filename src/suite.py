@@ -42,7 +42,21 @@ def _get_qat_instance_for_model(target_model):
     Find the QuantModel instance that owns *target_model*.
     We store the mapping in a global registry built during main().
     """
-    return _model_to_qat_instance.get(id(target_model))
+    candidates = [target_model]
+    module = getattr(target_model, "module", None)
+    if module is not None:
+        candidates.append(module)
+    orig_mod = getattr(target_model, "_orig_mod", None)
+    if orig_mod is not None:
+        candidates.append(orig_mod)
+    if module is not None and getattr(module, "_orig_mod", None) is not None:
+        candidates.append(module._orig_mod)
+
+    for candidate in candidates:
+        qat_instance = _model_to_qat_instance.get(id(candidate))
+        if qat_instance is not None:
+            return qat_instance
+    return None
 
 
 def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):

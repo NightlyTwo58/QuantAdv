@@ -14,7 +14,7 @@ import torch
 from autoattack import AutoAttack
 
 from .config import device, SEEDS, CLIP_MIN_DEV, CLIP_MAX_DEV
-from .model import Model as QuantModel
+from .Model import Model as QuantModel
 from .attacks import (
     amp_ctx,
     tolerate_masked_gradients,
@@ -70,11 +70,11 @@ def run_autoattack(model, loader, eps=8 / 255, aa_batch_size=256):
     adversary = AutoAttack(model, norm="Linf", eps=eps, version="custom", device=device, verbose=False)
     adversary.attacks_to_run = ["apgd-ce", "apgd-t"]
 
-    x_all = torch.cat([x for x, _ in loader], dim=0)
-    y_all = torch.cat([y for _, y in loader], dim=0)
+    x_all = torch.cat([x for x, _ in loader], dim=0).to(device)
+    y_all = torch.cat([y for _, y in loader], dim=0).to(device)
     bs = min(aa_batch_size, x_all.size(0))
 
-    with amp_ctx(), tolerate_masked_gradients():
+    with tolerate_masked_gradients():
         x_adv = adversary.run_standard_evaluation(x_all, y_all, bs=bs)
         with torch.no_grad():
             pred = model(x_adv).argmax(1)
@@ -157,6 +157,25 @@ def run_pgd_epsilon_sweep_shared(model, loader, epsilons, alpha=2 / 255, steps=2
     return {eps: correct_per_eps[eps] / total for eps in epsilons}
 
 
+def run_pgd_epsilon_sweep_exact(model, loader, epsilons, alpha=2 / 255, steps=20):
+    """
+    Reference-compatible epsilon sweep: run a fresh 20-step PGD attack for
+    each epsilon, matching the archived implementation instead of projecting
+    one max-epsilon trajectory onto smaller balls.
+    """
+    acc_by_eps = {}
+    for eps in epsilons:
+        torch.manual_seed(0)
+        acc_by_eps[eps] = evaluate_under_attack(
+            model,
+            loader,
+            lambda x, y, eps=eps: pgd_attack(
+                model, x, y, eps, alpha=alpha, steps=steps, random_start=True
+            ),
+        )
+    return acc_by_eps
+
+
 def run_epsilon_sweep_for_model(model, loader, name, epsilons, backward_model=None):
     """
     backward_model: fp32 shadow network (see `run_bpda`), forwarded into
@@ -173,7 +192,7 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons, backward_model=No
               f"reflecting a real BPDA attack.")
 
     pgd_acc_by_eps, _ = safe_run(
-        lambda: run_pgd_epsilon_sweep_shared(model, loader, epsilons), name, "shared-trajectory PGD sweep")
+        lambda: run_pgd_epsilon_sweep_exact(model, loader, epsilons), name, "PGD epsilon sweep")
     pgd_acc_by_eps = pgd_acc_by_eps or {}
 
     for eps in epsilons:

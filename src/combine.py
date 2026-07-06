@@ -162,13 +162,13 @@ def plot_accuracy(df_results):
     acc_cols = [
         c
         for c in [
-            "No Attack",
+            "clean_acc",
             "Random_Noise",
-            "FGSM (W)",
-            "PGD (W)",
-            "AutoAttack (W/B)",
-            "Transfer_from_FP32 (B)",
-            "BPDA_PGD (W)",
+            "FGSM",
+            "PGD",
+            "AutoAttack",
+            "Transfer_from_FP32",
+            "BPDA_PGD",
         ]
         if c in df_results.columns
     ]

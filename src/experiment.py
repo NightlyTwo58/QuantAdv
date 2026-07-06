@@ -22,7 +22,7 @@ import torch
 from . import config
 from .config import PROJECT_ROOT, DATA_DIR, PRETRAINED_NAMES, device
 from .data import get_dataloaders, load_pretrained
-from .model import Model as QuantModel
+from .Model import Model as QuantModel
 from .compute import parallelize, maybe_compile
 from .evaluation import sanity_check_accuracy, run_epsilon_sweep_for_model
 from .suite import run_suite, _model_to_qat_instance
@@ -175,10 +175,9 @@ def main():
             traceback.print_exc()
 
         suffixes = ["int8_PTQ", "int8_QAT"]
-        for name in variants:
+        for name, (variant_model, _) in variants.items():
             if any(name == f"{arch_key}_{suf}" for suf in suffixes):
-                _model_to_qat_instance[id(variants[name][0])] = qat_model
-                break
+                _model_to_qat_instance[id(variant_model)] = qat_model
 
         # qat_model.summary()
 
@@ -198,6 +197,8 @@ def main():
             model = parallelize(model)
             ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
             ref = parallelize(ref) if ref is not None else None
+            if any(name == f"{arch_key}_{suf}" for suf in suffixes):
+                _model_to_qat_instance[id(model)] = qat_model
 
             print(f"\n  Evaluating {name} ...")
             try:
@@ -257,8 +258,11 @@ def main():
         plt.savefig(PLOT_PNG, dpi=300, bbox_inches="tight")
         plt.show()
 
-    # Epsilon sweep — one architecture at a time (reuses same load→build→evaluate→free pattern)
-    SWEEP_EPSILONS = [1 / 255, 2 / 255, 4 / 255, 8 / 255, 16 / 255]
+    # Epsilon sweep
+    SWEEP_EPSILONS = [
+        1/255, 2/255, 3/255, 4/255,
+        6/255, 8/255, 12/255, 16/255
+    ]
 
     # Per-model sweep files
     sweep_rows = []
@@ -277,9 +281,16 @@ def main():
             f"{arch_key}_int8_PTQ": (qat_model.int8_PTQ, fp32),
         }
 
-        for name in sweep_variants:
+        try:
+            qat_int8 = qat_model.train_qat(finetune_loader, epochs=5, bits=8)
+            sweep_variants[f"{arch_key}_int8_QAT"] = (qat_int8, fp32)
+        except Exception as e:
+            print(f"  [FAIL] int8 QAT for sweep {arch_key}: {e}")
+            traceback.print_exc()
+
+        for name, (variant_model, _) in sweep_variants.items():
             if any(name == f"{arch_key}_{suf}" for suf in ["int8_PTQ", "int8_QAT"]):
-                _model_to_qat_instance[id(sweep_variants[name][0])] = qat_model
+                _model_to_qat_instance[id(variant_model)] = qat_model
 
         # Evaluate each variant in this architecture
         for name, (model, ref) in sweep_variants.items():
@@ -316,6 +327,8 @@ def main():
             model = parallelize(model)
             ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
             ref = parallelize(ref) if ref is not None else None
+            if any(name == f"{arch_key}_{suf}" for suf in ["int8_PTQ", "int8_QAT"]):
+                _model_to_qat_instance[id(model)] = qat_model
             try:
                 new_rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps, backward_model=ref)
                 if new_rows:
