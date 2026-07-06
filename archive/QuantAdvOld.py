@@ -28,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device:", device)
 
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
@@ -253,7 +253,6 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
 
     for epoch in range(epochs):
         running = 0.0
-
         for x, y in finetune_loader:
             x = x.to(device)
             y = y.to(device)
@@ -266,9 +265,7 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
             scaler.step(opt)
             scaler.update()
             running += loss.item()
-
-        print(f"  QAT epoch {epoch + 1}/{epochs} avg loss {running / len(finetune_loader):.4f}")
-
+        print(f"  QAT epoch {epoch+1}/{epochs} avg loss {running/len(finetune_loader):.4f}")
     set_ste_mode(m, False)
     return m.eval()
 
@@ -388,6 +385,203 @@ def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
         "BPDA_PGD": float(np.mean(accs)),
         "BPDA_PGD_mean": float(np.mean(accs)),
         "BPDA_PGD_std": float(np.std(accs)),
+    }
+
+
+def nes_estimate_gradient(model, x, y, n_samples=20, sigma=1e-3, query_chunk=512):
+    """
+    Estimates d(loss)/dx via antithetic NES sampling: for random directions
+    u, the finite-difference loss(x + sigma*u) - loss(x - sigma*u) weights u
+    in the gradient average. Uses only forward passes -- no backprop through
+    the model. x: (B,C,H,W), y: (B,). Returns a gradient estimate shaped like x.
+    """
+    if n_samples % 2 != 0:
+        n_samples += 1  # antithetic pairs require an even sample count
+    n_pairs = n_samples // 2
+    B = x.size(0)
+    grad_acc = torch.zeros_like(x)
+
+    remaining = n_pairs
+    while remaining > 0:
+        chunk = max(1, min(remaining, query_chunk // max(B, 1)))
+        u = torch.randn(chunk, *x.shape, device=x.device)
+        x_plus = (x.unsqueeze(0) + sigma * u).view(chunk * B, *x.shape[1:])
+        x_minus = (x.unsqueeze(0) - sigma * u).view(chunk * B, *x.shape[1:])
+        y_rep = y.repeat(chunk)
+
+        with torch.no_grad():
+            loss_plus = F.cross_entropy(model(x_plus), y_rep, reduction='none').view(chunk, B)
+            loss_minus = F.cross_entropy(model(x_minus), y_rep, reduction='none').view(chunk, B)
+
+        weight = (loss_plus - loss_minus).view(chunk, B, 1, 1, 1)
+        grad_acc += (weight * u).sum(dim=0)
+        remaining -= chunk
+
+    return grad_acc / (2 * n_pairs * sigma)
+
+
+def nes_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=10, n_samples=20,
+                    sigma=1e-3, query_chunk=512):
+    """
+    Black-box Linf PGD attack that substitutes the true gradient with the NES
+    estimate above. Same random-start / sign-step / projection structure as
+    the white-box PGD used elsewhere in this file, so results are directly
+    comparable at matched eps.
+    """
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+
+    for _ in range(steps):
+        grad = nes_estimate_gradient(model, x_adv, y, n_samples=n_samples,
+                                      sigma=sigma, query_chunk=query_chunk)
+        x_adv = x_adv + alpha * grad.sign()
+        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    return x_adv.detach()
+
+
+def nes_attack(model, loader, eps=8 / 255, n_samples=20, sigma=1e-3, alpha=2 / 255,
+               steps=10, seed=None, query_chunk=512):
+    """Single-seed NES attack accuracy over the whole loader."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    model.eval()
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = nes_pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps,
+                                n_samples=n_samples, sigma=sigma, query_chunk=query_chunk)
+        with torch.no_grad():
+            pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / total
+
+
+def run_nes_attack(model, loader, eps=8 / 255, seeds=SEEDS, **kwargs):
+    """Seed-averaged wrapper around nes_attack (mirrors run_random_noise_seeded)."""
+    accs = [nes_attack(model, loader, eps=eps, seed=s, **kwargs) for s in seeds]
+    return {
+        "NES": float(np.mean(accs)),
+        "NES_mean": float(np.mean(accs)),
+        "NES_std": float(np.std(accs)),
+    }
+
+
+def _predict_batch(model, x):
+    with torch.no_grad():
+        return model(x).argmax(dim=1)
+
+
+def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
+                            spherical_step=1e-2, source_step=1e-2, step_adapt=1.5,
+                            init_tries=200, init_chunk=25):
+    """
+    Decision-based Boundary Attack (Brendel, Bethge, 2018) for a single
+    already-correctly-classified image.
+    """
+    clip_min = clip_min.to(x_orig.device)
+    clip_max = clip_max.to(x_orig.device)
+
+    # 1. find an initial point that the model already misclassifies
+    x_adv = None
+    tries_left = init_tries
+    while tries_left > 0 and x_adv is None:
+        chunk = min(init_chunk, tries_left)
+        cand = torch.rand(chunk, *x_orig.shape, device=x_orig.device)
+        cand = cand * (clip_max - clip_min) + clip_min
+        preds = _predict_batch(model, cand)
+        mismatch = (preds != y_true).nonzero(as_tuple=True)[0]
+        if mismatch.numel() > 0:
+            x_adv = cand[mismatch[0]].clone()
+        tries_left -= chunk
+
+    if x_adv is None:
+        # no adversarial start found within the query budget -> treat as robust
+        return x_orig.clone()
+
+    sph_step, src_step = spherical_step, source_step
+    sph_hist, src_hist = [], []
+
+    for i in range(steps):
+        diff = x_orig - x_adv
+        dist = diff.norm()
+        if dist.item() < 1e-12:
+            break
+
+        # random move orthogonal to the direction toward x_orig, same radius
+        perturb = torch.randn_like(x_adv)
+        perturb = perturb - (perturb * diff).sum() / (dist ** 2) * diff
+        perturb = perturb / (perturb.norm() + 1e-12) * dist * sph_step
+        cand = x_adv + perturb
+        # re-project onto the sphere of radius `dist` around x_orig
+        new_diff = x_orig - cand
+        cand = x_orig - new_diff / (new_diff.norm() + 1e-12) * dist
+        cand = torch.clamp(cand, clip_min, clip_max)
+
+        sph_ok = (_predict_batch(model, cand.unsqueeze(0))[0] != y_true).item()
+        sph_hist.append(sph_ok)
+
+        if sph_ok:
+            cand2 = torch.clamp(cand + src_step * (x_orig - cand), clip_min, clip_max)
+            src_ok = (_predict_batch(model, cand2.unsqueeze(0))[0] != y_true).item()
+            src_hist.append(src_ok)
+            if src_ok:
+                x_adv = cand2
+
+        # adapt step sizes every 10 iters based on recent local success rate
+        if (i + 1) % 10 == 0:
+            if sph_hist:
+                rate = np.mean(sph_hist[-10:])
+                sph_step *= step_adapt if rate > 0.5 else (1 / step_adapt if rate < 0.2 else 1.0)
+            if src_hist:
+                rate = np.mean(src_hist[-10:])
+                src_step *= step_adapt if rate > 0.5 else (1 / step_adapt if rate < 0.2 else 1.0)
+
+    return x_adv.detach()
+
+
+def run_boundary_attack(model, loader, eps=8 / 255, max_images=50, steps=200, seed=0):
+    """
+    Runs the Boundary Attack on up to `max_images` correctly-classified
+    examples (it is inherently per-sample and query-heavy, so the full eval
+    set is not used) and reports:
+      - Boundary_acc: fraction of attacked images whose minimal Linf
+        perturbation exceeds eps, i.e. would still be correctly classified
+        within an eps budget -- directly comparable to the other
+        robust-accuracy columns produced elsewhere in this file.
+      - Boundary_mean_Linf: mean minimal Linf distance to the boundary found.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+    model.eval()
+    clip_min, clip_max = CLIP_MIN.squeeze(0).to(device), CLIP_MAX.squeeze(0).to(device)
+
+    dists = []
+    n_seen = 0
+    for x, y in loader:
+        if n_seen >= max_images:
+            break
+        x, y = x.to(device), y.to(device)
+        with torch.no_grad():
+            pred = model(x).argmax(dim=1)
+        for i in range(x.size(0)):
+            if n_seen >= max_images:
+                break
+            if pred[i] != y[i]:
+                continue  # only attack already-correctly-classified examples
+            x_adv = boundary_attack_single(model, x[i], y[i], clip_min, clip_max, steps=steps)
+            dists.append((x_adv - x[i]).abs().max().item())
+            n_seen += 1
+
+    if not dists:
+        return {"Boundary_acc": None, "Boundary_mean_Linf": None}
+
+    dists = np.array(dists)
+    return {
+        "Boundary_acc": float((dists > eps).mean()),
+        "Boundary_mean_Linf": float(dists.mean()),
     }
 
 
@@ -671,6 +865,20 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             results.update(staircase_diagnostic(model, loader))
         except Exception as e:
             print(f"  [WARN] staircase_diagnostic failed for {name}: {e}")
+
+        try:
+            results.update(run_boundary_attack(model, loader, eps=eps, max_images=30, steps=500, seed=0))
+        except Exception as e:
+            print(f"  [WARN] boundary_attack failed for {name}: {e}")
+            results["Boundary_acc"] = None
+            results["Boundary_mean_Linf"] = None
+
+        try:
+            results.update(run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=100, query_chunk=512
+            ))
+        except Exception as e:
+            print(f"  [WARN] NES attack failed for {name}: {e}")
+            results["NES"] = None
 
         try:
             ablation = pgd_steps_ablation(model, loader, eps=eps)

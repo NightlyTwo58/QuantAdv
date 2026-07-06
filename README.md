@@ -1,5 +1,5 @@
 # QuantAdv
-Quantized models introduce discrete rounding operations into the computational graph, which may produce either genuine robustness (coarser weight representation changing the decision boundary geometry) or gradient masking (rounding causing zero gradients that blind attacks). We systematically evaluate several models (ResNet20, ResNet56 MobileNetV2, VGG16_BN, ShuffleNetV2, and RepVGG_A0) across four quantization variants (FP32, int8 PTQ, int4 PTQ, int8 QAT) on the CIFAR-10 image dataset using a layered attack suite (FGSM, PGD, AutoAttack, transfer attacks from FP32, and BPDA-corrected PGD) to test these two explanations.  
+Quantized models introduce discrete rounding operations into the computational graph, which may produce either genuine robustnes against *inference-time evasion attacks* (coarser weight representation changing the decision boundary geometry) or gradient masking (rounding causing zero gradients that blind attacks). We systematically evaluate several models (ResNet20, ResNet56 MobileNetV2, VGG16_BN, ShuffleNetV2, and RepVGG_A0) across four quantization variants (FP32, int8 PTQ, int4 PTQ, int8 QAT) on the CIFAR-10 image dataset using a layered attack suite (FGSM, PGD, AutoAttack, transfer attacks from FP32, and BPDA-corrected PGD) to test these two explanations.  
 
 ## Setup
 
