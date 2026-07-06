@@ -326,12 +326,128 @@ def run_autoattack(model, loader, eps=8 / 255):
     return correct / total
 
 
+def run_extra_whitebox_attacks(model, loader, eps=8 / 255, jsma_max_images=200):
+    model.eval()
+    out = {}
+
+    cw = torchattacks.CW(model, c=1, kappa=0, steps=50, lr=0.01)
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = cw(x, y)
+        with torch.no_grad():
+            pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    out["CW"] = correct / total
+
+    deepfool = torchattacks.DeepFool(model, steps=50, overshoot=0.02)
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = deepfool(x, y)
+        with torch.no_grad():
+            pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    out["DeepFool"] = correct / total
+
+    jsma = torchattacks.JSMA(model, theta=1.0, gamma=0.1)
+    correct, total, n_seen = 0, 0, 0
+    for x, y in loader:
+        if n_seen >= jsma_max_images:
+            break
+        remaining = jsma_max_images - n_seen
+        x, y = x[:remaining].to(device), y[:remaining].to(device)
+        x_adv = jsma(x, y)
+        with torch.no_grad():
+            pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+        n_seen += y.size(0)
+    out["JSMA"] = correct / total if total else None
+
+    return out
+
+
 def transfer_attack(source_model, target_model, loader, eps=8 / 255):
     pgd = torchattacks.PGD(source_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         x_adv = pgd(x, y)
+        with torch.no_grad():
+            pred = target_model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / total
+
+
+def transfer_attack_mim(source_model, target_model, loader, eps=8 / 255):
+    mim = torchattacks.MIFGSM(source_model, eps=eps, alpha=2 / 255, steps=20, decay=1.0)
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = mim(x, y)
+        with torch.no_grad():
+            pred = target_model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / total
+
+
+def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps=20,
+              overshoot=0.02, max_images=1000):
+    model.eval()
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    sample_x, _ = next(iter(loader))
+    v = torch.zeros(1, *sample_x.shape[1:], device=device)
+    deepfool = torchattacks.DeepFool(model, steps=deepfool_steps, overshoot=overshoot)
+
+    fooling_rate, it = 0.0, 0
+    while fooling_rate < (1 - delta) and it < max_iter:
+        n_seen, n_fooled = 0, 0
+        for x, y in loader:
+            if n_seen >= max_images:
+                break
+            x, y = x.to(device), y.to(device)
+            x_pert = torch.max(torch.min(x + v, clip_max), clip_min)
+            with torch.no_grad():
+                pred_orig = model(x).argmax(dim=1)
+                pred_pert = model(x_pert).argmax(dim=1)
+            still_correct = pred_pert == pred_orig
+            if still_correct.any():
+                xs, ys = x_pert[still_correct], pred_orig[still_correct]
+                x_adv = deepfool(xs, ys)
+                v = torch.clamp(v + (x_adv - xs).mean(dim=0, keepdim=True), -eps, eps)
+            n_fooled += (pred_pert != pred_orig).sum().item()
+            n_seen += y.size(0)
+        fooling_rate = n_fooled / max(n_seen, 1)
+        it += 1
+    return v.detach()
+
+
+def run_uap_attack(model, loader, eps=8 / 255, max_images=1000):
+    v = build_uap(model, loader, eps=eps, max_images=max_images)
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = torch.max(torch.min(x + v, clip_max), clip_min)
+        with torch.no_grad():
+            pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / total
+
+
+def transfer_uap_attack(source_model, target_model, loader, eps=8 / 255, max_images=1000):
+    v = build_uap(source_model, loader, eps=eps, max_images=max_images)
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = torch.max(torch.min(x + v, clip_max), clip_min)
         with torch.no_grad():
             pred = target_model(x_adv).argmax(dim=1)
         correct += (pred == y).sum().item()
@@ -467,6 +583,73 @@ def run_nes_attack(model, loader, eps=8 / 255, seeds=SEEDS, **kwargs):
         "NES_mean": float(np.mean(accs)),
         "NES_std": float(np.std(accs)),
     }
+
+
+class SubstituteCNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 256), nn.ReLU(inplace=True),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+
+def train_substitute(target_model, seed_x, rounds=6, epochs_per_round=10, lr=1e-3,
+                      lam=0.1, batch_size=128):
+    target_model.eval()
+    substitute = SubstituteCNN().to(device)
+    opt = torch.optim.Adam(substitute.parameters(), lr=lr)
+    x = seed_x.clone().to(device)
+
+    for r in range(rounds):
+        with torch.no_grad():
+            y = target_model(x).argmax(dim=1)
+
+        substitute.train()
+        ds = torch.utils.data.TensorDataset(x, y)
+        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+        for _ in range(epochs_per_round):
+            for xb, yb in dl:
+                opt.zero_grad(set_to_none=True)
+                loss = F.cross_entropy(substitute(xb), yb)
+                loss.backward()
+                opt.step()
+
+        if r < rounds - 1:
+            substitute.eval()
+            x_in = x.clone().requires_grad_(True)
+            loss = F.cross_entropy(substitute(x_in), y)
+            grad = torch.autograd.grad(loss, x_in)[0]
+            x_aug = (x + lam * grad.sign()).detach()
+            x = torch.cat([x, x_aug], dim=0)
+
+    substitute.eval()
+    return substitute
+
+
+def run_surrogate_attack(model, loader, eps=8 / 255, seed_n=500, rounds=6):
+    x_seed, n = [], 0
+    for x, _ in loader:
+        x_seed.append(x)
+        n += x.size(0)
+        if n >= seed_n:
+            break
+    x_seed = torch.cat(x_seed, dim=0)[:seed_n]
+
+    substitute = train_substitute(model, x_seed, rounds=rounds)
+    return transfer_attack(substitute, model, loader, eps=eps)
 
 
 def _predict_batch(model, x):
@@ -836,12 +1019,35 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
         print(f"  [WARN] AutoAttack failed for {name}: {e}")
         results["AutoAttack"] = None
 
+    try:
+        results.update(run_extra_whitebox_attacks(model, loader, eps=eps))
+    except Exception as e:
+        print(f"  [WARN] CW/DeepFool/JSMA failed for {name}: {e}")
+
+    try:
+        results["Surrogate_Transfer"] = run_surrogate_attack(model, loader, eps=eps)
+    except Exception as e:
+        print(f"  [WARN] surrogate attack failed for {name}: {e}")
+        results["Surrogate_Transfer"] = None
+
     if fp32_ref is not None:
         try:
             results["Transfer_from_FP32"] = transfer_attack(fp32_ref, model, loader, eps=eps)
         except Exception as e:
             print(f"  [WARN] transfer_attack failed for {name}: {e}")
             results["Transfer_from_FP32"] = None
+
+        try:
+            results["MIM_Transfer"] = transfer_attack_mim(fp32_ref, model, loader, eps=eps)
+        except Exception as e:
+            print(f"  [WARN] MIM transfer_attack failed for {name}: {e}")
+            results["MIM_Transfer"] = None
+
+        try:
+            results["UAP_Transfer"] = transfer_uap_attack(fp32_ref, model, loader, eps=eps)
+        except Exception as e:
+            print(f"  [WARN] UAP transfer_attack failed for {name}: {e}")
+            results["UAP_Transfer"] = None
 
     try:
         results.update(run_random_noise_seeded(model, loader, eps=eps))
@@ -1027,7 +1233,9 @@ def main():
     print("\nFinal results:")
     print(df_results)
 
-    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "AutoAttack", "Transfer_from_FP32", "Random_Noise", "BPDA_PGD"]
+    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
+                             "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
+                             "Surrogate_Transfer", "Random_Noise", "BPDA_PGD"]
                 if c in df_results.columns]
 
     if len(acc_cols) > 0:
