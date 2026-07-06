@@ -118,11 +118,13 @@ def load_pretrained(arch_key):
 
 def sanity_check_accuracy(model, loader):
     model.eval()
-    correct, total = 0, 0
+    correct = 0
+    total = 0
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            with autocast():
+            x = x.to(device)
+            y = y.to(device)
+            with autocast(device_type=device.type):
                 pred = model(x).argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
@@ -240,20 +242,33 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
 
     set_ste_mode(m, True)
     m.train()
-    opt = torch.optim.SGD(m.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    scaler = GradScaler()
+
+    opt = torch.optim.SGD(
+        m.parameters(),
+        lr=lr,
+        momentum=0.9,
+        weight_decay=5e-4,
+    )
+    scaler = GradScaler(device=device.type)
+
     for epoch in range(epochs):
         running = 0.0
+
         for x, y in finetune_loader:
-            x, y = x.to(device), y.to(device)
+            x = x.to(device)
+            y = y.to(device)
+
             opt.zero_grad(set_to_none=True)
-            with autocast():
+
+            with autocast(device_type=device.type):
                 loss = F.cross_entropy(m(x), y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             running += loss.item()
-        print(f"  QAT epoch {epoch+1}/{epochs} avg loss {running/len(finetune_loader):.4f}")
+
+        print(f"  QAT epoch {epoch + 1}/{epochs} avg loss {running / len(finetune_loader):.4f}")
+
     set_ste_mode(m, False)
     return m.eval()
 
