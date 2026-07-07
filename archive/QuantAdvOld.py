@@ -28,15 +28,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from config import *
+
 print("device:", device)
-
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-RESULTS_CSV = os.path.join(DATA_DIR, "accuracyresult.csv")
-SWEEP_CSV = os.path.join(DATA_DIR, "sweepresult.csv")
-PLOT_PNG = os.path.join(DATA_DIR, "accuracyplot.png")
-
-SEEDS = [0, 1, 2]
 
 """
 Modernized archival non-threaded analysis of metrics of attacks per model and eplison
@@ -64,33 +58,18 @@ def margin_json_path(model_name):
     return os.path.join(DATA_DIR, f"margin_{model_name}.json")
 
 
-SWEEP_PLOT_PNG = os.path.join(DATA_DIR, "sweepplot.png")
-ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "ablationplot.png")
-TRAJECTORY_PLOT_PNG = os.path.join(DATA_DIR, "trajectoryplot.png")
-LAYERWISE_PLOT_PNG = os.path.join(DATA_DIR, "layerwiseplot.png")
-COMPONENT_ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "componentablationplot.png")
-MASKING_SUMMARY_PLOT_PNG = os.path.join(DATA_DIR, "maskingsummaryplot.png")
-MARGIN_PLOT_PNG = os.path.join(DATA_DIR, "marginplot.png")
-HEATMAP_PLOT_PNG = os.path.join(DATA_DIR, "heatmapplot.png")
-
-
 missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
 if missing:
     raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
 print("All required packages are available.")
 
-expected = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
-if not os.path.isdir(expected):
-    raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
+if not os.path.isdir(CIFAR10_DIR):
+    raise FileNotFoundError(f"Expected extracted CIFAR-10 at {CIFAR10_DIR!r}")
 
 
-CIFAR_MEAN_VALUES = (0.4914, 0.4822, 0.4465)
-CIFAR_STD_VALUES = (0.2023, 0.1994, 0.2010)
-
-
-def get_dataloaders(batch_size=1024, eval_n=2000, finetune_n=4000):
+def get_dataloaders(batch_size=DEFAULT_BATCH_SIZE, eval_n=DEFAULT_EVAL_N, finetune_n=DEFAULT_FINETUNE_N):
     transform_train = T.Compose([
-        T.RandomCrop(32, padding=4),
+        T.RandomCrop(CIFAR_IMAGE_SIZE, padding=CIFAR_RANDOM_CROP_PADDING),
         T.RandomHorizontalFlip(),
         T.ToTensor(),
         T.Normalize(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
@@ -100,32 +79,22 @@ def get_dataloaders(batch_size=1024, eval_n=2000, finetune_n=4000):
         T.Normalize(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
     ])
 
-    train_full = torchvision.datasets.CIFAR10(root=PROJECT_ROOT, train=True, download=False, transform=transform_train)
-    test_full = torchvision.datasets.CIFAR10(root=PROJECT_ROOT, train=False, download=False, transform=transform_test)
+    train_full = torchvision.datasets.CIFAR10(root=PROJECT_ROOT, train=True, download=CIFAR_DOWNLOAD, transform=transform_train)
+    test_full = torchvision.datasets.CIFAR10(root=PROJECT_ROOT, train=False, download=CIFAR_DOWNLOAD, transform=transform_test)
 
     finetune_subset = torch.utils.data.Subset(train_full, list(range(finetune_n)))
     eval_subset = torch.utils.data.Subset(test_full, list(range(eval_n)))
 
-    workers = min(16, os.cpu_count() or 1)
+    workers = min(MAX_DATA_WORKERS, os.cpu_count() or 1)
 
     finetune_loader = torch.utils.data.DataLoader(
-        finetune_subset, batch_size=batch_size, shuffle=True, num_workers=workers, pin_memory=True
+        finetune_subset, batch_size=batch_size, shuffle=TRAIN_SHUFFLE, num_workers=workers, pin_memory=PIN_MEMORY
     )
     eval_loader = torch.utils.data.DataLoader(
-        eval_subset, batch_size=100, shuffle=False, num_workers=workers, pin_memory=True
+        eval_subset, batch_size=DEFAULT_EVAL_BATCH_SIZE, shuffle=EVAL_SHUFFLE, num_workers=workers, pin_memory=PIN_MEMORY
     )
 
     return finetune_loader, eval_loader
-
-
-PRETRAINED_NAMES = {
-    "ResNet20": "cifar10_resnet20",
-    "ResNet56": "cifar10_resnet56",
-    "MobileNetV2": "cifar10_mobilenetv2_x1_0",
-    "VGG16_BN": "cifar10_vgg16_bn",
-    "ShuffleNetV2": "cifar10_shufflenetv2_x1_0",
-    "RepVGG_A0": "cifar10_repvgg_a0"
-}
 
 
 def load_pretrained(arch_key):
@@ -163,7 +132,7 @@ def quantize_tensor(t, bits, use_ste):
     if bits is None:
         return t
     qmax = 2 ** (bits - 1) - 1
-    scale = torch.clamp(t.detach().abs().max() / qmax, min=1e-8)
+    scale = torch.clamp(t.detach().abs().max() / qmax, min=QUANT_SCALE_MIN)
     t_scaled = t / scale
     t_round = FakeQuantSTE.apply(t_scaled) if use_ste else torch.round(t_scaled)
     t_round = torch.clamp(t_round, -qmax - 1, qmax)
@@ -173,9 +142,9 @@ def quantize_tensor(t, bits, use_ste):
 class QuantConv2d(nn.Conv2d):
     def forward(self, x):
         bits = getattr(self, 'bits', None)
-        use_ste = getattr(self, 'use_ste', False)
-        quant_weight = getattr(self, 'quant_weight', True)
-        quant_act = getattr(self, 'quant_act', True)
+        use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
+        quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
+        quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
 
         w = quantize_tensor(self.weight, bits, use_ste) if quant_weight else self.weight
         out = self._conv_forward(x, w, self.bias)
@@ -187,9 +156,9 @@ class QuantConv2d(nn.Conv2d):
 class QuantLinear(nn.Linear):
     def forward(self, x):
         bits = getattr(self, 'bits', None)
-        use_ste = getattr(self, 'use_ste', False)
-        quant_weight = getattr(self, 'quant_weight', True)
-        quant_act = getattr(self, 'quant_act', True)
+        use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
+        quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
+        quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
 
         w = quantize_tensor(self.weight, bits, use_ste) if quant_weight else self.weight
         out = F.linear(x, w, self.bias)
@@ -206,14 +175,14 @@ def _to_quant_module(mod, bits, quant_weight=True, quant_act=True):
         new.weight = mod.weight
         if mod.bias is not None:
             new.bias = mod.bias
-        new.bits, new.use_ste, new.quant_weight, new.quant_act = bits, False, quant_weight, quant_act
+        new.bits, new.use_ste, new.quant_weight, new.quant_act = bits, QUANT_DEFAULT_USE_STE, quant_weight, quant_act
         return new
     if isinstance(mod, nn.Linear):
         new = QuantLinear(mod.in_features, mod.out_features, bias=mod.bias is not None)
         new.weight = mod.weight
         if mod.bias is not None:
             new.bias = mod.bias
-        new.bits, new.use_ste, new.quant_weight, new.quant_act = bits, False, quant_weight, quant_act
+        new.bits, new.use_ste, new.quant_weight, new.quant_act = bits, QUANT_DEFAULT_USE_STE, quant_weight, quant_act
         return new
     return None
 
@@ -253,7 +222,7 @@ def set_quant_components(model, quant_weight, quant_act):
             mod.quant_act = quant_act
 
 
-def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
+def prepare_qat(fp32_model, bits, finetune_loader, epochs=QAT_EPOCHS_DEFAULT, lr=QAT_LR):
     m = convert_to_quant(fp32_model, bits, quant_weight=True, quant_act=True)
     if torch.cuda.device_count() > 1:
         m = nn.DataParallel(m)
@@ -264,8 +233,8 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
     opt = torch.optim.SGD(
         m.parameters(),
         lr=lr,
-        momentum=0.9,
-        weight_decay=5e-4,
+        momentum=QAT_MOMENTUM,
+        weight_decay=QAT_WEIGHT_DECAY,
     )
     scaler = GradScaler(device=device.type)
 
@@ -286,12 +255,6 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
         print(f"  QAT epoch {epoch+1}/{epochs} avg loss {running/len(finetune_loader):.4f}")
     set_ste_mode(m, False)
     return m.eval()
-
-
-CIFAR_MEAN = torch.tensor(CIFAR_MEAN_VALUES).view(1, 3, 1, 1)
-CIFAR_STD = torch.tensor(CIFAR_STD_VALUES).view(1, 3, 1, 1)
-CLIP_MIN = ((0.0 - CIFAR_MEAN) / CIFAR_STD)
-CLIP_MAX = ((1.0 - CIFAR_MEAN) / CIFAR_STD)
 
 
 class PixelSpaceModel(nn.Module):
@@ -339,7 +302,7 @@ def accuracy_under_attack(model, loader, attack, target_model=None, max_images=N
         n_seen += y.size(0)
     return correct / total if total else None
 
-def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
+def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
     model.eval()
     fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
     out = {}
@@ -349,7 +312,7 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     pgd_accs = []
     for seed in seeds:
         torch.manual_seed(seed)
-        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
         pgd_accs.append(accuracy_under_attack(model, loader, pgd))
     out["PGD"] = float(np.mean(pgd_accs))
     out["PGD_mean"] = float(np.mean(pgd_accs))
@@ -357,11 +320,11 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     return out
 
 
-def run_autoattack(model, loader, eps=8 / 255):
+def run_autoattack(model, loader, eps=DEFAULT_EPS):
     model.eval()
     pixel_model = PixelSpaceModel(model).to(device).eval()
-    adversary = AutoAttack(pixel_model, norm="Linf", eps=eps, version="standard", device=device, verbose=False)
-    adversary.seed = 0
+    adversary = AutoAttack(pixel_model, norm=AUTOATTACK_NORM, eps=eps, version=AUTOATTACK_VERSION, device=device, verbose=AUTOATTACK_VERBOSE)
+    adversary.seed = AUTOATTACK_SEED
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -374,34 +337,34 @@ def run_autoattack(model, loader, eps=8 / 255):
     return correct / total
 
 
-def run_extra_whitebox_attacks(model, loader, eps=8 / 255, jsma_max_images=200):
+def run_extra_whitebox_attacks(model, loader, eps=DEFAULT_EPS, jsma_max_images=JSMA_MAX_IMAGES):
     model.eval()
     out = {}
 
-    cw = make_torchattack(torchattacks.CW, model, c=1, kappa=0, steps=50, lr=0.01)
+    cw = make_torchattack(torchattacks.CW, model, c=CW_C, kappa=CW_KAPPA, steps=CW_STEPS, lr=CW_LR)
     out["CW"] = accuracy_under_attack(model, loader, cw)
 
-    deepfool = make_torchattack(torchattacks.DeepFool, model, steps=50, overshoot=0.02)
+    deepfool = make_torchattack(torchattacks.DeepFool, model, steps=DEEPFOOL_STEPS, overshoot=DEEPFOOL_OVERSHOOT)
     out["DeepFool"] = accuracy_under_attack(model, loader, deepfool)
 
-    jsma = make_torchattack(torchattacks.JSMA, model, theta=1.0, gamma=0.1)
+    jsma = make_torchattack(torchattacks.JSMA, model, theta=JSMA_THETA, gamma=JSMA_GAMMA)
     out["JSMA"] = accuracy_under_attack(model, loader, jsma, max_images=jsma_max_images)
 
     return out
 
 
-def transfer_attack(source_model, target_model, loader, eps=8 / 255):
-    pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+def transfer_attack(source_model, target_model, loader, eps=DEFAULT_EPS):
+    pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
     return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
 
 
-def transfer_attack_mim(source_model, target_model, loader, eps=8 / 255):
-    mim = make_torchattack(torchattacks.MIFGSM, source_model, eps=eps, alpha=2 / 255, steps=20, decay=1.0)
+def transfer_attack_mim(source_model, target_model, loader, eps=DEFAULT_EPS):
+    mim = make_torchattack(torchattacks.MIFGSM, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, decay=MIFGSM_DECAY)
     return accuracy_under_attack(source_model, loader, mim, target_model=target_model)
 
 
-def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps=20,
-              overshoot=0.02, max_images=1000):
+def build_uap(model, loader, eps=DEFAULT_EPS, delta=UAP_DELTA, max_iter=UAP_MAX_ITER, deepfool_steps=UAP_DEEPFOOL_STEPS,
+              overshoot=UAP_OVERSHOOT, max_images=UAP_MAX_IMAGES):
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     sample_x, _ = next(iter(loader))
@@ -431,7 +394,7 @@ def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps
     return v.detach()
 
 
-def run_uap_attack(model, loader, eps=8 / 255, max_images=1000):
+def run_uap_attack(model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
     v = build_uap(model, loader, eps=eps, max_images=max_images)
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     correct, total = 0, 0
@@ -445,7 +408,7 @@ def run_uap_attack(model, loader, eps=8 / 255, max_images=1000):
     return correct / total
 
 
-def transfer_uap_attack(source_model, target_model, loader, eps=8 / 255, max_images=1000):
+def transfer_uap_attack(source_model, target_model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
     v = build_uap(source_model, loader, eps=eps, max_images=max_images)
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     correct, total = 0, 0
@@ -459,7 +422,7 @@ def transfer_uap_attack(source_model, target_model, loader, eps=8 / 255, max_ima
     return correct / total
 
 
-def bpda_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=20):
+def bpda_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS):
     set_ste_mode(model, True)
     clip_min = CLIP_MIN.to(device)
     clip_max = CLIP_MAX.to(device)
@@ -491,7 +454,7 @@ def _run_bpda_once(model, loader, eps, n_restarts):
     return all_correct.float().mean().item()
 
 
-def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
+def run_bpda(model, loader, eps=DEFAULT_EPS, n_restarts=BPDA_RESTARTS_DEFAULT, seeds=SEEDS):
     """
     Runs the whole worst-case-over-n_restarts procedure once per seed and
     reports mean/std across seeds, in addition to the original scalar
@@ -508,7 +471,7 @@ def run_bpda(model, loader, eps=8 / 255, n_restarts=1, seeds=SEEDS):
     }
 
 
-def nes_estimate_gradient(model, x, y, n_samples=20, sigma=1e-3, query_chunk=512):
+def nes_estimate_gradient(model, x, y, n_samples=NES_SAMPLES_DEFAULT, sigma=NES_SIGMA, query_chunk=NES_QUERY_CHUNK):
     """
     Estimates d(loss)/dx via antithetic NES sampling: for random directions
     u, the finite-difference loss(x + sigma*u) - loss(x - sigma*u) weights u
@@ -540,8 +503,8 @@ def nes_estimate_gradient(model, x, y, n_samples=20, sigma=1e-3, query_chunk=512
     return grad_acc / (2 * n_pairs * sigma)
 
 
-def nes_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=10, n_samples=20,
-                    sigma=1e-3, query_chunk=512):
+def nes_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=NES_STEPS, n_samples=NES_SAMPLES_DEFAULT,
+                    sigma=NES_SIGMA, query_chunk=NES_QUERY_CHUNK):
     """
     Black-box Linf PGD attack that substitutes the true gradient with the NES
     estimate above. Same random-start / sign-step / projection structure as
@@ -561,8 +524,8 @@ def nes_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=10, n_samples=
     return x_adv.detach()
 
 
-def nes_attack(model, loader, eps=8 / 255, n_samples=20, sigma=1e-3, alpha=2 / 255,
-               steps=10, seed=None, query_chunk=512):
+def nes_attack(model, loader, eps=DEFAULT_EPS, n_samples=NES_SAMPLES_DEFAULT, sigma=NES_SIGMA, alpha=PGD_ALPHA,
+               steps=NES_STEPS, seed=None, query_chunk=NES_QUERY_CHUNK):
     """Single-seed NES attack accuracy over the whole loader."""
     if seed is not None:
         torch.manual_seed(seed)
@@ -579,7 +542,7 @@ def nes_attack(model, loader, eps=8 / 255, n_samples=20, sigma=1e-3, alpha=2 / 2
     return correct / total
 
 
-def run_nes_attack(model, loader, eps=8 / 255, seeds=SEEDS, **kwargs):
+def run_nes_attack(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, **kwargs):
     """Seed-averaged wrapper around nes_attack (mirrors run_random_noise_seeded)."""
     accs = [nes_attack(model, loader, eps=eps, seed=s, **kwargs) for s in seeds]
     return {
@@ -590,28 +553,28 @@ def run_nes_attack(model, loader, eps=8 / 255, seeds=SEEDS, **kwargs):
 
 
 class SubstituteCNN(nn.Module):
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=SUBSTITUTE_NUM_CLASSES):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
+            nn.Conv2d(3, SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.Conv2d(SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.MaxPool2d(SUBSTITUTE_POOL_KERNEL),
+            nn.Conv2d(SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_CONV2_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.Conv2d(SUBSTITUTE_CONV2_CHANNELS, SUBSTITUTE_CONV2_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.MaxPool2d(SUBSTITUTE_POOL_KERNEL),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, num_classes),
+            nn.Linear(SUBSTITUTE_CONV2_CHANNELS * SUBSTITUTE_LINEAR_FEATURE_MAP * SUBSTITUTE_LINEAR_FEATURE_MAP, SUBSTITUTE_HIDDEN_DIM), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.Linear(SUBSTITUTE_HIDDEN_DIM, num_classes),
         )
 
     def forward(self, x):
         return self.classifier(self.features(x))
 
 
-def train_substitute(target_model, seed_x, rounds=6, epochs_per_round=10, lr=1e-3,
-                      lam=0.1, batch_size=128):
+def train_substitute(target_model, seed_x, rounds=SUBSTITUTE_ROUNDS, epochs_per_round=SUBSTITUTE_EPOCHS_PER_ROUND, lr=SUBSTITUTE_LR,
+                      lam=SUBSTITUTE_LAMBDA, batch_size=SUBSTITUTE_BATCH_SIZE):
     target_model.eval()
     substitute = SubstituteCNN().to(device)
     opt = torch.optim.Adam(substitute.parameters(), lr=lr)
@@ -623,7 +586,7 @@ def train_substitute(target_model, seed_x, rounds=6, epochs_per_round=10, lr=1e-
 
         substitute.train()
         ds = torch.utils.data.TensorDataset(x, y)
-        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=TRAIN_SHUFFLE)
         for _ in range(epochs_per_round):
             for xb, yb in dl:
                 opt.zero_grad(set_to_none=True)
@@ -643,7 +606,7 @@ def train_substitute(target_model, seed_x, rounds=6, epochs_per_round=10, lr=1e-
     return substitute
 
 
-def run_surrogate_attack(model, loader, eps=8 / 255, seed_n=500, rounds=6):
+def run_surrogate_attack(model, loader, eps=DEFAULT_EPS, seed_n=SURROGATE_SEED_N, rounds=SUBSTITUTE_ROUNDS):
     x_seed, n = [], 0
     for x, _ in loader:
         x_seed.append(x)
@@ -661,9 +624,9 @@ def _predict_batch(model, x):
         return model(x).argmax(dim=1)
 
 
-def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
-                            spherical_step=1e-2, source_step=1e-2, step_adapt=1.5,
-                            init_tries=200, init_chunk=25):
+def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=BOUNDARY_STEPS_DEFAULT,
+                            spherical_step=BOUNDARY_SPHERICAL_STEP, source_step=BOUNDARY_SOURCE_STEP, step_adapt=BOUNDARY_STEP_ADAPT,
+                            init_tries=BOUNDARY_INIT_TRIES, init_chunk=BOUNDARY_INIT_CHUNK):
     """
     Decision-based Boundary Attack (Brendel, Bethge, 2018) for a single
     already-correctly-classified image.
@@ -694,17 +657,17 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
     for i in range(steps):
         diff = x_orig - x_adv
         dist = diff.norm()
-        if dist.item() < 1e-12:
+        if dist.item() < BOUNDARY_MIN_DIST:
             break
 
         # random move orthogonal to the direction toward x_orig, same radius
         perturb = torch.randn_like(x_adv)
         perturb = perturb - (perturb * diff).sum() / (dist ** 2) * diff
-        perturb = perturb / (perturb.norm() + 1e-12) * dist * sph_step
+        perturb = perturb / (perturb.norm() + BOUNDARY_MIN_DIST) * dist * sph_step
         cand = x_adv + perturb
         # re-project onto the sphere of radius `dist` around x_orig
         new_diff = x_orig - cand
-        cand = x_orig - new_diff / (new_diff.norm() + 1e-12) * dist
+        cand = x_orig - new_diff / (new_diff.norm() + BOUNDARY_MIN_DIST) * dist
         cand = torch.clamp(cand, clip_min, clip_max)
 
         sph_ok = (_predict_batch(model, cand.unsqueeze(0))[0] != y_true).item()
@@ -718,18 +681,18 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
                 x_adv = cand2
 
         # adapt step sizes every 10 iters based on recent local success rate
-        if (i + 1) % 10 == 0:
+        if (i + 1) % BOUNDARY_ADAPT_INTERVAL == 0:
             if sph_hist:
                 rate = np.mean(sph_hist[-10:])
-                sph_step *= step_adapt if rate > 0.5 else (1 / step_adapt if rate < 0.2 else 1.0)
+                sph_step *= step_adapt if rate > BOUNDARY_SPH_SUCCESS_HIGH else (1 / step_adapt if rate < BOUNDARY_SPH_SUCCESS_LOW else 1.0)
             if src_hist:
                 rate = np.mean(src_hist[-10:])
-                src_step *= step_adapt if rate > 0.5 else (1 / step_adapt if rate < 0.2 else 1.0)
+                src_step *= step_adapt if rate > BOUNDARY_SPH_SUCCESS_HIGH else (1 / step_adapt if rate < BOUNDARY_SPH_SUCCESS_LOW else 1.0)
 
     return x_adv.detach()
 
 
-def run_boundary_attack(model, loader, eps=8 / 255, max_images=50, steps=200, seed=0):
+def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_IMAGES_DEFAULT, steps=BOUNDARY_STEPS_DEFAULT, seed=BOUNDARY_SEED):
     """
     Runs the Boundary Attack on up to `max_images` correctly-classified
     examples (it is inherently per-sample and query-heavy, so the full eval
@@ -772,7 +735,7 @@ def run_boundary_attack(model, loader, eps=8 / 255, max_images=50, steps=200, se
     }
 
 
-def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=3):
+def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX_BATCHES):
     set_ste_mode(model, False)
     frac_zero_hard, norm_hard = [], []
     frac_zero_ste, norm_ste = [], []
@@ -787,7 +750,7 @@ def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=3):
         x_in = x.clone().requires_grad_(True)
         loss = F.cross_entropy(model(x_in), y)
         g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
-        frac_zero_hard.append((g_hard.abs() < 1e-8).float().mean().item())
+        frac_zero_hard.append((g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item())
         norm_hard.append(g_hard.norm().item())
 
         set_ste_mode(model, True)
@@ -795,7 +758,7 @@ def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=3):
         loss2 = F.cross_entropy(model(x_in2), y)
         g_ste = torch.autograd.grad(loss2, x_in2)[0].flatten()
         set_ste_mode(model, False)
-        frac_zero_ste.append((g_ste.abs() < 1e-8).float().mean().item())
+        frac_zero_ste.append((g_ste.abs() < GRAD_ZERO_THRESHOLD).float().mean().item())
         norm_ste.append(g_ste.norm().item())
 
         if fp32_ref is not None:
@@ -816,7 +779,7 @@ def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=3):
     return diagnostics
 
 
-def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
+def random_noise_attack(model, loader, eps=DEFAULT_EPS, n_restarts=1, seed=None):
     if seed is not None:
         torch.manual_seed(seed)
     model.eval()
@@ -836,7 +799,7 @@ def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
     return correct / total
 
 
-def run_random_noise_seeded(model, loader, eps=8 / 255, seeds=SEEDS):
+def run_random_noise_seeded(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
     """Seed-averaged wrapper around random_noise_attack."""
     accs = [random_noise_attack(model, loader, eps=eps, seed=s) for s in seeds]
     return {
@@ -846,20 +809,20 @@ def run_random_noise_seeded(model, loader, eps=8 / 255, seeds=SEEDS):
     }
 
 
-def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20, 50)):
+def pgd_steps_ablation(model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_STEPS):
     model.eval()
     out = {}
     for steps in step_list:
         if steps == 0:
             acc = random_noise_attack(model, loader, eps=eps, seed=0)
         else:
-            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=steps, random_start=PGD_RANDOM_START)
             acc = accuracy_under_attack(model, loader, pgd)
         out[steps] = acc
     return out
 
 
-def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=20, max_batches=3):
+def pgd_trajectory_diagnostics(model, loader, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS, max_batches=TRAJECTORY_MAX_BATCHES):
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     step_grad_norms = [0.0] * steps
@@ -888,7 +851,7 @@ def pgd_trajectory_diagnostics(model, loader, eps=8 / 255, alpha=2 / 255, steps=
     }
 
 
-def layerwise_grad_profile(model, loader, use_ste, max_batches=3):
+def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BATCHES):
     quant_layers = [(n, m) for n, m in model.named_modules() if isinstance(m, (QuantConv2d, QuantLinear))]
     norms = {n: [] for n, _ in quant_layers}
     handles = []
@@ -923,7 +886,7 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=3):
     return {n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names}
 
 
-def staircase_diagnostic(model, loader, radius=1 / 255, n_points=40):
+def staircase_diagnostic(model, loader, radius=STAIRCASE_RADIUS, n_points=STAIRCASE_N_POINTS):
     model.eval()
     x, y = next(iter(loader))
     x = x.to(device)
@@ -950,7 +913,7 @@ def staircase_diagnostic(model, loader, radius=1 / 255, n_points=40):
 # single-seed 20-step PGD + frac_zero_grad_hard per config (not the full
 # AutoAttack/BPDA/trajectory suite). Restores the model to (True, True)
 # (its original state) before returning.
-def run_quant_component_ablation(model, loader, name, eps=8 / 255):
+def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     configs = [
         ("weight_only", True, False),
         ("act_only", False, True),
@@ -962,7 +925,7 @@ def run_quant_component_ablation(model, loader, name, eps=8 / 255):
         clean_acc = sanity_check_accuracy(model, loader)
 
         torch.manual_seed(0)
-        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
         pgd_acc = accuracy_under_attack(model, loader, pgd)
 
         x, y = next(iter(loader))
@@ -970,7 +933,7 @@ def run_quant_component_ablation(model, loader, name, eps=8 / 255):
         x_in = x.clone().requires_grad_(True)
         loss = F.cross_entropy(model(x_in), y)
         g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
-        frac_zero = (g_hard.abs() < 1e-8).float().mean().item()
+        frac_zero = (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
 
         rows.append({
             "model": name, "config": label,
@@ -984,9 +947,9 @@ def run_quant_component_ablation(model, loader, name, eps=8 / 255):
     return rows
 
 
-def confidence_margin_diagnostic(model, loader, eps=8 / 255, steps=20, max_batches=3):
+def confidence_margin_diagnostic(model, loader, eps=DEFAULT_EPS, steps=MARGIN_STEPS, max_batches=MARGIN_MAX_BATCHES):
     model.eval()
-    pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
+    pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=steps, random_start=PGD_RANDOM_START)
     clean_margins, adv_margins = [], []
     for bi, (x, y) in enumerate(loader):
         if bi >= max_batches:
@@ -1006,7 +969,7 @@ def confidence_margin_diagnostic(model, loader, eps=8 / 255, steps=20, max_batch
     return {"clean_margins": clean_margins, "adv_margins": adv_margins}
 
 
-def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
+def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     model.eval()
     results = {"model": name}
 
@@ -1067,13 +1030,13 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
 
     if count_quant_layers(model) > 0:
         try:
-            results.update(run_bpda(model, loader, eps=eps, n_restarts=2))
+            results.update(run_bpda(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SUITE))
         except Exception as e:
             print(f"  [WARN] BPDA failed for {name}: {e}")
             results["BPDA_PGD"] = None
 
         try:
-            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=3))
+            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=GRAD_DIAG_MAX_BATCHES))
         except Exception as e:
             print(f"  [WARN] gradient_diagnostics failed for {name}: {e}")
 
@@ -1083,14 +1046,14 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             print(f"  [WARN] staircase_diagnostic failed for {name}: {e}")
 
         try:
-            results.update(run_boundary_attack(model, loader, eps=eps, max_images=30, steps=500, seed=0))
+            results.update(run_boundary_attack(model, loader, eps=eps, max_images=BOUNDARY_MAX_IMAGES_SUITE, steps=BOUNDARY_STEPS_SUITE, seed=BOUNDARY_SEED))
         except Exception as e:
             print(f"  [WARN] boundary_attack failed for {name}: {e}")
             results["Boundary_acc"] = None
             results["Boundary_mean_Linf"] = None
 
         try:
-            results.update(run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=100, query_chunk=512
+            results.update(run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=NES_SAMPLES_SUITE, query_chunk=NES_QUERY_CHUNK
             ))
         except Exception as e:
             print(f"  [WARN] NES attack failed for {name}: {e}")
@@ -1104,7 +1067,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             print(f"  [WARN] pgd_steps_ablation failed for {name}: {e}")
 
         try:
-            traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=3)
+            traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=TRAJECTORY_MAX_BATCHES)
             with open(trajectory_json_path(name), "w") as f:
                 json.dump(traj, f, indent=2)
         except Exception as e:
@@ -1127,7 +1090,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             print(f"  [WARN] run_quant_component_ablation failed for {name}: {e}")
 
         try:
-            margins = confidence_margin_diagnostic(model, loader, eps=eps, max_batches=3)
+            margins = confidence_margin_diagnostic(model, loader, eps=eps, max_batches=MARGIN_MAX_BATCHES)
             with open(margin_json_path(name), "w") as f:
                 json.dump(margins, f)
         except Exception as e:
@@ -1142,7 +1105,7 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
         try:
-            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
             row["PGD_acc"] = accuracy_under_attack(model, loader, pgd)
         except Exception as e:
             print(f"  [WARN] PGD sweep failed for {name} eps={eps:.4f}: {e}")
@@ -1156,7 +1119,7 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
 
         if is_quant:
             try:
-                row["BPDA_acc"] = _run_bpda_once(model, loader, eps=eps, n_restarts=3)
+                row["BPDA_acc"] = _run_bpda_once(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SWEEP)
             except Exception as e:
                 print(f"  [WARN] BPDA sweep failed for {name} eps={eps:.4f}: {e}")
                 row["BPDA_acc"] = None
@@ -1176,20 +1139,20 @@ def plot_epsilon_sweep_curves(df_sweep):
         return
 
     models = df_long["model"].unique()
-    cols = min(3, len(models))
+    cols = min(SWEEP_PLOT_COLS_MAX, len(models))
     rows = int(np.ceil(len(models) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(SWEEP_PLOT_WIDTH * cols, SWEEP_PLOT_HEIGHT * rows), squeeze=False)
     for i, m in enumerate(models):
         ax = axes[i // cols][i % cols]
         sns.lineplot(data=df_long[df_long["model"] == m], x="epsilon", y="Accuracy", hue="Attack", marker="o", ax=ax)
         ax.set_title(m)
-        ax.set_ylim(0, 1.0)
-        ax.grid(linestyle="--", alpha=0.6)
+        ax.set_ylim(0, PLOT_MAX_ACCURACY)
+        ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
     for j in range(len(models), rows * cols):
         axes[j // cols][j % cols].axis("off")
     fig.suptitle("Accuracy vs Perturbation Budget (Epsilon Sweep)")
     fig.tight_layout()
-    fig.savefig(SWEEP_PLOT_PNG, dpi=300, bbox_inches="tight")
+    fig.savefig(SWEEP_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1199,15 +1162,15 @@ def plot_pgd_steps_ablation(model_names):
         return
     df_all = pd.concat(frames, ignore_index=True)
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=ABLATION_FIGSIZE)
     sns.lineplot(data=df_all, x="steps", y="acc", hue="model", marker="o")
     plt.title("PGD Accuracy vs Number of Steps (Gradient Masking Check)")
     plt.xlabel("PGD steps")
     plt.ylabel("Accuracy")
-    plt.ylim(0, 1.0)
-    plt.grid(linestyle="--", alpha=0.6)
+    plt.ylim(0, PLOT_MAX_ACCURACY)
+    plt.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
     plt.tight_layout()
-    plt.savefig(ABLATION_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.savefig(ABLATION_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1221,7 +1184,7 @@ def plot_pgd_trajectory(model_names):
     if not trajs:
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 2, figsize=TRAJECTORY_FIGSIZE)
     for name, traj in trajs.items():
         steps = range(1, len(traj["grad_norm_per_step"]) + 1)
         axes[0].plot(steps, traj["grad_norm_per_step"], marker="o", label=name)
@@ -1231,17 +1194,17 @@ def plot_pgd_trajectory(model_names):
     axes[0].set_xlabel("Step")
     axes[0].set_ylabel("Grad Norm")
     axes[0].set_yscale("log")
-    axes[0].grid(linestyle="--", alpha=0.6)
-    axes[0].legend(fontsize=8)
+    axes[0].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
+    axes[0].legend(fontsize=PLOT_LEGEND_FONT_SIZE)
 
     axes[1].set_title("Perturbation Movement per PGD Step")
     axes[1].set_xlabel("Step")
     axes[1].set_ylabel("Linf Movement from Random Start")
-    axes[1].grid(linestyle="--", alpha=0.6)
-    axes[1].legend(fontsize=8)
+    axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
+    axes[1].legend(fontsize=PLOT_LEGEND_FONT_SIZE)
 
     fig.tight_layout()
-    fig.savefig(TRAJECTORY_PLOT_PNG, dpi=300, bbox_inches="tight")
+    fig.savefig(TRAJECTORY_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1250,9 +1213,9 @@ def plot_layerwise_grad_profile(model_names):
     if not quant_names:
         return
 
-    cols = min(2, len(quant_names))
+    cols = min(LAYERWISE_PLOT_COLS_MAX, len(quant_names))
     rows = int(np.ceil(len(quant_names) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(9 * cols, 4.5 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(LAYERWISE_PLOT_WIDTH * cols, LAYERWISE_PLOT_HEIGHT * rows), squeeze=False)
     for i, name in enumerate(quant_names):
         df = pd.read_csv(layerwise_csv_path(name))
         ax = axes[i // cols][i % cols]
@@ -1261,16 +1224,16 @@ def plot_layerwise_grad_profile(model_names):
         ax.plot(x, df["grad_norm_ste"], marker="o", label="STE")
         ax.set_yscale("log")
         ax.set_xticks(x)
-        ax.set_xticklabels(df["layer"], rotation=90, fontsize=6)
+        ax.set_xticklabels(df["layer"], rotation=LAYERWISE_XTICK_ROTATION, fontsize=LAYERWISE_XTICK_FONT_SIZE)
         ax.set_title(name)
         ax.set_ylabel("Grad Norm (log)")
-        ax.legend(fontsize=8)
-        ax.grid(linestyle="--", alpha=0.6)
+        ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
+        ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
     for j in range(len(quant_names), rows * cols):
         axes[j // cols][j % cols].axis("off")
     fig.suptitle("Layerwise Gradient Norms: Hard-Round vs STE")
     fig.tight_layout()
-    fig.savefig(LAYERWISE_PLOT_PNG, dpi=300, bbox_inches="tight")
+    fig.savefig(LAYERWISE_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1281,10 +1244,10 @@ def plot_component_ablation(model_names):
     df_all = pd.concat(frames, ignore_index=True)
     df_long = df_all.melt(id_vars=["model", "config"], value_vars=["clean_acc", "PGD_acc"], var_name="Metric", value_name="Accuracy")
 
-    g = sns.catplot(data=df_long, x="config", y="Accuracy", hue="Metric", col="model", kind="bar", col_wrap=3, height=4, sharey=True)
+    g = sns.catplot(data=df_long, x="config", y="Accuracy", hue="Metric", col="model", kind="bar", col_wrap=COMPONENT_ABLATION_COL_WRAP, height=COMPONENT_ABLATION_HEIGHT, sharey=True)
     g.set_titles("{col_name}")
-    g.set(ylim=(0, 1.0))
-    g.savefig(COMPONENT_ABLATION_PLOT_PNG, dpi=300, bbox_inches="tight")
+    g.set(ylim=(0, PLOT_MAX_ACCURACY))
+    g.savefig(COMPONENT_ABLATION_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1296,23 +1259,23 @@ def plot_gradient_masking_summary(df_results):
         return
     df["PGD_minus_AutoAttack"] = df["PGD"] - df["AutoAttack"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 2, figsize=MASKING_SUMMARY_FIGSIZE)
     sns.barplot(data=df, x="model", y="PGD_minus_AutoAttack", ax=axes[0])
-    axes[0].axhline(0, color="black", linewidth=0.8)
-    axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=45, ha="right")
+    axes[0].axhline(0, color="black", linewidth=MASKING_BASELINE_LINEWIDTH)
+    axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=SUMMARY_XTICK_ROTATION, ha="right")
     axes[0].set_title("PGD - AutoAttack Accuracy Gap")
-    axes[0].grid(axis="y", linestyle="--", alpha=0.6)
+    axes[0].grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
 
     if "frac_zero_grad_hard" in df.columns:
         df2 = df.dropna(subset=["frac_zero_grad_hard"])
-        sns.scatterplot(data=df2, x="frac_zero_grad_hard", y="PGD_minus_AutoAttack", hue="model", s=80, ax=axes[1])
+        sns.scatterplot(data=df2, x="frac_zero_grad_hard", y="PGD_minus_AutoAttack", hue="model", s=MASKING_SCATTER_SIZE, ax=axes[1])
         axes[1].set_title("Masking Gap vs Fraction of Zero Gradients")
-        axes[1].grid(linestyle="--", alpha=0.6)
+        axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
     else:
         axes[1].axis("off")
 
     fig.tight_layout()
-    fig.savefig(MASKING_SUMMARY_PLOT_PNG, dpi=300, bbox_inches="tight")
+    fig.savefig(MASKING_SUMMARY_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1326,22 +1289,22 @@ def plot_confidence_margin_diagnostic(model_names):
     if not data:
         return
 
-    cols = min(3, len(data))
+    cols = min(MARGIN_PLOT_COLS_MAX, len(data))
     rows = int(np.ceil(len(data) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(MARGIN_PLOT_WIDTH * cols, MARGIN_PLOT_HEIGHT * rows), squeeze=False)
     for i, (name, margins) in enumerate(data.items()):
         ax = axes[i // cols][i % cols]
-        ax.hist(margins["clean_margins"], bins=30, alpha=0.6, label="clean", density=True)
-        ax.hist(margins["adv_margins"], bins=30, alpha=0.6, label="PGD-adv", density=True)
+        ax.hist(margins["clean_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="clean", density=True)
+        ax.hist(margins["adv_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="PGD-adv", density=True)
         ax.set_title(name)
         ax.set_xlabel("Top1 - Top2 Softmax Margin")
-        ax.legend(fontsize=8)
-        ax.grid(linestyle="--", alpha=0.6)
+        ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
+        ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
     for j in range(len(data), rows * cols):
         axes[j // cols][j % cols].axis("off")
     fig.suptitle("Confidence Margin: Clean vs PGD-Adversarial")
     fig.tight_layout()
-    fig.savefig(MARGIN_PLOT_PNG, dpi=300, bbox_inches="tight")
+    fig.savefig(MARGIN_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1356,11 +1319,11 @@ def plot_results_heatmap(df_results):
         return
     df_heat = df_results.set_index("model")[cols].astype(float)
 
-    plt.figure(figsize=(max(10, len(cols)), max(6, len(df_heat) * 0.5)))
-    sns.heatmap(df_heat, annot=True, fmt=".2f", cmap="RdYlGn", vmin=0, vmax=1, linewidths=0.5)
+    plt.figure(figsize=(max(HEATMAP_MIN_WIDTH, len(cols)), max(HEATMAP_MIN_HEIGHT, len(df_heat) * HEATMAP_ROW_HEIGHT)))
+    sns.heatmap(df_heat, annot=True, fmt=".2f", cmap="RdYlGn", vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX, linewidths=HEATMAP_LINEWIDTHS)
     plt.title("Full Results Heatmap: Models vs Attacks")
     plt.tight_layout()
-    plt.savefig(HEATMAP_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.savefig(HEATMAP_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
 
@@ -1387,7 +1350,7 @@ def main():
             continue
 
         try:
-            int8_ptq = convert_to_quant(fp32, bits=8, quant_weight=True, quant_act=True)
+            int8_ptq = convert_to_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
             model_registry[f"{arch_key}_int8_PTQ"] = (int8_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 PTQ for {arch_key}: {e}")
@@ -1399,7 +1362,7 @@ def main():
             print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
 
         try:
-            int8_qat = prepare_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=5)
+            int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS)
             model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
@@ -1450,17 +1413,15 @@ def main():
     if len(acc_cols) > 0:
         df_plot = df_results.melt(id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy")
 
-        plt.figure(figsize=(14, 6))
+        plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
         sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Attack")
-        plt.xticks(rotation=45, ha="right")
+        plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
         plt.title("Model Accuracy under Various Adversarial Attacks")
-        plt.ylim(0, 1.0)
-        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.ylim(0, PLOT_MAX_ACCURACY)
+        plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
         plt.tight_layout()
-        plt.savefig(PLOT_PNG, dpi=300, bbox_inches="tight")
+        plt.savefig(PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
         plt.show()
-
-    SWEEP_EPSILONS = [1/255, 2/255, 3/255, 4/255, 6/255, 8/255, 12/255, 16/255]
 
     if os.path.exists(SWEEP_CSV):
         df_sweep = pd.read_csv(SWEEP_CSV)
