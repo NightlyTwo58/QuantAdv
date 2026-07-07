@@ -304,9 +304,12 @@ def quant_layer_chunks(layer_names, n_chunks):
 
 
 def set_ste_mode(model, flag):
+    toggled = 0
     for mod in model.modules():
         if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
             mod.use_ste = flag
+            toggled += 1
+    return toggled
 
 
 def count_quant_layers(model):
@@ -559,21 +562,29 @@ def transfer_uap_attack(source_model, target_model, loader, eps=DEFAULT_EPS, max
     return correct / total
 
 
-def bpda_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS):
+def bpda_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS, backward_model=None):
     set_ste_mode(model, True)
+    backward_model = backward_model if backward_model is not None else model
+    if backward_model is not model:
+        set_ste_mode(backward_model, True)
     clip_min = CLIP_MIN.to(device)
     clip_max = CLIP_MAX.to(device)
     x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
     x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-    for _ in range(steps):
-        x_adv.requires_grad_(True)
-        loss = F.cross_entropy(model(x_adv), y)
-        grad = torch.autograd.grad(loss, x_adv)[0]
-        x_adv = x_adv.detach() + alpha * grad.sign()
-        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-    set_ste_mode(model, False)
-    return x_adv.detach()
+    try:
+        for _ in range(steps):
+            x_adv.requires_grad_(True)
+            loss = F.cross_entropy(backward_model(x_adv), y)
+            grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+            grad = torch.zeros_like(x_adv) if grad is None else grad
+            x_adv = x_adv.detach() + alpha * grad.sign()
+            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+        return x_adv.detach()
+    finally:
+        set_ste_mode(model, False)
+        if backward_model is not model:
+            set_ste_mode(backward_model, False)
 
 
 def _run_bpda_once(model, loader, eps, n_restarts):
@@ -606,6 +617,118 @@ def run_bpda(model, loader, eps=DEFAULT_EPS, n_restarts=BPDA_RESTARTS_DEFAULT, s
         "BPDA_PGD_mean": float(np.mean(accs)),
         "BPDA_PGD_std": float(np.std(accs)),
     }
+
+
+def evaluate_normalized_attack(model, loader, attack_fn):
+    correct, total = 0, 0
+    model.eval()
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        x_adv = attack_fn(x, y)
+        with torch.no_grad():
+            pred = model(x_adv).argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / total if total else None
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def adaptive_pgd_attack(model, x, y, loss_fn, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS):
+    set_ste_mode(model, True)
+    clip_min = CLIP_MIN.to(device)
+    clip_max = CLIP_MAX.to(device)
+    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    try:
+        for _ in range(steps):
+            x_adv.requires_grad_(True)
+            loss = loss_fn(x_adv, y)
+            grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+            grad = torch.zeros_like(x_adv) if grad is None else grad
+            x_adv = x_adv.detach() + alpha * grad.sign()
+            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+        return x_adv.detach()
+    finally:
+        set_ste_mode(model, False)
+
+
+def run_sanitized_bpda(model, loader, eps=DEFAULT_EPS):
+    defense_model = unwrap_model(model)
+    backward_model = defense_model.model if hasattr(defense_model, "model") else model
+    acc = evaluate_normalized_attack(
+        model,
+        loader,
+        lambda x, y: bpda_pgd_attack(model, x, y, eps=eps, backward_model=backward_model),
+    )
+    return {"BPDA_Adaptive": acc}
+
+
+def run_eot_pgd(model, loader, eps=DEFAULT_EPS, eot_samples=ADAPTIVE_EOT_SAMPLES):
+    defense_model = unwrap_model(model)
+
+    def attack(x, y):
+        def loss_fn(x_adv, labels):
+            loss = 0.0
+            base_model = defense_model.model if hasattr(defense_model, "model") else model
+            sigma = getattr(defense_model, "sigma", 0.0)
+            clip_min = CLIP_MIN.to(x_adv.device)
+            clip_max = CLIP_MAX.to(x_adv.device)
+            for _ in range(eot_samples):
+                noisy = (x_adv + torch.randn_like(x_adv) * sigma).clamp(clip_min, clip_max)
+                loss = loss + F.cross_entropy(base_model(noisy), labels)
+            return loss / eot_samples
+
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+
+    return {"EOT_PGD": evaluate_normalized_attack(model, loader, attack)}
+
+
+def run_adaptive_guardrail(model, loader, eps=DEFAULT_EPS, lam=ADAPTIVE_GUARDRAIL_LAMBDA):
+    defense_model = unwrap_model(model)
+
+    def attack(x, y):
+        def loss_fn(x_adv, labels):
+            logits = defense_model.model(x_adv)
+            conf = F.softmax(logits, dim=1).max(dim=1).values
+            threshold = getattr(defense_model, "conf_threshold", 0.55)
+            guardrail_penalty = F.softplus(ADAPTIVE_GUARDRAIL_SCALE * (threshold - conf)).mean()
+            return F.cross_entropy(logits, labels) - lam * guardrail_penalty
+
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+
+    return {"Adaptive_Guardrail": evaluate_normalized_attack(model, loader, attack)}
+
+
+def run_adaptive_detect_guard(model, loader, eps=DEFAULT_EPS, lam=ADAPTIVE_DETECTOR_LAMBDA):
+    defense_model = unwrap_model(model)
+
+    def attack(x, y):
+        def loss_fn(x_adv, labels):
+            logits = defense_model.model(x_adv)
+            benign = torch.zeros(labels.size(0), dtype=torch.long, device=labels.device)
+            detector_penalty = F.cross_entropy(defense_model.detector(x_adv), benign)
+            return F.cross_entropy(logits, labels) - lam * detector_penalty
+
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+
+    return {"Adaptive_DetectGuard": evaluate_normalized_attack(model, loader, attack)}
+
+
+def run_defense_adaptive_attacks(model, loader, eps=DEFAULT_EPS):
+    defense_model = unwrap_model(model)
+    if isinstance(defense_model, dfn.SanitizedModel):
+        return run_sanitized_bpda(model, loader, eps=eps)
+    if isinstance(defense_model, dfn.SmoothedModel):
+        return run_eot_pgd(model, loader, eps=eps)
+    if isinstance(defense_model, dfn.GuardrailModel):
+        return run_adaptive_guardrail(model, loader, eps=eps)
+    if isinstance(defense_model, dfn.DetectGuardModel):
+        return run_adaptive_detect_guard(model, loader, eps=eps)
+    return {}
 
 
 def nes_estimate_gradient(model, x, y, n_samples=NES_SAMPLES_DEFAULT, sigma=NES_SIGMA, query_chunk=NES_QUERY_CHUNK):
@@ -863,12 +986,25 @@ def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_
             n_seen += 1
 
     if not dists:
-        return {"Boundary_acc": None, "Boundary_mean_Linf": None}
+        return {
+            "Boundary_acc": None,
+            "Boundary_mean_Linf": None,
+            "Boundary_median_Linf": None,
+            "Boundary_min_Linf": None,
+            "Boundary_max_Linf": None,
+            "Boundary_std_Linf": None,
+            "Boundary_n": 0,
+        }
 
-    dists = np.array(dists)
+    dists = np.array(dists, dtype=float)
     return {
         "Boundary_acc": float((dists > eps).mean()),
         "Boundary_mean_Linf": float(dists.mean()),
+        "Boundary_median_Linf": float(np.median(dists)),
+        "Boundary_min_Linf": float(dists.min()),
+        "Boundary_max_Linf": float(dists.max()),
+        "Boundary_std_Linf": float(dists.std()),
+        "Boundary_n": int(len(dists)),
     }
 
 
@@ -1214,6 +1350,20 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         print(f"  [WARN] random_noise_attack failed for {name}: {e}")
         results["Random_Noise"] = None
 
+    try:
+        results.update(run_defense_adaptive_attacks(model, loader, eps=eps))
+    except Exception as e:
+        print(f"  [WARN] adaptive defense attack failed for {name}: {e}")
+        defense_model = unwrap_model(model)
+        if isinstance(defense_model, dfn.SanitizedModel):
+            results["BPDA_Adaptive"] = None
+        elif isinstance(defense_model, dfn.SmoothedModel):
+            results["EOT_PGD"] = None
+        elif isinstance(defense_model, dfn.GuardrailModel):
+            results["Adaptive_Guardrail"] = None
+        elif isinstance(defense_model, dfn.DetectGuardModel):
+            results["Adaptive_DetectGuard"] = None
+
     if count_quant_layers(model) > 0:
         try:
             results.update(run_bpda(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SUITE))
@@ -1237,6 +1387,11 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             print(f"  [WARN] boundary_attack failed for {name}: {e}")
             results["Boundary_acc"] = None
             results["Boundary_mean_Linf"] = None
+            results["Boundary_median_Linf"] = None
+            results["Boundary_min_Linf"] = None
+            results["Boundary_max_Linf"] = None
+            results["Boundary_std_Linf"] = None
+            results["Boundary_n"] = 0
 
         try:
             results.update(run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=NES_SAMPLES_SUITE, query_chunk=NES_QUERY_CHUNK
@@ -1405,7 +1560,18 @@ def plot_defense_comparison(df_results):
     df_def = df_results[df_results["model"].astype(str).str.contains("|".join(defense_tags))]
     if df_def.empty:
         return
-    cols = [c for c in ["clean_acc", "PGD", "AutoAttack"] if c in df_def.columns and df_def[c].notna().any()]
+    cols = [
+        c for c in [
+            "clean_acc",
+            "PGD",
+            "AutoAttack",
+            "BPDA_Adaptive",
+            "EOT_PGD",
+            "Adaptive_Guardrail",
+            "Adaptive_DetectGuard",
+        ]
+        if c in df_def.columns and df_def[c].notna().any()
+    ]
     if not cols:
         return
     df_long = df_def.melt(id_vars="model", value_vars=cols, var_name="Attack", value_name="Accuracy")
@@ -1628,7 +1794,8 @@ def plot_results_heatmap(df_results):
     candidate_cols = ["clean_acc", "FGSM", "PGD", "AutoAttack", "CW", "DeepFool", "JSMA",
                       "Surrogate_Transfer", "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
                       "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
-                      "Random_Noise", "BPDA_PGD", "NES", "Boundary_acc"]
+                      "Random_Noise", "BPDA_PGD", "BPDA_Adaptive", "EOT_PGD",
+                      "Adaptive_Guardrail", "Adaptive_DetectGuard", "NES", "Boundary_acc"]
     cols = [c for c in candidate_cols if c in df_results.columns and df_results[c].notna().any()]
     if not cols:
         return
@@ -1782,6 +1949,10 @@ def main():
     adaptive_cols = [
         c for c in [
             "BPDA_PGD",
+            "BPDA_Adaptive",
+            "EOT_PGD",
+            "Adaptive_Guardrail",
+            "Adaptive_DetectGuard",
             "NES",
             "Boundary_acc",
             "AutoAttack",
@@ -1830,7 +2001,8 @@ def main():
     acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
                              "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
                              "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
-                             "Surrogate_Transfer", "Random_Noise", "BPDA_PGD"]
+                             "Surrogate_Transfer", "Random_Noise", "BPDA_PGD",
+                             "BPDA_Adaptive", "EOT_PGD", "Adaptive_Guardrail", "Adaptive_DetectGuard"]
                 if c in df_results.columns]
 
     if len(acc_cols) > 0:
