@@ -21,6 +21,8 @@ from torch.amp import autocast, GradScaler
 import torchattacks
 from autoattack import AutoAttack
 
+import defense as dfn
+
 import sys
 from pathlib import Path
 
@@ -51,6 +53,8 @@ def trajectory_json_path(model_name):
 def component_ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
 
+def defense_summary_csv_path():
+    return os.path.join(DATA_DIR, "defense_summary.csv")
 
 def margin_json_path(model_name):
     return os.path.join(DATA_DIR, f"margin_{model_name}.json")
@@ -1230,6 +1234,114 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     return rows
 
 
+def run_defense_suite(model_registry, finetune_loader, eval_loader):
+
+    summary_rows = []
+
+    arch_keys = sorted({name.split("_FP32")[0] for name in model_registry if name.endswith("_FP32")})
+
+    for arch_key in arch_keys:
+        fp32_entry = model_registry.get(f"{arch_key}_FP32")
+        qat_entry = model_registry.get(f"{arch_key}_int8_QAT")
+        if fp32_entry is None:
+            continue
+        fp32_model = fp32_entry[0]
+
+        try:
+            fp32_at = dfn.prepare_adversarial_training(fp32_model, finetune_loader, bits=None)
+            model_registry[f"{arch_key}_FP32_AT"] = (fp32_at, fp32_model)
+        except Exception as e:
+            print(f"  [FAIL] adversarial training (FP32) for {arch_key}: {e}")
+            traceback.print_exc()
+
+        try:
+            int8_at = dfn.prepare_adversarial_training(fp32_model, finetune_loader, bits=QAT_BITS)
+            model_registry[f"{arch_key}_int8_QAT_AT"] = (int8_at, fp32_model)
+        except Exception as e:
+            print(f"  [FAIL] adversarial training (int8) for {arch_key}: {e}")
+            traceback.print_exc()
+
+        wrap_targets = [("FP32", fp32_model)]
+        if qat_entry is not None:
+            wrap_targets.append(("int8_QAT", qat_entry[0]))
+
+        detector = None
+        try:
+            detector = dfn.train_adversarial_detector(fp32_model, finetune_loader)
+        except Exception as e:
+            print(f"  [FAIL] adversarial detector training for {arch_key}: {e}")
+            traceback.print_exc()
+
+        for tag, base_model in wrap_targets:
+            entry_name = f"{arch_key}_{tag}"
+
+            try:
+                sanitized = dfn.SanitizedModel(base_model).to(device).eval()
+                model_registry[f"{entry_name}_Sanitized"] = (sanitized, fp32_model)
+            except Exception as e:
+                print(f"  [FAIL] SanitizedModel for {entry_name}: {e}")
+
+            try:
+                smoothed = dfn.SmoothedModel(base_model).to(device).eval()
+                model_registry[f"{entry_name}_Smoothed"] = (smoothed, fp32_model)
+                cert_stats = dfn.run_certified_accuracy(smoothed, eval_loader)
+                summary_rows.append({"model": entry_name, "defense": "randomized_smoothing", **cert_stats})
+            except Exception as e:
+                print(f"  [FAIL] SmoothedModel/certification for {entry_name}: {e}")
+                traceback.print_exc()
+
+            try:
+                guardrail = dfn.GuardrailModel(base_model).to(device).eval()
+                model_registry[f"{entry_name}_Guardrail"] = (guardrail, fp32_model)
+                pgd_for_flagging = make_torchattack(torchattacks.PGD, guardrail, eps=DEFAULT_EPS,
+                                                     alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+                flag_stats = dfn.run_guardrail_flagging_rate(guardrail, eval_loader, attack=pgd_for_flagging)
+                summary_rows.append({"model": entry_name, "defense": "guardrail", **flag_stats})
+            except Exception as e:
+                print(f"  [FAIL] GuardrailModel for {entry_name}: {e}")
+                traceback.print_exc()
+
+            if detector is not None:
+                try:
+                    detect_guard = dfn.DetectGuardModel(base_model, detector).to(device).eval()
+                    model_registry[f"{entry_name}_DetectGuard"] = (detect_guard, fp32_model)
+                    pgd_for_detect = make_torchattack(torchattacks.PGD, detect_guard, eps=DEFAULT_EPS,
+                                                       alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+                    catch_stats = dfn.run_detector_catch_rate(detect_guard, eval_loader, attack=pgd_for_detect)
+                    summary_rows.append({"model": entry_name, "defense": "detector", **catch_stats})
+                except Exception as e:
+                    print(f"  [FAIL] DetectGuardModel for {entry_name}: {e}")
+                    traceback.print_exc()
+
+    df_defense = pd.DataFrame(summary_rows)
+    if not df_defense.empty:
+        df_defense.to_csv(defense_summary_csv_path(), index=False)
+    return model_registry, df_defense
+
+
+def plot_defense_comparison(df_results):
+    if df_results is None or df_results.empty:
+        return
+    defense_tags = ("_AT", "_Sanitized", "_Smoothed", "_Guardrail", "_DetectGuard")
+    df_def = df_results[df_results["model"].astype(str).str.contains("|".join(defense_tags))]
+    if df_def.empty:
+        return
+    cols = [c for c in ["clean_acc", "PGD", "AutoAttack"] if c in df_def.columns and df_def[c].notna().any()]
+    if not cols:
+        return
+    df_long = df_def.melt(id_vars="model", value_vars=cols, var_name="Attack", value_name="Accuracy")
+
+    plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
+    sns.barplot(data=df_long, x="model", y="Accuracy", hue="Attack")
+    plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
+    plt.title("Defense Variants: Accuracy under Attack")
+    plt.ylim(0, PLOT_MAX_ACCURACY)
+    plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
+    plt.tight_layout()
+    plt.savefig(os.path.join(DATA_DIR, "defense_comparison.png"), dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
+    plt.show()
+
+
 def plot_epsilon_sweep_curves(df_sweep):
     if df_sweep is None or df_sweep.empty:
         return
@@ -1639,134 +1751,6 @@ def main():
         print(f"  [WARN] plot_defense_comparison failed: {e}")
 
     print("All done.")
-
-
-
-def defense_summary_csv_path():
-    return os.path.join(DATA_DIR, "defense_summary.csv")
-
-
-def run_defense_suite(model_registry, finetune_loader, eval_loader):
-    """
-    Additive defense pass:
-      1. Adversarial-trained variants (FP32 + int8) straight into
-         model_registry so they flow through the *existing* run_suite /
-         epsilon-sweep / plotting code unchanged.
-      2. Input-sanitization, certified-smoothing, and guardrail wrappers
-         around the plain FP32 and int8_QAT models (also added to
-         model_registry for the same reason).
-      3. A detection-based active defense (ConvNeXt guard model) wrapped
-         around FP32 and int8_QAT.
-    Returns the (mutated) model_registry plus a defense-specific summary
-    dataframe (guardrail/detector flag rates, certified accuracy) that
-    doesn't fit the existing per-attack CSV schema.
-    """
-
-    summary_rows = []
-
-    arch_keys = sorted({name.split("_FP32")[0] for name in model_registry if name.endswith("_FP32")})
-
-    for arch_key in arch_keys:
-        fp32_entry = model_registry.get(f"{arch_key}_FP32")
-        qat_entry = model_registry.get(f"{arch_key}_int8_QAT")
-        if fp32_entry is None:
-            continue
-        fp32_model = fp32_entry[0]
-
-        try:
-            fp32_at = dfn.prepare_adversarial_training(fp32_model, finetune_loader, bits=None)
-            model_registry[f"{arch_key}_FP32_AT"] = (fp32_at, fp32_model)
-        except Exception as e:
-            print(f"  [FAIL] adversarial training (FP32) for {arch_key}: {e}")
-            traceback.print_exc()
-
-        try:
-            int8_at = dfn.prepare_adversarial_training(fp32_model, finetune_loader, bits=QAT_BITS)
-            model_registry[f"{arch_key}_int8_QAT_AT"] = (int8_at, fp32_model)
-        except Exception as e:
-            print(f"  [FAIL] adversarial training (int8) for {arch_key}: {e}")
-            traceback.print_exc()
-
-        wrap_targets = [("FP32", fp32_model)]
-        if qat_entry is not None:
-            wrap_targets.append(("int8_QAT", qat_entry[0]))
-
-        detector = None
-        try:
-            detector = dfn.train_adversarial_detector(fp32_model, finetune_loader)
-        except Exception as e:
-            print(f"  [FAIL] adversarial detector training for {arch_key}: {e}")
-            traceback.print_exc()
-
-        for tag, base_model in wrap_targets:
-            entry_name = f"{arch_key}_{tag}"
-
-            try:
-                sanitized = dfn.SanitizedModel(base_model).to(device).eval()
-                model_registry[f"{entry_name}_Sanitized"] = (sanitized, fp32_model)
-            except Exception as e:
-                print(f"  [FAIL] SanitizedModel for {entry_name}: {e}")
-
-            try:
-                smoothed = dfn.SmoothedModel(base_model).to(device).eval()
-                model_registry[f"{entry_name}_Smoothed"] = (smoothed, fp32_model)
-                cert_stats = dfn.run_certified_accuracy(smoothed, eval_loader)
-                summary_rows.append({"model": entry_name, "defense": "randomized_smoothing", **cert_stats})
-            except Exception as e:
-                print(f"  [FAIL] SmoothedModel/certification for {entry_name}: {e}")
-                traceback.print_exc()
-
-            try:
-                guardrail = dfn.GuardrailModel(base_model).to(device).eval()
-                model_registry[f"{entry_name}_Guardrail"] = (guardrail, fp32_model)
-                pgd_for_flagging = make_torchattack(torchattacks.PGD, guardrail, eps=DEFAULT_EPS,
-                                                     alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-                flag_stats = dfn.run_guardrail_flagging_rate(guardrail, eval_loader, attack=pgd_for_flagging)
-                summary_rows.append({"model": entry_name, "defense": "guardrail", **flag_stats})
-            except Exception as e:
-                print(f"  [FAIL] GuardrailModel for {entry_name}: {e}")
-                traceback.print_exc()
-
-            if detector is not None:
-                try:
-                    detect_guard = dfn.DetectGuardModel(base_model, detector).to(device).eval()
-                    model_registry[f"{entry_name}_DetectGuard"] = (detect_guard, fp32_model)
-                    pgd_for_detect = make_torchattack(torchattacks.PGD, detect_guard, eps=DEFAULT_EPS,
-                                                       alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-                    catch_stats = dfn.run_detector_catch_rate(detect_guard, eval_loader, attack=pgd_for_detect)
-                    summary_rows.append({"model": entry_name, "defense": "detector", **catch_stats})
-                except Exception as e:
-                    print(f"  [FAIL] DetectGuardModel for {entry_name}: {e}")
-                    traceback.print_exc()
-
-    df_defense = pd.DataFrame(summary_rows)
-    if not df_defense.empty:
-        df_defense.to_csv(defense_summary_csv_path(), index=False)
-    return model_registry, df_defense
-
-
-def plot_defense_comparison(df_results):
-    if df_results is None or df_results.empty:
-        return
-    defense_tags = ("_AT", "_Sanitized", "_Smoothed", "_Guardrail", "_DetectGuard")
-    df_def = df_results[df_results["model"].astype(str).str.contains("|".join(defense_tags))]
-    if df_def.empty:
-        return
-    cols = [c for c in ["clean_acc", "PGD", "AutoAttack"] if c in df_def.columns and df_def[c].notna().any()]
-    if not cols:
-        return
-    df_long = df_def.melt(id_vars="model", value_vars=cols, var_name="Attack", value_name="Accuracy")
-
-    plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
-    sns.barplot(data=df_long, x="model", y="Accuracy", hue="Attack")
-    plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
-    plt.title("Defense Variants: Accuracy under Attack")
-    plt.ylim(0, PLOT_MAX_ACCURACY)
-    plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
-    plt.tight_layout()
-    plt.savefig(os.path.join(DATA_DIR, "defense_comparison.png"), dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
 
 if __name__ == '__main__':
     main()
