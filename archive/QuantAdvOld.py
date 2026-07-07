@@ -70,16 +70,20 @@ if not os.path.isdir(expected):
     raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
 
 
+CIFAR_MEAN_VALUES = (0.4914, 0.4822, 0.4465)
+CIFAR_STD_VALUES = (0.2023, 0.1994, 0.2010)
+
+
 def get_dataloaders(batch_size=1024, eval_n=2000, finetune_n=4000):
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
         T.RandomHorizontalFlip(),
         T.ToTensor(),
-        T.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.2023, 0.1994, 0.2010))
+        T.Normalize(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
     ])
     transform_test = T.Compose([
         T.ToTensor(),
-        T.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.2023, 0.1994, 0.2010))
+        T.Normalize(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
     ])
 
     train_full = torchvision.datasets.CIFAR10(root=PROJECT_ROOT, train=True, download=False, transform=transform_train)
@@ -270,40 +274,69 @@ def prepare_qat(fp32_model, bits, finetune_loader, epochs=3, lr=1e-3):
     return m.eval()
 
 
-CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
-CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
+CIFAR_MEAN = torch.tensor(CIFAR_MEAN_VALUES).view(1, 3, 1, 1)
+CIFAR_STD = torch.tensor(CIFAR_STD_VALUES).view(1, 3, 1, 1)
 CLIP_MIN = ((0.0 - CIFAR_MEAN) / CIFAR_STD)
 CLIP_MAX = ((1.0 - CIFAR_MEAN) / CIFAR_STD)
 
 
-def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
-    model.eval()
-    fgsm = torchattacks.FGSM(model, eps=eps)
-    out = {}
+class PixelSpaceModel(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.register_buffer("mean", CIFAR_MEAN.clone())
+        self.register_buffer("std", CIFAR_STD.clone())
 
-    correct, total = 0, 0
+    def forward(self, x):
+        return self.model((x - self.mean.to(x.device)) / self.std.to(x.device))
+
+
+def normalize_pixels(x):
+    return (x - CIFAR_MEAN.to(x.device)) / CIFAR_STD.to(x.device)
+
+
+def denormalize_inputs(x):
+    return x * CIFAR_STD.to(x.device) + CIFAR_MEAN.to(x.device)
+
+
+def make_torchattack(attack_cls, model, *args, **kwargs):
+    attack = attack_cls(model, *args, **kwargs)
+    attack.set_normalization_used(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
+    return attack
+
+
+def accuracy_under_attack(model, loader, attack, target_model=None, max_images=None):
+    target = target_model if target_model is not None else model
+    correct, total, n_seen = 0, 0, 0
     for x, y in loader:
+        if max_images is not None:
+            if n_seen >= max_images:
+                break
+            remaining = max_images - n_seen
+            x, y = x[:remaining], y[:remaining]
         x, y = x.to(device), y.to(device)
-        x_adv = fgsm(x, y)
+        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
+        x_adv_pixel = attack(x_pixel, y)
+        x_adv = normalize_pixels(x_adv_pixel)
         with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
+            pred = target(x_adv).argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
-    out["FGSM"] = correct / total
+        n_seen += y.size(0)
+    return correct / total if total else None
+
+def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
+    model.eval()
+    fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
+    out = {}
+
+    out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
 
     pgd_accs = []
     for seed in seeds:
         torch.manual_seed(seed)
-        pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-        correct, total = 0, 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            x_adv = pgd(x, y)
-            with torch.no_grad():
-                pred = model(x_adv).argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-        pgd_accs.append(correct / total)
+        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+        pgd_accs.append(accuracy_under_attack(model, loader, pgd))
     out["PGD"] = float(np.mean(pgd_accs))
     out["PGD_mean"] = float(np.mean(pgd_accs))
     out["PGD_std"] = float(np.std(pgd_accs))
@@ -312,13 +345,14 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
 
 def run_autoattack(model, loader, eps=8 / 255):
     model.eval()
-    adversary = AutoAttack(model, norm="Linf", eps=eps, version="standard", device=device, verbose=False)
-    # adversary.attacks_to_run = ["apgd-ce", "apgd-t"]
+    pixel_model = PixelSpaceModel(model).to(device).eval()
+    adversary = AutoAttack(pixel_model, norm="Linf", eps=eps, version="standard", device=device, verbose=False)
     adversary.seed = 0
     correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        x_adv = adversary.run_standard_evaluation(x, y, bs=x.size(0))
+        x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
+        x_adv = normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
         with torch.no_grad():
             pred = model(x_adv).argmax(1)
             correct += (pred == y).sum().item()
@@ -330,70 +364,26 @@ def run_extra_whitebox_attacks(model, loader, eps=8 / 255, jsma_max_images=200):
     model.eval()
     out = {}
 
-    cw = torchattacks.CW(model, c=1, kappa=0, steps=50, lr=0.01)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = cw(x, y)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    out["CW"] = correct / total
+    cw = make_torchattack(torchattacks.CW, model, c=1, kappa=0, steps=50, lr=0.01)
+    out["CW"] = accuracy_under_attack(model, loader, cw)
 
-    deepfool = torchattacks.DeepFool(model, steps=50, overshoot=0.02)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = deepfool(x, y)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    out["DeepFool"] = correct / total
+    deepfool = make_torchattack(torchattacks.DeepFool, model, steps=50, overshoot=0.02)
+    out["DeepFool"] = accuracy_under_attack(model, loader, deepfool)
 
-    jsma = torchattacks.JSMA(model, theta=1.0, gamma=0.1)
-    correct, total, n_seen = 0, 0, 0
-    for x, y in loader:
-        if n_seen >= jsma_max_images:
-            break
-        remaining = jsma_max_images - n_seen
-        x, y = x[:remaining].to(device), y[:remaining].to(device)
-        x_adv = jsma(x, y)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-        n_seen += y.size(0)
-    out["JSMA"] = correct / total if total else None
+    jsma = make_torchattack(torchattacks.JSMA, model, theta=1.0, gamma=0.1)
+    out["JSMA"] = accuracy_under_attack(model, loader, jsma, max_images=jsma_max_images)
 
     return out
 
 
 def transfer_attack(source_model, target_model, loader, eps=8 / 255):
-    pgd = torchattacks.PGD(source_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = pgd(x, y)
-        with torch.no_grad():
-            pred = target_model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+    pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+    return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
 
 
 def transfer_attack_mim(source_model, target_model, loader, eps=8 / 255):
-    mim = torchattacks.MIFGSM(source_model, eps=eps, alpha=2 / 255, steps=20, decay=1.0)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = mim(x, y)
-        with torch.no_grad():
-            pred = target_model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+    mim = make_torchattack(torchattacks.MIFGSM, source_model, eps=eps, alpha=2 / 255, steps=20, decay=1.0)
+    return accuracy_under_attack(source_model, loader, mim, target_model=target_model)
 
 
 def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps=20,
@@ -402,7 +392,7 @@ def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     sample_x, _ = next(iter(loader))
     v = torch.zeros(1, *sample_x.shape[1:], device=device)
-    deepfool = torchattacks.DeepFool(model, steps=deepfool_steps, overshoot=overshoot)
+    deepfool = make_torchattack(torchattacks.DeepFool, model, steps=deepfool_steps, overshoot=overshoot)
 
     fooling_rate, it = 0.0, 0
     while fooling_rate < (1 - delta) and it < max_iter:
@@ -849,16 +839,8 @@ def pgd_steps_ablation(model, loader, eps=8 / 255, step_list=(0, 1, 2, 5, 10, 20
         if steps == 0:
             acc = random_noise_attack(model, loader, eps=eps, seed=0)
         else:
-            pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
-            correct, total = 0, 0
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
-                x_adv = pgd(x, y)
-                with torch.no_grad():
-                    pred = model(x_adv).argmax(dim=1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-            acc = correct / total
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
+            acc = accuracy_under_attack(model, loader, pgd)
         out[steps] = acc
     return out
 
@@ -966,16 +948,8 @@ def run_quant_component_ablation(model, loader, name, eps=8 / 255):
         clean_acc = sanity_check_accuracy(model, loader)
 
         torch.manual_seed(0)
-        pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-        correct, total = 0, 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            x_adv = pgd(x, y)
-            with torch.no_grad():
-                pred = model(x_adv).argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-        pgd_acc = correct / total
+        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+        pgd_acc = accuracy_under_attack(model, loader, pgd)
 
         x, y = next(iter(loader))
         x, y = x.to(device), y.to(device)
@@ -1125,16 +1099,8 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
         try:
-            pgd = torchattacks.PGD(model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
-            correct, total = 0, 0
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
-                x_adv = pgd(x, y)
-                with torch.no_grad():
-                    pred = model(x_adv).argmax(dim=1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-            row["PGD_acc"] = correct / total
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=20, random_start=True)
+            row["PGD_acc"] = accuracy_under_attack(model, loader, pgd)
         except Exception as e:
             print(f"  [WARN] PGD sweep failed for {name} eps={eps:.4f}: {e}")
             row["PGD_acc"] = None
