@@ -60,6 +60,20 @@ def component_ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
 
 
+def margin_json_path(model_name):
+    return os.path.join(DATA_DIR, f"margin_{model_name}.json")
+
+
+SWEEP_PLOT_PNG = os.path.join(DATA_DIR, "sweepplot.png")
+ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "ablationplot.png")
+TRAJECTORY_PLOT_PNG = os.path.join(DATA_DIR, "trajectoryplot.png")
+LAYERWISE_PLOT_PNG = os.path.join(DATA_DIR, "layerwiseplot.png")
+COMPONENT_ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "componentablationplot.png")
+MASKING_SUMMARY_PLOT_PNG = os.path.join(DATA_DIR, "maskingsummaryplot.png")
+MARGIN_PLOT_PNG = os.path.join(DATA_DIR, "marginplot.png")
+HEATMAP_PLOT_PNG = os.path.join(DATA_DIR, "heatmapplot.png")
+
+
 missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
 if missing:
     raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
@@ -970,6 +984,28 @@ def run_quant_component_ablation(model, loader, name, eps=8 / 255):
     return rows
 
 
+def confidence_margin_diagnostic(model, loader, eps=8 / 255, steps=20, max_batches=3):
+    model.eval()
+    pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=2 / 255, steps=steps, random_start=True)
+    clean_margins, adv_margins = [], []
+    for bi, (x, y) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x, y = x.to(device), y.to(device)
+
+        with torch.no_grad():
+            top2 = F.softmax(model(x), dim=1).topk(2, dim=1).values
+        clean_margins.extend((top2[:, 0] - top2[:, 1]).cpu().tolist())
+
+        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
+        x_adv = normalize_pixels(pgd(x_pixel, y))
+        with torch.no_grad():
+            top2_adv = F.softmax(model(x_adv), dim=1).topk(2, dim=1).values
+        adv_margins.extend((top2_adv[:, 0] - top2_adv[:, 1]).cpu().tolist())
+
+    return {"clean_margins": clean_margins, "adv_margins": adv_margins}
+
+
 def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
     model.eval()
     results = {"model": name}
@@ -1090,6 +1126,13 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
         except Exception as e:
             print(f"  [WARN] run_quant_component_ablation failed for {name}: {e}")
 
+        try:
+            margins = confidence_margin_diagnostic(model, loader, eps=eps, max_batches=3)
+            with open(margin_json_path(name), "w") as f:
+                json.dump(margins, f)
+        except Exception as e:
+            print(f"  [WARN] confidence_margin_diagnostic failed for {name}: {e}")
+
     return results
 
 
@@ -1119,6 +1162,206 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
                 row["BPDA_acc"] = None
         rows.append(row)
     return rows
+
+
+def plot_epsilon_sweep_curves(df_sweep):
+    if df_sweep is None or df_sweep.empty:
+        return
+    value_cols = [c for c in ["PGD_acc", "Random_Noise_acc", "BPDA_acc"] if c in df_sweep.columns]
+    if not value_cols:
+        return
+    df_long = df_sweep.melt(id_vars=["model", "epsilon"], value_vars=value_cols, var_name="Attack", value_name="Accuracy")
+    df_long = df_long.dropna(subset=["Accuracy"])
+    if df_long.empty:
+        return
+
+    models = df_long["model"].unique()
+    cols = min(3, len(models))
+    rows = int(np.ceil(len(models) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows), squeeze=False)
+    for i, m in enumerate(models):
+        ax = axes[i // cols][i % cols]
+        sns.lineplot(data=df_long[df_long["model"] == m], x="epsilon", y="Accuracy", hue="Attack", marker="o", ax=ax)
+        ax.set_title(m)
+        ax.set_ylim(0, 1.0)
+        ax.grid(linestyle="--", alpha=0.6)
+    for j in range(len(models), rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle("Accuracy vs Perturbation Budget (Epsilon Sweep)")
+    fig.tight_layout()
+    fig.savefig(SWEEP_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def plot_pgd_steps_ablation(model_names):
+    frames = [pd.read_csv(ablation_csv_path(n)) for n in model_names if os.path.exists(ablation_csv_path(n))]
+    if not frames:
+        return
+    df_all = pd.concat(frames, ignore_index=True)
+
+    plt.figure(figsize=(10, 6))
+    sns.lineplot(data=df_all, x="steps", y="acc", hue="model", marker="o")
+    plt.title("PGD Accuracy vs Number of Steps (Gradient Masking Check)")
+    plt.xlabel("PGD steps")
+    plt.ylabel("Accuracy")
+    plt.ylim(0, 1.0)
+    plt.grid(linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(ABLATION_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def plot_pgd_trajectory(model_names):
+    trajs = {}
+    for name in model_names:
+        p = trajectory_json_path(name)
+        if os.path.exists(p):
+            with open(p) as f:
+                trajs[name] = json.load(f)
+    if not trajs:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for name, traj in trajs.items():
+        steps = range(1, len(traj["grad_norm_per_step"]) + 1)
+        axes[0].plot(steps, traj["grad_norm_per_step"], marker="o", label=name)
+        axes[1].plot(steps, traj["movement_from_random_start_per_step"], marker="o", label=name)
+
+    axes[0].set_title("Gradient Norm per PGD Step")
+    axes[0].set_xlabel("Step")
+    axes[0].set_ylabel("Grad Norm")
+    axes[0].set_yscale("log")
+    axes[0].grid(linestyle="--", alpha=0.6)
+    axes[0].legend(fontsize=8)
+
+    axes[1].set_title("Perturbation Movement per PGD Step")
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Linf Movement from Random Start")
+    axes[1].grid(linestyle="--", alpha=0.6)
+    axes[1].legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(TRAJECTORY_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def plot_layerwise_grad_profile(model_names):
+    quant_names = [n for n in model_names if os.path.exists(layerwise_csv_path(n))]
+    if not quant_names:
+        return
+
+    cols = min(2, len(quant_names))
+    rows = int(np.ceil(len(quant_names) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(9 * cols, 4.5 * rows), squeeze=False)
+    for i, name in enumerate(quant_names):
+        df = pd.read_csv(layerwise_csv_path(name))
+        ax = axes[i // cols][i % cols]
+        x = np.arange(len(df))
+        ax.plot(x, df["grad_norm_hard"], marker="o", label="hard-round")
+        ax.plot(x, df["grad_norm_ste"], marker="o", label="STE")
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels(df["layer"], rotation=90, fontsize=6)
+        ax.set_title(name)
+        ax.set_ylabel("Grad Norm (log)")
+        ax.legend(fontsize=8)
+        ax.grid(linestyle="--", alpha=0.6)
+    for j in range(len(quant_names), rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle("Layerwise Gradient Norms: Hard-Round vs STE")
+    fig.tight_layout()
+    fig.savefig(LAYERWISE_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def plot_component_ablation(model_names):
+    frames = [pd.read_csv(component_ablation_csv_path(n)) for n in model_names if os.path.exists(component_ablation_csv_path(n))]
+    if not frames:
+        return
+    df_all = pd.concat(frames, ignore_index=True)
+    df_long = df_all.melt(id_vars=["model", "config"], value_vars=["clean_acc", "PGD_acc"], var_name="Metric", value_name="Accuracy")
+
+    g = sns.catplot(data=df_long, x="config", y="Accuracy", hue="Metric", col="model", kind="bar", col_wrap=3, height=4, sharey=True)
+    g.set_titles("{col_name}")
+    g.set(ylim=(0, 1.0))
+    g.savefig(COMPONENT_ABLATION_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def plot_gradient_masking_summary(df_results):
+    if df_results is None or df_results.empty or not {"model", "PGD", "AutoAttack"}.issubset(df_results.columns):
+        return
+    df = df_results.dropna(subset=["PGD", "AutoAttack"]).copy()
+    if df.empty:
+        return
+    df["PGD_minus_AutoAttack"] = df["PGD"] - df["AutoAttack"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sns.barplot(data=df, x="model", y="PGD_minus_AutoAttack", ax=axes[0])
+    axes[0].axhline(0, color="black", linewidth=0.8)
+    axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=45, ha="right")
+    axes[0].set_title("PGD - AutoAttack Accuracy Gap")
+    axes[0].grid(axis="y", linestyle="--", alpha=0.6)
+
+    if "frac_zero_grad_hard" in df.columns:
+        df2 = df.dropna(subset=["frac_zero_grad_hard"])
+        sns.scatterplot(data=df2, x="frac_zero_grad_hard", y="PGD_minus_AutoAttack", hue="model", s=80, ax=axes[1])
+        axes[1].set_title("Masking Gap vs Fraction of Zero Gradients")
+        axes[1].grid(linestyle="--", alpha=0.6)
+    else:
+        axes[1].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(MASKING_SUMMARY_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def plot_confidence_margin_diagnostic(model_names):
+    data = {}
+    for name in model_names:
+        p = margin_json_path(name)
+        if os.path.exists(p):
+            with open(p) as f:
+                data[name] = json.load(f)
+    if not data:
+        return
+
+    cols = min(3, len(data))
+    rows = int(np.ceil(len(data) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), squeeze=False)
+    for i, (name, margins) in enumerate(data.items()):
+        ax = axes[i // cols][i % cols]
+        ax.hist(margins["clean_margins"], bins=30, alpha=0.6, label="clean", density=True)
+        ax.hist(margins["adv_margins"], bins=30, alpha=0.6, label="PGD-adv", density=True)
+        ax.set_title(name)
+        ax.set_xlabel("Top1 - Top2 Softmax Margin")
+        ax.legend(fontsize=8)
+        ax.grid(linestyle="--", alpha=0.6)
+    for j in range(len(data), rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle("Confidence Margin: Clean vs PGD-Adversarial")
+    fig.tight_layout()
+    fig.savefig(MARGIN_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def plot_results_heatmap(df_results):
+    if df_results is None or df_results.empty:
+        return
+    candidate_cols = ["clean_acc", "FGSM", "PGD", "AutoAttack", "CW", "DeepFool", "JSMA",
+                      "Surrogate_Transfer", "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
+                      "Random_Noise", "BPDA_PGD", "NES", "Boundary_acc"]
+    cols = [c for c in candidate_cols if c in df_results.columns and df_results[c].notna().any()]
+    if not cols:
+        return
+    df_heat = df_results.set_index("model")[cols].astype(float)
+
+    plt.figure(figsize=(max(10, len(cols)), max(6, len(df_heat) * 0.5)))
+    sns.heatmap(df_heat, annot=True, fmt=".2f", cmap="RdYlGn", vmin=0, vmax=1, linewidths=0.5)
+    plt.title("Full Results Heatmap: Models vs Attacks")
+    plt.tight_layout()
+    plt.savefig(HEATMAP_PLOT_PNG, dpi=300, bbox_inches="tight")
+    plt.show()
 
 
 def parallelize(model):
@@ -1243,6 +1486,49 @@ def main():
             traceback.print_exc()
 
     print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
+
+    model_names = list(model_registry.keys())
+
+    try:
+        plot_epsilon_sweep_curves(df_sweep)
+    except Exception as e:
+        print(f"  [WARN] plot_epsilon_sweep_curves failed: {e}")
+
+    try:
+        plot_pgd_steps_ablation(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_pgd_steps_ablation failed: {e}")
+
+    try:
+        plot_pgd_trajectory(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_pgd_trajectory failed: {e}")
+
+    try:
+        plot_layerwise_grad_profile(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_layerwise_grad_profile failed: {e}")
+
+    try:
+        plot_component_ablation(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_component_ablation failed: {e}")
+
+    try:
+        plot_gradient_masking_summary(df_results)
+    except Exception as e:
+        print(f"  [WARN] plot_gradient_masking_summary failed: {e}")
+
+    try:
+        plot_confidence_margin_diagnostic(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_confidence_margin_diagnostic failed: {e}")
+
+    try:
+        plot_results_heatmap(df_results)
+    except Exception as e:
+        print(f"  [WARN] plot_results_heatmap failed: {e}")
+
     print("All done.")
 
 
