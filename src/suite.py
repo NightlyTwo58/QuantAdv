@@ -158,7 +158,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             qat_instance = _get_qat_instance_for_model(model)
             if qat_instance is not None:
                 return run_quant_component_ablation(qat_instance, loader, name, eps=eps)
-            return None
+            return run_quant_component_ablation(model, loader, name, eps=eps)
 
         component_rows, _ = safe_run(_component_ablation, name, "run_quant_component_ablation")
         if component_rows is not None:
