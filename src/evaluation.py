@@ -29,6 +29,7 @@ from .attacks import (
     accuracy_under_torchattack,
     nes_attack,
 )
+from .quantization import count_quant_layers as count_custom_quant_layers
 
 
 def sanity_check_accuracy(model, loader):
@@ -37,8 +38,7 @@ def sanity_check_accuracy(model, loader):
 
 
 def count_quant_layers(model):
-    """Count quantized layers using the QuantModel helper."""
-    return QuantModel._count_quant_layers(model)
+    return QuantModel._count_quant_layers(model) + count_custom_quant_layers(model)
 
 
 def safe_run(fn, name, label):

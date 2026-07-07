@@ -27,6 +27,7 @@ from .compute import parallelize, maybe_compile
 from .evaluation import sanity_check_accuracy, run_epsilon_sweep_for_model
 from .suite import run_suite, _model_to_qat_instance
 from .paths import results_csv_path, sweep_csv_path
+from .quantization import convert_to_quant, convert_to_chaotic_quant, prepare_qat as prepare_custom_qat
 
 PLOT_PNG = config.PLOT_PNG
 
@@ -165,6 +166,30 @@ def main():
 
         variants[f"{arch_key}_int8_PTQ"] = (qat_model.int8_PTQ, fp32)
 
+        try:
+            variants[f"{arch_key}_int4_PTQ"] = (
+                convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True),
+                fp32,
+            )
+        except Exception as e:
+            print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
+
+        try:
+            variants[f"{arch_key}_chaotic_int8_PTQ"] = (
+                convert_to_chaotic_quant(fp32, bits=8, quant_weight=True, quant_act=True),
+                fp32,
+            )
+        except Exception as e:
+            print(f"  [FAIL] chaotic int8 PTQ for {arch_key}: {e}")
+
+        try:
+            variants[f"{arch_key}_chaotic_int4_PTQ"] = (
+                convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True),
+                fp32,
+            )
+        except Exception as e:
+            print(f"  [FAIL] chaotic int4 PTQ for {arch_key}: {e}")
+
         # QAT int8
         qat_int8 = None
         try:
@@ -172,6 +197,13 @@ def main():
             variants[f"{arch_key}_int8_QAT"] = (qat_int8, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
+            traceback.print_exc()
+
+        try:
+            chaotic_qat_int8 = prepare_custom_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=3, chaotic=True)
+            variants[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_qat_int8, fp32)
+        except Exception as e:
+            print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
 
         suffixes = ["int8_PTQ", "int8_QAT"]
@@ -282,10 +314,41 @@ def main():
         }
 
         try:
+            sweep_variants[f"{arch_key}_int4_PTQ"] = (
+                convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True),
+                fp32,
+            )
+        except Exception as e:
+            print(f"  [FAIL] int4 PTQ for sweep {arch_key}: {e}")
+
+        try:
+            sweep_variants[f"{arch_key}_chaotic_int8_PTQ"] = (
+                convert_to_chaotic_quant(fp32, bits=8, quant_weight=True, quant_act=True),
+                fp32,
+            )
+        except Exception as e:
+            print(f"  [FAIL] chaotic int8 PTQ for sweep {arch_key}: {e}")
+
+        try:
+            sweep_variants[f"{arch_key}_chaotic_int4_PTQ"] = (
+                convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True),
+                fp32,
+            )
+        except Exception as e:
+            print(f"  [FAIL] chaotic int4 PTQ for sweep {arch_key}: {e}")
+
+        try:
             qat_int8 = qat_model.train_qat(finetune_loader, epochs=5, bits=8)
             sweep_variants[f"{arch_key}_int8_QAT"] = (qat_int8, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for sweep {arch_key}: {e}")
+            traceback.print_exc()
+
+        try:
+            chaotic_qat_int8 = prepare_custom_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=5, chaotic=True)
+            sweep_variants[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_qat_int8, fp32)
+        except Exception as e:
+            print(f"  [FAIL] chaotic int8 QAT for sweep {arch_key}: {e}")
             traceback.print_exc()
 
         for name, (variant_model, _) in sweep_variants.items():

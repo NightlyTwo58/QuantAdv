@@ -12,6 +12,11 @@ from torchao.quantization.qat.linear import FakeQuantizedLinear
 from .config import device, CLIP_MIN_DEV, CLIP_MAX_DEV
 from .attacks import amp_ctx, pgd_step, pgd_attack, evaluate_under_attack, random_noise_attack
 from .evaluation import sanity_check_accuracy
+from .quantization import (
+    CUSTOM_QUANT_MODULES,
+    count_quant_layers as count_custom_quant_layers,
+    set_quant_components,
+)
 
 
 def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max_batches=5):
@@ -20,6 +25,7 @@ def gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=None, max
     """
     quant_layers = [(n, m) for n, m in model.named_modules()
                     if isinstance(m, FakeQuantizedLinear)
+                    or isinstance(m, CUSTOM_QUANT_MODULES)
                     or (hasattr(m, '_quantized_op') and m._quantized_op is not None)
                     or hasattr(m, 'quantizer')
                     or (getattr(m, 'weight', None) is not None
@@ -146,27 +152,10 @@ def staircase_diagnostic(model, loader, radius=1 / 255, n_points=40):
     return {"plateau_fraction": plateau_hits / n_points}
 
 
-# weight-only vs activation-only vs both quantization ablation.
-# For torchao models: PTQ with weight-only config vs dynamic-activation config.
 def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
-    """
-    Run component ablation for a torchao-based model.
+    if count_custom_quant_layers(model_qat_instance) > 0:
+        return _run_custom_quant_component_ablation(model_qat_instance, loader, name, eps)
 
-    Uses the QuantModel to get the PTQ variants that exist in the newer
-    torchao implementation:
-    - weight_only: int8 weight-only PTQ
-    - both: dynamic-activation + int8-weight PTQ
-
-    Torchao does not expose an activation-only PTQ variant for these modules,
-    so that row is emitted as unsupported instead of duplicating the `both`
-    model and reporting misleading numbers.
-
-    Args:
-        model_qat_instance: The QuantModel instance (holds all variants).
-        loader: DataLoader for evaluation.
-        name: Model display name.
-        eps: PGD epsilon.
-    """
     configs = [
         ("weight_only", getattr(model_qat_instance, "int8_PTQ_weight_only", None)),
         ("act_only", None),
@@ -210,4 +199,48 @@ def run_quant_component_ablation(model_qat_instance, loader, name, eps=8 / 255):
             "frac_zero_grad_hard": frac_zero,
             "supported": True,
         })
+    return rows
+
+
+def _run_custom_quant_component_ablation(model, loader, name, eps):
+    original = [
+        (mod, getattr(mod, "quant_weight", True), getattr(mod, "quant_act", True))
+        for mod in model.modules()
+        if isinstance(mod, CUSTOM_QUANT_MODULES)
+    ]
+    rows = []
+    try:
+        for label, quant_weight, quant_act in (
+            ("weight_only", True, False),
+            ("act_only", False, True),
+            ("both", True, True),
+        ):
+            set_quant_components(model, quant_weight, quant_act)
+            clean_acc = sanity_check_accuracy(model, loader)
+            torch.manual_seed(0)
+            pgd_acc = evaluate_under_attack(
+                model,
+                loader,
+                lambda x, y: pgd_attack(model, x, y, eps, alpha=2 / 255, steps=20, random_start=True),
+            )
+            x, y = next(iter(loader))
+            x, y = x.to(device), y.to(device)
+            x_in = x.clone().requires_grad_(True)
+            with amp_ctx():
+                loss = F.cross_entropy(model(x_in), y)
+            grad = torch.autograd.grad(loss, x_in, allow_unused=True)[0]
+            if grad is None:
+                grad = torch.zeros_like(x_in)
+            rows.append({
+                "model": name,
+                "config": label,
+                "clean_acc": clean_acc,
+                "PGD_acc": pgd_acc,
+                "frac_zero_grad_hard": (grad.flatten().abs() < 1e-8).float().mean().item(),
+                "supported": True,
+            })
+    finally:
+        for mod, quant_weight, quant_act in original:
+            mod.quant_weight = quant_weight
+            mod.quant_act = quant_act
     return rows
