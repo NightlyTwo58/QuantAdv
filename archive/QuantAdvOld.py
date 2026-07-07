@@ -315,14 +315,15 @@ def accuracy_under_attack(model, loader, attack, target_model=None, max_images=N
             remaining = max_images - n_seen
             x, y = x[:remaining], y[:remaining]
         x, y = x.to(device), y.to(device)
-        x_adv = attack(x, y)
+        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
+        x_adv_pixel = attack(x_pixel, y)
+        x_adv = normalize_pixels(x_adv_pixel)
         with torch.no_grad():
             pred = target(x_adv).argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
         n_seen += y.size(0)
     return correct / total if total else None
-
 
 def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
     model.eval()
