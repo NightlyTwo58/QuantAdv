@@ -8,15 +8,23 @@ import json
 
 import pandas as pd
 
-from .attacks import transfer_attack
+from .attacks import (
+    transfer_attack,
+    transfer_attack_mim,
+    transfer_uap_attack,
+    run_surrogate_attack,
+    run_boundary_attack,
+)
 from .evaluation import (
     safe_run,
     sanity_check_accuracy,
     count_quant_layers,
     run_fgsm_pgd,
     run_autoattack,
+    run_extra_whitebox_attacks,
     run_random_noise_seeded,
     run_bpda,
+    run_nes_attack,
 )
 from .diagnostics import (
     gradient_diagnostics_and_layerwise_profile,
@@ -75,9 +83,21 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
 
     results["AutoAttack"], _ = safe_run(lambda: run_autoattack(model, loader, eps=eps), name, "AutoAttack")
 
+    extra_whitebox, _ = safe_run(
+        lambda: run_extra_whitebox_attacks(model, loader, eps=eps), name, "CW/DeepFool/JSMA")
+    if extra_whitebox is not None:
+        results.update(extra_whitebox)
+
+    results["Surrogate_Transfer"], _ = safe_run(
+        lambda: run_surrogate_attack(model, loader, eps=eps), name, "surrogate_attack")
+
     if fp32_ref is not None:
         results["Transfer_from_FP32"], _ = safe_run(
             lambda: transfer_attack(fp32_ref, model, loader, eps=eps), name, "transfer_attack")
+        results["MIM_Transfer"], _ = safe_run(
+            lambda: transfer_attack_mim(fp32_ref, model, loader, eps=eps), name, "transfer_attack_mim")
+        results["UAP_Transfer"], _ = safe_run(
+            lambda: transfer_uap_attack(fp32_ref, model, loader, eps=eps), name, "transfer_uap_attack")
 
     random_noise, _ = safe_run(lambda: run_random_noise_seeded(model, loader, eps=eps), name, "random_noise_attack")
     if random_noise is not None:
@@ -92,6 +112,21 @@ def run_suite(model, loader, name, fp32_ref=None, eps=8 / 255):
             results.update(bpda)
         else:
             results["BPDA_PGD"] = None
+
+        nes, _ = safe_run(lambda: run_nes_attack(model, loader, eps=eps), name, "NES")
+        if nes is not None:
+            results.update(nes)
+        else:
+            results["NES"] = None
+
+        boundary, _ = safe_run(
+            lambda: run_boundary_attack(model, loader, eps=eps, max_images=30, steps=200, seed=0),
+            name, "boundary_attack")
+        if boundary is not None:
+            results.update(boundary)
+        else:
+            results["Boundary_acc"] = None
+            results["Boundary_mean_Linf"] = None
 
         diag_result, _ = safe_run(
             lambda: gradient_diagnostics_and_layerwise_profile(model, loader, fp32_ref=fp32_ref, max_batches=5),

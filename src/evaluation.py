@@ -10,6 +10,7 @@ import traceback
 import numpy as np
 import pandas as pd
 import torch
+import torchattacks
 
 from autoattack import AutoAttack
 
@@ -24,6 +25,9 @@ from .attacks import (
     bpda_pgd_attack,
     random_noise_attack,
     evaluate_under_attack,
+    make_torchattack,
+    accuracy_under_torchattack,
+    nes_attack,
 )
 
 
@@ -63,6 +67,36 @@ def run_fgsm_pgd(model, loader, eps=8 / 255, seeds=SEEDS):
 
     out.update(seeded_average(run_seed, seeds, "PGD"))
     return out
+
+
+def run_extra_whitebox_attacks(model, loader, eps=8 / 255, jsma_max_images=200):
+    """C&W, DeepFool, and JSMA, in addition to the FGSM/PGD already covered
+    by run_fgsm_pgd. JSMA is capped at `jsma_max_images` since it is far
+    more query/compute-heavy per example than the L_inf attacks above."""
+    model.eval()
+    out = {}
+
+    cw = make_torchattack(torchattacks.CW, model, c=1, kappa=0, steps=50, lr=0.01)
+    out["CW"] = accuracy_under_torchattack(model, loader, cw)
+
+    deepfool = make_torchattack(torchattacks.DeepFool, model, steps=50, overshoot=0.02)
+    out["DeepFool"] = accuracy_under_torchattack(model, loader, deepfool)
+
+    jsma = make_torchattack(torchattacks.JSMA, model, theta=1.0, gamma=0.1)
+    out["JSMA"] = accuracy_under_torchattack(model, loader, jsma, max_images=jsma_max_images)
+
+    return out
+
+
+def run_nes_attack(model, loader, eps=8 / 255, seeds=SEEDS, **kwargs):
+    """Seed-averaged wrapper around the black-box NES attack, mirroring
+    run_random_noise_seeded's seeded_average pattern."""
+    accs = [nes_attack(model, loader, eps=eps, seed=s, **kwargs) for s in seeds]
+    return {
+        "NES": float(np.mean(accs)),
+        "NES_mean": float(np.mean(accs)),
+        "NES_std": float(np.std(accs)),
+    }
 
 
 def run_autoattack(model, loader, eps=8 / 255, aa_batch_size=256):
