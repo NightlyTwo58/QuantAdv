@@ -40,18 +40,17 @@ Modernized archival non-threaded analysis of metrics of attacks per model and ep
 def ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"ablation_{model_name}.csv")
 
-
 def layerwise_csv_path(model_name):
     return os.path.join(DATA_DIR, f"layerwise_{model_name}.csv")
-
 
 def trajectory_json_path(model_name):
     return os.path.join(DATA_DIR, f"trajectory_{model_name}.json")
 
-
-# weight-only vs activation-only vs both quantization ablation
 def component_ablation_csv_path(model_name):
     return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
+
+def chunk_quant_csv_path(model_name):
+    return os.path.join(DATA_DIR, f"chunk_quant_{model_name}.csv")
 
 def defense_summary_csv_path():
     return os.path.join(DATA_DIR, "defense_summary.csv")
@@ -270,6 +269,38 @@ def convert_to_chaotic_quant(model, bits, quant_weight=True, quant_act=True):
     m = copy.deepcopy(model)
     _replace_recursive(m, bits, quant_weight, quant_act, chaotic=True)
     return m
+
+
+def quantizable_layer_names(model):
+    quant_types = (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
+    return [n for n, m in model.named_modules() if isinstance(m, (nn.Conv2d, nn.Linear)) and not isinstance(m, quant_types)]
+
+
+def set_child_module(root, module_name, new_module):
+    parts = module_name.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = parent._modules[part]
+    parent._modules[parts[-1]] = new_module
+
+
+def convert_layer_chunk_to_quant(model, layer_names, bits, quant_weight=True, quant_act=True, chaotic=False):
+    m = copy.deepcopy(model)
+    targets = set(layer_names)
+    for name, mod in list(m.named_modules()):
+        if name not in targets:
+            continue
+        new_mod = _to_quant_module(mod, bits, quant_weight, quant_act, chaotic=chaotic)
+        if new_mod is not None:
+            set_child_module(m, name, new_mod)
+    return m.to(device).eval()
+
+
+def quant_layer_chunks(layer_names, n_chunks):
+    if not layer_names:
+        return []
+    n_chunks = max(1, min(n_chunks, len(layer_names)))
+    return [list(chunk) for chunk in np.array_split(np.array(layer_names, dtype=object), n_chunks) if len(chunk) > 0]
 
 
 def set_ste_mode(model, flag):
@@ -1048,6 +1079,41 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     return rows
 
 
+def run_chunk_quantization_attacks(fp32_model, loader, name, bits=QAT_BITS, n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS):
+    layer_names = quantizable_layer_names(fp32_model)
+    chunks = quant_layer_chunks(layer_names, n_chunks)
+    rows = []
+    for i, chunk in enumerate(chunks, start=1):
+        chunk_model = convert_layer_chunk_to_quant(fp32_model, chunk, bits=bits, quant_weight=True, quant_act=True)
+        row = {
+            "model": name,
+            "bits": bits,
+            "chunk_id": i,
+            "chunk_count": len(chunks),
+            "chunk_label": f"{i}/{len(chunks)}",
+            "chunk_size": len(chunk),
+            "first_layer": chunk[0],
+            "last_layer": chunk[-1],
+            "layers": json.dumps(chunk),
+        }
+        try:
+            row["clean_acc"] = sanity_check_accuracy(chunk_model, loader)
+        except Exception as e:
+            print(f"  [WARN] chunk clean_acc failed for {name} {row['chunk_label']}: {e}")
+            row["clean_acc"] = None
+        try:
+            pgd = make_torchattack(torchattacks.PGD, chunk_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+            row["PGD_acc"] = accuracy_under_attack(chunk_model, loader, pgd)
+        except Exception as e:
+            print(f"  [WARN] chunk PGD failed for {name} {row['chunk_label']}: {e}")
+            row["PGD_acc"] = None
+        rows.append(row)
+        del chunk_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return rows
+
+
 def confidence_margin_diagnostic(model, loader, eps=DEFAULT_EPS, steps=MARGIN_STEPS, max_batches=MARGIN_MAX_BATCHES):
     model.eval()
     pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=steps, random_start=PGD_RANDOM_START)
@@ -1479,6 +1545,26 @@ def plot_component_ablation(model_names):
     plt.show()
 
 
+def plot_chunk_quantization_attacks(model_names):
+    frames = [pd.read_csv(chunk_quant_csv_path(n)) for n in model_names if os.path.exists(chunk_quant_csv_path(n))]
+    if not frames:
+        return
+    df_all = pd.concat(frames, ignore_index=True)
+    df_long = df_all.melt(id_vars=["model", "chunk_label", "first_layer", "last_layer"], value_vars=["clean_acc", "PGD_acc"], var_name="Metric", value_name="Accuracy")
+    df_long = df_long.dropna(subset=["Accuracy"])
+    if df_long.empty:
+        return
+
+    g = sns.catplot(data=df_long, x="chunk_label", y="Accuracy", hue="Metric", col="model", kind="bar", col_wrap=CHUNK_QUANT_COL_WRAP, height=CHUNK_QUANT_HEIGHT, sharey=True)
+    g.set_titles("{col_name}")
+    g.set_axis_labels("Quantized layer chunk", "Accuracy")
+    g.set(ylim=(0, PLOT_MAX_ACCURACY))
+    for ax in g.axes.flatten():
+        ax.grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
+    g.savefig(CHUNK_QUANT_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
+    plt.show()
+
+
 def plot_gradient_masking_summary(df_results):
     if df_results is None or df_results.empty or not {"model", "PGD", "AutoAttack"}.issubset(df_results.columns):
         return
@@ -1637,6 +1723,25 @@ def main():
         print(f"  [FAIL] run_defense_suite failed: {e}")
         traceback.print_exc()
 
+    chunk_model_names = []
+    for arch_key in PRETRAINED_NAMES:
+        entry = model_registry.get(f"{arch_key}_FP32")
+        if entry is None:
+            continue
+        chunk_model_names.append(arch_key)
+        out_path = chunk_quant_csv_path(arch_key)
+        if os.path.exists(out_path):
+            print(f"Skipping chunk quantization for {arch_key} (already in {out_path})")
+            continue
+        print(f"\nChunk quantization sweep for {arch_key} ...")
+        try:
+            rows = run_chunk_quantization_attacks(entry[0], eval_loader, arch_key, bits=QAT_BITS, n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS)
+            pd.DataFrame(rows).to_csv(out_path, index=False)
+            print(f"Chunk quantization results saved to {out_path}")
+        except Exception as e:
+            print(f"  [FAIL] chunk quantization sweep failed for {arch_key}: {e}")
+            traceback.print_exc()
+
     print("\nRegistry built:", list(model_registry.keys()))
 
     for k in model_registry:
@@ -1673,6 +1778,54 @@ def main():
 
     print("\nFinal results:")
     print(df_results)
+
+    adaptive_cols = [
+        c for c in [
+            "BPDA_PGD",
+            "NES",
+            "Boundary_acc",
+            "AutoAttack",
+        ]
+        if c in df_results.columns
+    ]
+
+    if adaptive_cols:
+        df_results["Worst_Robust_Acc"] = df_results[adaptive_cols].min(axis=1, skipna=True)
+
+    if {"PGD", "Worst_Robust_Acc"}.issubset(df_results.columns):
+        df_results["Gradient_Masking_Gap"] = (
+            df_results["PGD"] - df_results["Worst_Robust_Acc"]
+        )
+
+    fp32_baseline = (
+        df_results[df_results["model"].str.endswith("_FP32")]
+        .assign(
+            Architecture=lambda d: d["model"].str.replace(
+                "_FP32", "", regex=False
+            )
+        )
+        .set_index("Architecture")["Worst_Robust_Acc"]
+    )
+
+    df_results["Architecture"] = (
+        df_results["model"]
+        .str.replace(r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT).*", "", regex=True)
+    )
+
+    df_results["FP32_Worst_Robust_Acc"] = (
+        df_results["Architecture"].map(fp32_baseline)
+    )
+
+    if {
+        "Worst_Robust_Acc",
+        "FP32_Worst_Robust_Acc",
+    }.issubset(df_results.columns):
+        df_results["True_Robustness_Gain"] = (
+            df_results["Worst_Robust_Acc"]
+            - df_results["FP32_Worst_Robust_Acc"]
+        )
+
+    df_results.to_csv(RESULTS_CSV, index=False)
 
     acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
                              "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
@@ -1744,6 +1897,11 @@ def main():
         plot_component_ablation(model_names)
     except Exception as e:
         print(f"  [WARN] plot_component_ablation failed: {e}")
+
+    try:
+        plot_chunk_quantization_attacks(chunk_model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_chunk_quantization_attacks failed: {e}")
 
     try:
         plot_gradient_masking_summary(df_results)
