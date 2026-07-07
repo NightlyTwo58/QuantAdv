@@ -45,3 +45,28 @@ CLIP_MIN = (0.0 - CIFAR_MEAN) / CIFAR_STD
 CLIP_MAX = (1.0 - CIFAR_MEAN) / CIFAR_STD
 CLIP_MIN_DEV = CLIP_MIN.to(device)
 CLIP_MAX_DEV = CLIP_MAX.to(device)
+
+# Chaotic quantization constants (ported from archive/config.py)
+CHAOTIC_QUANT_MAP = "logistic"
+CHAOTIC_QUANT_SEED = 0.731
+CHAOTIC_QUANT_R = 3.99
+CHAOTIC_QUANT_MU = 1.999
+CHAOTIC_QUANT_DITHER = 0.5
+CHAOTIC_QUANT_WARMUP = 17
+
+# QAT / PTQ / PGD constants (ported from archive/config.py)
+DEFAULT_EPS = 8 / 255
+PGD_ALPHA = 2 / 255
+PGD_STEPS = 20
+PGD_RANDOM_START = True
+
+QAT_BITS = 8
+QAT_EPOCHS_DEFAULT = 3
+QAT_MAIN_EPOCHS = 5
+QAT_LR = 1e-3
+QAT_MOMENTUM = 0.9
+QAT_WEIGHT_DECAY = 5e-4
+
+PTQ_BITS = (8, 4)
+
+PGD_ABLATION_STEPS = (0, 1, 2, 5, 10, 20, 50)
