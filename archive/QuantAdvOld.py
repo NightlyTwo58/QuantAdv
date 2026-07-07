@@ -1217,7 +1217,7 @@ def main():
         plt.savefig(PLOT_PNG, dpi=300, bbox_inches="tight")
         plt.show()
 
-    SWEEP_EPSILONS = [1 / 255, 2 / 255, 4 / 255, 8 / 255, 16 / 255]
+    SWEEP_EPSILONS = [1/255, 2/255, 3/255, 4/255, 6/255, 8/255, 12/255, 16/255]
 
     if os.path.exists(SWEEP_CSV):
         df_sweep = pd.read_csv(SWEEP_CSV)
