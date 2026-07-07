@@ -1014,12 +1014,6 @@ def staircase_diagnostic(model, loader, radius=STAIRCASE_RADIUS, n_points=STAIRC
     return {"plateau_fraction": plateau_hits / n_points}
 
 
-# weight-only vs activation-only vs both quantization ablation.
-# Cheap by design -- reuses the already-built quantized model, just flips
-# quant_weight/quant_act flags in place, and only computes clean_acc + a
-# single-seed 20-step PGD + frac_zero_grad_hard per config (not the full
-# AutoAttack/BPDA/trajectory suite). Restores the model to (True, True)
-# (its original state) before returning.
 def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     configs = [
         ("weight_only", True, False),
@@ -1128,6 +1122,25 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         except Exception as e:
             print(f"  [WARN] UAP transfer_attack failed for {name}: {e}")
             results["UAP_Transfer"] = None
+
+        if count_quant_layers(model) > 0:
+            try:
+                results["Transfer_to_FP32"] = transfer_attack(model, fp32_ref, loader, eps=eps)
+            except Exception as e:
+                print(f"  [WARN] reverse transfer_attack failed for {name}: {e}")
+                results["Transfer_to_FP32"] = None
+
+            try:
+                results["MIM_Transfer_to_FP32"] = transfer_attack_mim(model, fp32_ref, loader, eps=eps)
+            except Exception as e:
+                print(f"  [WARN] reverse MIM transfer_attack failed for {name}: {e}")
+                results["MIM_Transfer_to_FP32"] = None
+
+            try:
+                results["UAP_Transfer_to_FP32"] = transfer_uap_attack(model, fp32_ref, loader, eps=eps)
+            except Exception as e:
+                print(f"  [WARN] reverse UAP transfer_attack failed for {name}: {e}")
+                results["UAP_Transfer_to_FP32"] = None
 
     try:
         results.update(run_random_noise_seeded(model, loader, eps=eps))
@@ -1528,6 +1541,7 @@ def plot_results_heatmap(df_results):
         return
     candidate_cols = ["clean_acc", "FGSM", "PGD", "AutoAttack", "CW", "DeepFool", "JSMA",
                       "Surrogate_Transfer", "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
+                      "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
                       "Random_Noise", "BPDA_PGD", "NES", "Boundary_acc"]
     cols = [c for c in candidate_cols if c in df_results.columns and df_results[c].notna().any()]
     if not cols:
@@ -1662,6 +1676,7 @@ def main():
 
     acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
                              "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
+                             "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
                              "Surrogate_Transfer", "Random_Noise", "BPDA_PGD"]
                 if c in df_results.columns]
 
