@@ -24,17 +24,11 @@ from autoattack import AutoAttack
 import sys
 from pathlib import Path
 
-# defenses.py is imported at the very end of this file (see bottom), after
-# every name it depends on (device, denormalize_inputs, convert_to_quant,
-# make_torchattack, config constants, ...) has been defined.
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import *
-
-print("device:", device)
 
 """
 Modernized archival non-threaded analysis of metrics of attacks per model and eplison
@@ -61,14 +55,16 @@ def component_ablation_csv_path(model_name):
 def margin_json_path(model_name):
     return os.path.join(DATA_DIR, f"margin_{model_name}.json")
 
+def check_environment():
+    missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
+    if missing:
+        raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
+    print("All required packages are available.")
+    print("device:", device)
 
-missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
-if missing:
-    raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
-print("All required packages are available.")
-
-if not os.path.isdir(CIFAR10_DIR):
-    raise FileNotFoundError(f"Expected extracted CIFAR-10 at {CIFAR10_DIR!r}")
+    if not os.path.isdir(CIFAR10_DIR):
+        raise FileNotFoundError(f"Expected extracted CIFAR-10 at {CIFAR10_DIR!r}")
+    
 
 
 def get_dataloaders(batch_size=DEFAULT_BATCH_SIZE, eval_n=DEFAULT_EVAL_N, finetune_n=DEFAULT_FINETUNE_N):
@@ -143,6 +139,36 @@ def quantize_tensor(t, bits, use_ste):
     return t_round * scale
 
 
+def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP):
+    n = t.numel()
+    if n == 0:
+        return torch.empty_like(t)
+    dtype = torch.float32 if t.dtype in (torch.float16, torch.bfloat16) else t.dtype
+    idx = torch.arange(n, device=t.device, dtype=dtype)
+    z = torch.frac(seed + (idx + 1.0) * 0.6180339887498949)
+    z = torch.clamp(z, 1e-6, 1.0 - 1e-6)
+    if map_name == "tent":
+        for _ in range(CHAOTIC_QUANT_WARMUP):
+            z = torch.where(z < 0.5, CHAOTIC_QUANT_MU * z * 0.5, CHAOTIC_QUANT_MU * (1.0 - z) * 0.5)
+    else:
+        for _ in range(CHAOTIC_QUANT_WARMUP):
+            z = CHAOTIC_QUANT_R * z * (1.0 - z)
+    return z.view_as(t).to(dtype=t.dtype)
+
+
+def chaotic_quantize_tensor(t, bits, use_ste, quantize=True):
+    if bits is None or not quantize:
+        return t
+    qmax = 2 ** (bits - 1) - 1
+    scale = torch.clamp(t.detach().abs().max() / qmax, min=QUANT_SCALE_MIN)
+    chaos = chaotic_sequence_like(t)
+    dither = (chaos - 0.5) * CHAOTIC_QUANT_DITHER
+    t_scaled = t / scale + dither
+    t_round = FakeQuantSTE.apply(t_scaled) if use_ste else torch.round(t_scaled)
+    t_round = torch.clamp(t_round, -qmax - 1, qmax)
+    return (t_round - dither) * scale
+
+
 class QuantConv2d(nn.Conv2d):
     def forward(self, x):
         bits = getattr(self, 'bits', None)
@@ -154,6 +180,20 @@ class QuantConv2d(nn.Conv2d):
         out = self._conv_forward(x, w, self.bias)
         if quant_act:
             out = quantize_tensor(out, bits, use_ste)
+        return out.clone()
+
+
+class ChaoticQuantConv2d(QuantConv2d):
+    def forward(self, x):
+        bits = getattr(self, 'bits', None)
+        use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
+        quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
+        quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
+
+        w = chaotic_quantize_tensor(self.weight, bits, use_ste, quant_weight) if quant_weight else self.weight
+        out = self._conv_forward(x, w, self.bias)
+        if quant_act:
+            out = chaotic_quantize_tensor(out, bits, use_ste, quant_act)
         return out.clone()
 
 
@@ -171,18 +211,34 @@ class QuantLinear(nn.Linear):
         return out.clone()
 
 
-def _to_quant_module(mod, bits, quant_weight=True, quant_act=True):
+class ChaoticQuantLinear(QuantLinear):
+    def forward(self, x):
+        bits = getattr(self, 'bits', None)
+        use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
+        quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
+        quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
+
+        w = chaotic_quantize_tensor(self.weight, bits, use_ste, quant_weight) if quant_weight else self.weight
+        out = F.linear(x, w, self.bias)
+        if quant_act:
+            out = chaotic_quantize_tensor(out, bits, use_ste, quant_act)
+        return out.clone()
+
+
+def _to_quant_module(mod, bits, quant_weight=True, quant_act=True, chaotic=False):
     if isinstance(mod, nn.Conv2d):
-        new = QuantConv2d(mod.in_channels, mod.out_channels, mod.kernel_size,
-                          mod.stride, mod.padding, mod.dilation, mod.groups,
-                          mod.bias is not None, mod.padding_mode)
+        cls = ChaoticQuantConv2d if chaotic else QuantConv2d
+        new = cls(mod.in_channels, mod.out_channels, mod.kernel_size,
+                  mod.stride, mod.padding, mod.dilation, mod.groups,
+                  mod.bias is not None, mod.padding_mode)
         new.weight = mod.weight
         if mod.bias is not None:
             new.bias = mod.bias
         new.bits, new.use_ste, new.quant_weight, new.quant_act = bits, QUANT_DEFAULT_USE_STE, quant_weight, quant_act
         return new
     if isinstance(mod, nn.Linear):
-        new = QuantLinear(mod.in_features, mod.out_features, bias=mod.bias is not None)
+        cls = ChaoticQuantLinear if chaotic else QuantLinear
+        new = cls(mod.in_features, mod.out_features, bias=mod.bias is not None)
         new.weight = mod.weight
         if mod.bias is not None:
             new.bias = mod.bias
@@ -191,13 +247,13 @@ def _to_quant_module(mod, bits, quant_weight=True, quant_act=True):
     return None
 
 
-def _replace_recursive(module, bits, quant_weight=True, quant_act=True):
+def _replace_recursive(module, bits, quant_weight=True, quant_act=True, chaotic=False):
     for name, child in list(module.named_children()):
-        nc = _to_quant_module(child, bits, quant_weight, quant_act)
+        nc = _to_quant_module(child, bits, quant_weight, quant_act, chaotic=chaotic)
         if nc is not None:
             setattr(module, name, nc)
         else:
-            _replace_recursive(child, bits, quant_weight, quant_act)
+            _replace_recursive(child, bits, quant_weight, quant_act, chaotic=chaotic)
 
 
 def convert_to_quant(model, bits, quant_weight=True, quant_act=True):
@@ -206,14 +262,20 @@ def convert_to_quant(model, bits, quant_weight=True, quant_act=True):
     return m
 
 
+def convert_to_chaotic_quant(model, bits, quant_weight=True, quant_act=True):
+    m = copy.deepcopy(model)
+    _replace_recursive(m, bits, quant_weight, quant_act, chaotic=True)
+    return m
+
+
 def set_ste_mode(model, flag):
     for mod in model.modules():
-        if isinstance(mod, (QuantConv2d, QuantLinear)):
+        if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
             mod.use_ste = flag
 
 
 def count_quant_layers(model):
-    return sum(1 for m in model.modules() if isinstance(m, (QuantConv2d, QuantLinear)))
+    return sum(1 for m in model.modules() if isinstance(m, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)))
 
 
 # flip weight/activation quantization on an already-built quantized model
@@ -221,13 +283,13 @@ def count_quant_layers(model):
 # ablation configs instead of re-running convert_to_quant/QAT.
 def set_quant_components(model, quant_weight, quant_act):
     for mod in model.modules():
-        if isinstance(mod, (QuantConv2d, QuantLinear)):
+        if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
             mod.quant_weight = quant_weight
             mod.quant_act = quant_act
 
 
-def prepare_qat(fp32_model, bits, finetune_loader, epochs=QAT_EPOCHS_DEFAULT, lr=QAT_LR):
-    m = convert_to_quant(fp32_model, bits, quant_weight=True, quant_act=True)
+def prepare_qat(fp32_model, bits, finetune_loader, epochs=QAT_EPOCHS_DEFAULT, lr=QAT_LR, chaotic=False):
+    m = convert_to_chaotic_quant(fp32_model, bits, quant_weight=True, quant_act=True) if chaotic else convert_to_quant(fp32_model, bits, quant_weight=True, quant_act=True)
     if torch.cuda.device_count() > 1:
         m = nn.DataParallel(m)
 
@@ -270,6 +332,42 @@ class PixelSpaceModel(nn.Module):
 
     def forward(self, x):
         return self.model((x - self.mean.to(x.device)) / self.std.to(x.device))
+
+
+class ImageCompressionSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, bits):
+        levels = float(2 ** bits - 1)
+        return torch.round(x * levels).div(levels)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+
+class CompressedInputModel(nn.Module):
+    def __init__(self, model, size=COMPRESS_IMAGE_SIZE, bits=COMPRESS_IMAGE_BITS, mode=COMPRESS_IMAGE_MODE):
+        super().__init__()
+        self.model = model
+        self.size = size
+        self.bits = bits
+        self.mode = mode
+
+    def forward(self, x):
+        pixels = denormalize_inputs(x).clamp(0.0, 1.0)
+        if self.size and self.size < pixels.shape[-1]:
+            kwargs = {"mode": self.mode}
+            if self.mode in ("linear", "bilinear", "bicubic", "trilinear"):
+                kwargs["align_corners"] = COMPRESS_IMAGE_ALIGN_CORNERS
+            pixels = F.interpolate(pixels, size=(self.size, self.size), **kwargs)
+            pixels = F.interpolate(pixels, size=(CIFAR_IMAGE_SIZE, CIFAR_IMAGE_SIZE), **kwargs)
+        if self.bits is not None:
+            pixels = ImageCompressionSTE.apply(pixels, self.bits)
+        return self.model(normalize_pixels(pixels.clamp(0.0, 1.0)))
+
+
+def with_image_compression(model, size=COMPRESS_IMAGE_SIZE, bits=COMPRESS_IMAGE_BITS, mode=COMPRESS_IMAGE_MODE):
+    return CompressedInputModel(copy.deepcopy(model), size=size, bits=bits, mode=mode).to(device).eval()
 
 
 def normalize_pixels(x):
@@ -1339,6 +1437,7 @@ def parallelize(model):
 
 
 def main():
+    check_environment()
     finetune_loader, eval_loader = get_dataloaders()
     model_registry = {}
 
@@ -1361,16 +1460,46 @@ def main():
             print(f"  [FAIL] int8 PTQ for {arch_key}: {e}")
 
         try:
+            model_registry[f"{arch_key}_FP32_Compressed"] = (with_image_compression(fp32), fp32)
+        except Exception as e:
+            print(f"  [FAIL] compressed FP32 for {arch_key}: {e}")
+
+        try:
             int4_ptq = convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True)
             model_registry[f"{arch_key}_int4_PTQ"] = (int4_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
 
         try:
+            chaotic_int8_ptq = convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
+            model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (chaotic_int8_ptq, fp32)
+        except Exception as e:
+            print(f"  [FAIL] chaotic int8 PTQ for {arch_key}: {e}")
+
+        try:
+            chaotic_int4_ptq = convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True)
+            model_registry[f"{arch_key}_chaotic_int4_PTQ"] = (chaotic_int4_ptq, fp32)
+        except Exception as e:
+            print(f"  [FAIL] chaotic int4 PTQ for {arch_key}: {e}")
+
+        try:
+            compressed_chaotic_int8 = with_image_compression(convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True))
+            model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (compressed_chaotic_int8, fp32)
+        except Exception as e:
+            print(f"  [FAIL] compressed chaotic int8 PTQ for {arch_key}: {e}")
+
+        try:
             int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS)
             model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
+            traceback.print_exc()
+
+        try:
+            chaotic_int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS, chaotic=True)
+            model_registry[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_int8_qat, fp32)
+        except Exception as e:
+            print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
 
     try:
@@ -1532,7 +1661,6 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
     dataframe (guardrail/detector flag rates, certified accuracy) that
     doesn't fit the existing per-attack CSV schema.
     """
-    import defenses as dfn
 
     summary_rows = []
 

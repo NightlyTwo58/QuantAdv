@@ -24,7 +24,7 @@ or set Download=true
 To run  
 `python src/run_experiment.py`  
 `python src/combine_results`  
-`python archive/QuantAdvOld.py`  
+`python archive/QuantAdv.py`  
 
 Parallelized (obsolete)  
 `python archive/launcher.py`
