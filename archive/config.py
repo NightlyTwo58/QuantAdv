@@ -36,10 +36,10 @@ SEEDS = [0, 1, 2]
 PRETRAINED_NAMES = {
     "ResNet20": "cifar10_resnet20",
     "ResNet56": "cifar10_resnet56",
-    "MobileNetV2": "cifar10_mobilenetv2_x1_0",
-    "VGG16_BN": "cifar10_vgg16_bn",
-    "ShuffleNetV2": "cifar10_shufflenetv2_x1_0",
-    "RepVGG_A0": "cifar10_repvgg_a0",
+    # "MobileNetV2": "cifar10_mobilenetv2_x1_0",
+    # "VGG16_BN": "cifar10_vgg16_bn",
+    # "ShuffleNetV2": "cifar10_shufflenetv2_x1_0",
+    # "RepVGG_A0": "cifar10_repvgg_a0",
 }
 
 CIFAR_MEAN_VALUES = (0.4914, 0.4822, 0.4465)

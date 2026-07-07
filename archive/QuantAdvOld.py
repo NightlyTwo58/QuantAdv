@@ -125,7 +125,14 @@ def sanity_check_accuracy(model, loader):
 class FakeQuantSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        return torch.round(x)
+        # .clone() so this custom Function's output is never the same
+        # storage/view that a later downstream nn.ReLU(inplace=True) (or any
+        # other in-place op) ends up mutating. Without this, any model with
+        # inplace activations (VGG*_BN and friends) raises "Output 0 of
+        # BackwardHookFunctionBackward is a view and is being modified
+        # inplace" as soon as a backward hook is registered anywhere on the
+        # model (see layerwise_grad_profile).
+        return torch.round(x).clone()
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -154,7 +161,16 @@ class QuantConv2d(nn.Conv2d):
         out = self._conv_forward(x, w, self.bias)
         if quant_act:
             out = quantize_tensor(out, bits, use_ste)
-        return out
+        # Clone before returning: this is the tensor a module-level backward
+        # hook (see layerwise_grad_profile) wraps, and it's also exactly what
+        # gets handed to the next layer's nn.ReLU(inplace=True) in most
+        # torchvision-style architectures (VGG*_BN and friends). Returning
+        # the same storage to both means the inplace ReLU mutates a
+        # hook-tracked tensor, which PyTorch forbids ("Output 0 of
+        # BackwardHookFunctionBackward is a view and is being modified
+        # inplace"). The clone is a cheap, always-safe fix independent of
+        # whether any hooks happen to be registered.
+        return out.clone()
 
 
 class QuantLinear(nn.Linear):
@@ -168,7 +184,10 @@ class QuantLinear(nn.Linear):
         out = F.linear(x, w, self.bias)
         if quant_act:
             out = quantize_tensor(out, bits, use_ste)
-        return out
+        # See the matching comment in QuantConv2d.forward: clone so this
+        # module's output is never the exact storage a downstream inplace op
+        # or a module-level backward hook both touch.
+        return out.clone()
 
 
 def _to_quant_module(mod, bits, quant_weight=True, quant_act=True):
@@ -868,23 +887,24 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
 
         return hook
 
-    for n, m in quant_layers:
-        handles.append(m.register_full_backward_hook(make_hook(n)))
+    try:
+        for n, m in quant_layers:
+            handles.append(m.register_full_backward_hook(make_hook(n)))
 
-    set_ste_mode(model, use_ste)
-    model.eval()
-    for bi, (x, y) in enumerate(loader):
-        if bi >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        x = x.clone().requires_grad_(True)
-        loss = F.cross_entropy(model(x), y)
-        model.zero_grad(set_to_none=True)
-        loss.backward()
-
-    for h in handles:
-        h.remove()
-    set_ste_mode(model, False)
+        set_ste_mode(model, use_ste)
+        model.eval()
+        for bi, (x, y) in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x, y = x.to(device), y.to(device)
+            x = x.clone().requires_grad_(True)
+            loss = F.cross_entropy(model(x), y)
+            model.zero_grad(set_to_none=True)
+            loss.backward()
+    finally:
+        for h in handles:
+            h.remove()
+        set_ste_mode(model, False)
 
     ordered_names = [n for n, _ in quant_layers]
     return {n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names}
@@ -1617,6 +1637,13 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
 
 
 def plot_defense_comparison(df_results):
+    """
+    Bar chart comparing clean_acc / PGD / AutoAttack accuracy across the
+    new defense variants (AT, Sanitized, Smoothed, Guardrail, DetectGuard)
+    alongside the original PTQ/QAT models already in df_results, reusing
+    the same columns/plot style as plot_results_heatmap /
+    plot_gradient_masking_summary above.
+    """
     if df_results is None or df_results.empty:
         return
     defense_tags = ("_AT", "_Sanitized", "_Smoothed", "_Guardrail", "_DetectGuard")
