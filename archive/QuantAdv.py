@@ -855,7 +855,6 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=BOUN
     clip_min = clip_min.to(x_orig.device)
     clip_max = clip_max.to(x_orig.device)
 
-    # 1. find an initial point that the model already misclassifies
     x_adv = None
     tries_left = init_tries
     while tries_left > 0 and x_adv is None:
@@ -869,8 +868,7 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=BOUN
         tries_left -= chunk
 
     if x_adv is None:
-        # no adversarial start found within the query budget -> treat as robust
-        return x_orig.clone()
+        return x_orig.clone(), False
 
     sph_step, src_step = spherical_step, source_step
     sph_hist, src_hist = [], []
@@ -910,7 +908,7 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=BOUN
                 rate = np.mean(src_hist[-10:])
                 src_step *= step_adapt if rate > BOUNDARY_SPH_SUCCESS_HIGH else (1 / step_adapt if rate < BOUNDARY_SPH_SUCCESS_LOW else 1.0)
 
-    return x_adv.detach()
+    return x_adv.detach(), True
 
 
 def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_IMAGES_DEFAULT, steps=BOUNDARY_STEPS_DEFAULT, seed=BOUNDARY_SEED):
@@ -927,6 +925,7 @@ def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_
     total_seen = 0
     clean_correct = 0
     robust_correct = 0
+    init_failed = 0  # random search never found a misclassified starting point
     for x, y in loader:
         if total_seen >= max_images:
             break
@@ -940,7 +939,10 @@ def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_
             if (pred[i] != y[i]).item():
                 continue
             clean_correct += 1
-            x_adv = boundary_attack_single(model, x[i], y[i], clip_min, clip_max, steps=steps)
+            x_adv, init_ok = boundary_attack_single(model, x[i], y[i], clip_min, clip_max, steps=steps)
+            if not init_ok:
+                init_failed += 1
+                continue
             dist = (denormalize_inputs(x_adv.unsqueeze(0)) - denormalize_inputs(x[i].unsqueeze(0))).abs().max().item()
             adv_found = (_predict_batch(model, x_adv.unsqueeze(0))[0] != y[i]).item()
             if adv_found:
@@ -957,24 +959,37 @@ def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_
             "Boundary_max_Linf": None,
             "Boundary_std_Linf": None,
             "Boundary_n": 0,
+            "Boundary_init_failed": 0,
+            "Boundary_init_failed_rate": None,
         }
 
+    evaluated = clean_correct - init_failed
     dists = np.array(dists, dtype=float)
-    boundary_acc = robust_correct / total_seen
+    boundary_acc = (robust_correct / evaluated) if evaluated > 0 else None
     clean_subset_acc = clean_correct / total_seen
-    if boundary_acc > clean_subset_acc + 1e-12:
+    if boundary_acc is not None and boundary_acc > clean_subset_acc + 1e-12:
         warnings.warn(
             "Boundary_acc exceeded clean accuracy on the evaluated subset; the old subset-only metric could do this because it divided only by clean-correct attacked samples.",
             RuntimeWarning,
         )
+    init_failed_rate = (init_failed / clean_correct) if clean_correct > 0 else None
+    if init_failed_rate is not None and init_failed_rate > 0.2:  # >20% failed inits -> Boundary_acc is unreliable
+        warnings.warn(
+            f"Boundary attack init search failed on {init_failed_rate:.1%} of clean-correct samples "
+            f"({init_failed}/{clean_correct}); Boundary_acc is computed only over the remaining "
+            f"{evaluated} samples and may not be a reliable robustness estimate.",
+            RuntimeWarning,
+        )
     return {
-        "Boundary_acc": float(boundary_acc),
+        "Boundary_acc": float(boundary_acc) if boundary_acc is not None else None,
         "Boundary_mean_Linf": float(dists.mean()) if dists.size else None,
         "Boundary_median_Linf": float(np.median(dists)) if dists.size else None,
         "Boundary_min_Linf": float(dists.min()) if dists.size else None,
         "Boundary_max_Linf": float(dists.max()) if dists.size else None,
         "Boundary_std_Linf": float(dists.std()) if dists.size else None,
-        "Boundary_n": int(total_seen),
+        "Boundary_n": int(evaluated),
+        "Boundary_init_failed": int(init_failed),
+        "Boundary_init_failed_rate": float(init_failed_rate) if init_failed_rate is not None else None,
     }
 
 
@@ -1309,6 +1324,8 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             results["Boundary_max_Linf"] = None
             results["Boundary_std_Linf"] = None
             results["Boundary_n"] = 0
+            results["Boundary_init_failed"] = None
+            results["Boundary_init_failed_rate"] = None
 
         safe_update(
             lambda: run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=NES_SAMPLES_SUITE, query_chunk=NES_QUERY_CHUNK),
