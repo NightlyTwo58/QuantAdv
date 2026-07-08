@@ -33,30 +33,17 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import *
 
 """
-Modernized archival non-threaded analysis of metrics of attacks per model and eplison
+Modernized non-threaded analysis of metrics of attacks per model and eplison
 """
 
+def csv_path(model_name, type):
+    return os.path.join(DATA_DIR, f"{type}_{model_name}.csv")
 
-def ablation_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"ablation_{model_name}.csv")
-
-def layerwise_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"layerwise_{model_name}.csv")
-
-def trajectory_json_path(model_name):
-    return os.path.join(DATA_DIR, f"trajectory_{model_name}.json")
-
-def component_ablation_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
-
-def chunk_quant_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"chunk_quant_{model_name}.csv")
+def json_path(model_name, type):
+    return os.path.join(DATA_DIR, f"{type}_{model_name}.json")
 
 def defense_summary_csv_path():
     return os.path.join(DATA_DIR, "defense_summary.csv")
-
-def margin_json_path(model_name):
-    return os.path.join(DATA_DIR, f"margin_{model_name}.json")
 
 def check_environment():
     missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
@@ -67,7 +54,7 @@ def check_environment():
 
     if not os.path.isdir(CIFAR10_DIR):
         raise FileNotFoundError(f"Expected extracted CIFAR-10 at {CIFAR10_DIR!r}")
-    
+
 
 
 def get_dataloaders(batch_size=DEFAULT_BATCH_SIZE, eval_n=DEFAULT_EVAL_N, finetune_n=DEFAULT_FINETUNE_N):
@@ -108,17 +95,7 @@ def load_pretrained(arch_key):
 
 def sanity_check_accuracy(model, loader):
     model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            with autocast(device_type=device.type):
-                pred = model(x).argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-    return correct / total
+    return accuracy_from_adv_fn(model, loader, use_autocast=True)
 
 
 class FakeQuantSTE(torch.autograd.Function):
@@ -172,60 +149,48 @@ def chaotic_quantize_tensor(t, bits, use_ste, quantize=True):
     return (t_round - dither) * scale
 
 
-class QuantConv2d(nn.Conv2d):
-    def forward(self, x):
+class _QuantizedLayerMixin:
+    chaotic = False
+
+    def _quant_params(self):
         bits = getattr(self, 'bits', None)
         use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
         quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
         quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
+        return bits, use_ste, quant_weight, quant_act
 
-        w = quantize_tensor(self.weight, bits, use_ste) if quant_weight else self.weight
+    def _quantize(self, t, bits, use_ste, enabled=True):
+        if self.chaotic:
+            return chaotic_quantize_tensor(t, bits, use_ste, enabled)
+        return quantize_tensor(t, bits, use_ste) if enabled else t
+
+
+class QuantConv2d(_QuantizedLayerMixin, nn.Conv2d):
+    def forward(self, x):
+        bits, use_ste, quant_weight, quant_act = self._quant_params()
+        w = self._quantize(self.weight, bits, use_ste, quant_weight)
         out = self._conv_forward(x, w, self.bias)
         if quant_act:
-            out = quantize_tensor(out, bits, use_ste)
+            out = self._quantize(out, bits, use_ste, quant_act)
         return out.clone()
 
 
 class ChaoticQuantConv2d(QuantConv2d):
+    chaotic = True
+
+
+class QuantLinear(_QuantizedLayerMixin, nn.Linear):
     def forward(self, x):
-        bits = getattr(self, 'bits', None)
-        use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
-        quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
-        quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
-
-        w = chaotic_quantize_tensor(self.weight, bits, use_ste, quant_weight) if quant_weight else self.weight
-        out = self._conv_forward(x, w, self.bias)
-        if quant_act:
-            out = chaotic_quantize_tensor(out, bits, use_ste, quant_act)
-        return out.clone()
-
-
-class QuantLinear(nn.Linear):
-    def forward(self, x):
-        bits = getattr(self, 'bits', None)
-        use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
-        quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
-        quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
-
-        w = quantize_tensor(self.weight, bits, use_ste) if quant_weight else self.weight
+        bits, use_ste, quant_weight, quant_act = self._quant_params()
+        w = self._quantize(self.weight, bits, use_ste, quant_weight)
         out = F.linear(x, w, self.bias)
         if quant_act:
-            out = quantize_tensor(out, bits, use_ste)
+            out = self._quantize(out, bits, use_ste, quant_act)
         return out.clone()
 
 
 class ChaoticQuantLinear(QuantLinear):
-    def forward(self, x):
-        bits = getattr(self, 'bits', None)
-        use_ste = getattr(self, 'use_ste', QUANT_DEFAULT_USE_STE)
-        quant_weight = getattr(self, 'quant_weight', QUANT_DEFAULT_WEIGHT)
-        quant_act = getattr(self, 'quant_act', QUANT_DEFAULT_ACT)
-
-        w = chaotic_quantize_tensor(self.weight, bits, use_ste, quant_weight) if quant_weight else self.weight
-        out = F.linear(x, w, self.bias)
-        if quant_act:
-            out = chaotic_quantize_tensor(out, bits, use_ste, quant_act)
-        return out.clone()
+    chaotic = True
 
 
 def _to_quant_module(mod, bits, quant_weight=True, quant_act=True, chaotic=False):
@@ -259,16 +224,14 @@ def _replace_recursive(module, bits, quant_weight=True, quant_act=True, chaotic=
             _replace_recursive(child, bits, quant_weight, quant_act, chaotic=chaotic)
 
 
-def convert_to_quant(model, bits, quant_weight=True, quant_act=True):
+def convert_to_quant(model, bits, quant_weight=True, quant_act=True, chaotic=False):
     m = copy.deepcopy(model)
-    _replace_recursive(m, bits, quant_weight, quant_act)
+    _replace_recursive(m, bits, quant_weight, quant_act, chaotic=chaotic)
     return m
 
 
 def convert_to_chaotic_quant(model, bits, quant_weight=True, quant_act=True):
-    m = copy.deepcopy(model)
-    _replace_recursive(m, bits, quant_weight, quant_act, chaotic=True)
-    return m
+    return convert_to_quant(model, bits, quant_weight=quant_weight, quant_act=quant_act, chaotic=True)
 
 
 def quantizable_layer_names(model):
@@ -316,9 +279,6 @@ def count_quant_layers(model):
     return sum(1 for m in model.modules() if isinstance(m, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)))
 
 
-# flip weight/activation quantization on an already-built quantized model
-# without rebuilding it, so one model object can be reused for all three
-# ablation configs instead of re-running convert_to_quant/QAT.
 def set_quant_components(model, quant_weight, quant_act):
     for mod in model.modules():
         if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
@@ -422,7 +382,7 @@ def make_torchattack(attack_cls, model, *args, **kwargs):
     return attack
 
 
-def accuracy_under_attack(model, loader, attack, target_model=None, max_images=None):
+def accuracy_from_adv_fn(model, loader, adv_fn=None, target_model=None, max_images=None, use_autocast=False):
     target = target_model if target_model is not None else model
     correct, total, n_seen = 0, 0, 0
     for x, y in loader:
@@ -432,15 +392,39 @@ def accuracy_under_attack(model, loader, attack, target_model=None, max_images=N
             remaining = max_images - n_seen
             x, y = x[:remaining], y[:remaining]
         x, y = x.to(device), y.to(device)
-        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
-        x_adv_pixel = attack(x_pixel, y)
-        x_adv = normalize_pixels(x_adv_pixel)
+        x_adv = adv_fn(x, y) if adv_fn is not None else x
         with torch.no_grad():
-            pred = target(x_adv).argmax(dim=1)
+            if use_autocast:
+                with autocast(device_type=device.type):
+                    pred = target(x_adv).argmax(dim=1)
+            else:
+                pred = target(x_adv).argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
         n_seen += y.size(0)
     return correct / total if total else None
+
+
+def accuracy_under_attack(model, loader, attack, target_model=None, max_images=None):
+    def adv_fn(x, y):
+        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
+        return normalize_pixels(attack(x_pixel, y))
+
+    return accuracy_from_adv_fn(model, loader, adv_fn, target_model=target_model, max_images=max_images)
+
+
+def seed_averaged_metrics(name, seeds, fn):
+    accs = []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        accs.append(fn(seed))
+    mean = float(np.mean(accs))
+    return {
+        name: mean,
+        f"{name}_mean": mean,
+        f"{name}_std": float(np.std(accs)),
+    }
+
 
 def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
     model.eval()
@@ -449,14 +433,11 @@ def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
 
     out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
 
-    pgd_accs = []
-    for seed in seeds:
-        torch.manual_seed(seed)
+    def run_seed(seed):
         pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-        pgd_accs.append(accuracy_under_attack(model, loader, pgd))
-    out["PGD"] = float(np.mean(pgd_accs))
-    out["PGD_mean"] = float(np.mean(pgd_accs))
-    out["PGD_std"] = float(np.std(pgd_accs))
+        return accuracy_under_attack(model, loader, pgd)
+
+    out.update(seed_averaged_metrics("PGD", seeds, run_seed))
     return out
 
 
@@ -465,16 +446,11 @@ def run_autoattack(model, loader, eps=DEFAULT_EPS):
     pixel_model = PixelSpaceModel(model).to(device).eval()
     adversary = AutoAttack(pixel_model, norm=AUTOATTACK_NORM, eps=eps, version=AUTOATTACK_VERSION, device=device, verbose=AUTOATTACK_VERBOSE)
     adversary.seed = AUTOATTACK_SEED
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+    def adv_fn(x, y):
         x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
-        x_adv = normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
-        with torch.no_grad():
-            pred = model(x_adv).argmax(1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-    return correct / total
+        return normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
+
+    return accuracy_from_adv_fn(model, loader, adv_fn)
 
 
 def run_extra_whitebox_attacks(model, loader, eps=DEFAULT_EPS, jsma_max_images=JSMA_MAX_IMAGES):
@@ -534,32 +510,36 @@ def build_uap(model, loader, eps=DEFAULT_EPS, delta=UAP_DELTA, max_iter=UAP_MAX_
     return v.detach()
 
 
-def run_uap_attack(model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
-    v = build_uap(model, loader, eps=eps, max_images=max_images)
+def _run_uap_attack(source_model, target_model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
+    v = build_uap(source_model, loader, eps=eps, max_images=max_images)
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = torch.max(torch.min(x + v, clip_max), clip_min)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+
+    def adv_fn(x, y):
+        return torch.max(torch.min(x + v, clip_max), clip_min)
+
+    return accuracy_from_adv_fn(source_model, loader, adv_fn, target_model=target_model)
+
+
+def run_uap_attack(model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
+    return _run_uap_attack(model, model, loader, eps=eps, max_images=max_images)
 
 
 def transfer_uap_attack(source_model, target_model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
-    v = build_uap(source_model, loader, eps=eps, max_images=max_images)
-    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = torch.max(torch.min(x + v, clip_max), clip_min)
-        with torch.no_grad():
-            pred = target_model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+    return _run_uap_attack(source_model, target_model, loader, eps=eps, max_images=max_images)
+
+
+def projected_pgd_attack(x, y, eps, alpha, steps, grad_fn):
+    clip_min = CLIP_MIN.to(device)
+    clip_max = CLIP_MAX.to(device)
+    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    for _ in range(steps):
+        grad = grad_fn(x_adv, y)
+        grad = torch.zeros_like(x_adv) if grad is None else grad
+        x_adv = x_adv.detach() + alpha * grad.sign()
+        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    return x_adv.detach()
 
 
 def bpda_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS, backward_model=None):
@@ -567,20 +547,14 @@ def bpda_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STE
     backward_model = backward_model if backward_model is not None else model
     if backward_model is not model:
         set_ste_mode(backward_model, True)
-    clip_min = CLIP_MIN.to(device)
-    clip_max = CLIP_MAX.to(device)
-    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     try:
-        for _ in range(steps):
+        def grad_fn(x_adv, labels):
             x_adv.requires_grad_(True)
-            loss = F.cross_entropy(backward_model(x_adv), y)
+            loss = F.cross_entropy(backward_model(x_adv), labels)
             grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
-            grad = torch.zeros_like(x_adv) if grad is None else grad
-            x_adv = x_adv.detach() + alpha * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-        return x_adv.detach()
+            return grad
+
+        return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
     finally:
         set_ste_mode(model, False)
         if backward_model is not model:
@@ -603,33 +577,12 @@ def _run_bpda_once(model, loader, eps, n_restarts):
 
 
 def run_bpda(model, loader, eps=DEFAULT_EPS, n_restarts=BPDA_RESTARTS_DEFAULT, seeds=SEEDS):
-    """
-    Runs the whole worst-case-over-n_restarts procedure once per seed and
-    reports mean/std across seeds, in addition to the original scalar
-    (mean of seeds) for backward-compat.
-    """
-    accs = []
-    for seed in seeds:
-        torch.manual_seed(seed)
-        accs.append(_run_bpda_once(model, loader, eps, n_restarts))
-    return {
-        "BPDA_PGD": float(np.mean(accs)),
-        "BPDA_PGD_mean": float(np.mean(accs)),
-        "BPDA_PGD_std": float(np.std(accs)),
-    }
+    return seed_averaged_metrics("BPDA_PGD", seeds, lambda seed: _run_bpda_once(model, loader, eps, n_restarts))
 
 
 def evaluate_normalized_attack(model, loader, attack_fn):
-    correct, total = 0, 0
     model.eval()
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = attack_fn(x, y)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total if total else None
+    return accuracy_from_adv_fn(model, loader, attack_fn)
 
 
 def unwrap_model(model):
@@ -638,20 +591,14 @@ def unwrap_model(model):
 
 def adaptive_pgd_attack(model, x, y, loss_fn, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS):
     set_ste_mode(model, True)
-    clip_min = CLIP_MIN.to(device)
-    clip_max = CLIP_MAX.to(device)
-    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     try:
-        for _ in range(steps):
+        def grad_fn(x_adv, labels):
             x_adv.requires_grad_(True)
-            loss = loss_fn(x_adv, y)
+            loss = loss_fn(x_adv, labels)
             grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
-            grad = torch.zeros_like(x_adv) if grad is None else grad
-            x_adv = x_adv.detach() + alpha * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-        return x_adv.detach()
+            return grad
+
+        return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
     finally:
         set_ste_mode(model, False)
 
@@ -765,23 +712,11 @@ def nes_estimate_gradient(model, x, y, n_samples=NES_SAMPLES_DEFAULT, sigma=NES_
 
 def nes_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=NES_STEPS, n_samples=NES_SAMPLES_DEFAULT,
                     sigma=NES_SIGMA, query_chunk=NES_QUERY_CHUNK):
-    """
-    Black-box Linf PGD attack that substitutes the true gradient with the NES
-    estimate above. Same random-start / sign-step / projection structure as
-    the white-box PGD used elsewhere in this file, so results are directly
-    comparable at matched eps.
-    """
-    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
-    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-
-    for _ in range(steps):
-        grad = nes_estimate_gradient(model, x_adv, y, n_samples=n_samples,
+    def grad_fn(x_adv, labels):
+        return nes_estimate_gradient(model, x_adv, labels, n_samples=n_samples,
                                       sigma=sigma, query_chunk=query_chunk)
-        x_adv = x_adv + alpha * grad.sign()
-        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-    return x_adv.detach()
+
+    return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
 
 
 def nes_attack(model, loader, eps=DEFAULT_EPS, n_samples=NES_SAMPLES_DEFAULT, sigma=NES_SIGMA, alpha=PGD_ALPHA,
@@ -790,26 +725,15 @@ def nes_attack(model, loader, eps=DEFAULT_EPS, n_samples=NES_SAMPLES_DEFAULT, si
     if seed is not None:
         torch.manual_seed(seed)
     model.eval()
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = nes_pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps,
+    def adv_fn(x, y):
+        return nes_pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps,
                                 n_samples=n_samples, sigma=sigma, query_chunk=query_chunk)
-        with torch.no_grad():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+
+    return accuracy_from_adv_fn(model, loader, adv_fn)
 
 
 def run_nes_attack(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, **kwargs):
-    """Seed-averaged wrapper around nes_attack (mirrors run_random_noise_seeded)."""
-    accs = [nes_attack(model, loader, eps=eps, seed=s, **kwargs) for s in seeds]
-    return {
-        "NES": float(np.mean(accs)),
-        "NES_mean": float(np.mean(accs)),
-        "NES_std": float(np.std(accs)),
-    }
+    return seed_averaged_metrics("NES", seeds, lambda seed: nes_attack(model, loader, eps=eps, seed=seed, **kwargs))
 
 
 class SubstituteCNN(nn.Module):
@@ -1073,13 +997,7 @@ def random_noise_attack(model, loader, eps=DEFAULT_EPS, n_restarts=1, seed=None)
 
 
 def run_random_noise_seeded(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
-    """Seed-averaged wrapper around random_noise_attack."""
-    accs = [random_noise_attack(model, loader, eps=eps, seed=s) for s in seeds]
-    return {
-        "Random_Noise": float(np.mean(accs)),
-        "Random_Noise_mean": float(np.mean(accs)),
-        "Random_Noise_std": float(np.std(accs)),
-    }
+    return seed_averaged_metrics("Random_Noise", seeds, lambda seed: random_noise_attack(model, loader, eps=eps, seed=seed))
 
 
 def pgd_steps_ablation(model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_STEPS):
@@ -1276,79 +1194,44 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     model.eval()
     results = {"model": name}
 
-    try:
-        results["clean_acc"] = sanity_check_accuracy(model, loader)
-    except Exception as e:
-        print(f"  [WARN] clean_acc failed for {name}: {e}")
-        results["clean_acc"] = None
+    def safe_set(key, fn, warning, default=None):
+        try:
+            results[key] = fn()
+        except Exception as e:
+            print(f"  [WARN] {warning} for {name}: {e}")
+            results[key] = default
 
-    try:
-        results.update(run_fgsm_pgd(model, loader, eps=eps))
-    except Exception as e:
-        print(f"  [WARN] FGSM/PGD failed for {name}: {e}")
-        results["FGSM"] = results.get("FGSM", None)
-        results["PGD"] = results.get("PGD", None)
+    def safe_update(fn, warning, defaults=None):
+        try:
+            results.update(fn())
+        except Exception as e:
+            print(f"  [WARN] {warning} for {name}: {e}")
+            if defaults:
+                for key, value in defaults.items():
+                    results[key] = value() if callable(value) else value
 
-    try:
-        results["AutoAttack"] = run_autoattack(model, loader, eps=eps)
-    except Exception as e:
-        print(f"  [WARN] AutoAttack failed for {name}: {e}")
-        results["AutoAttack"] = None
-
-    try:
-        results.update(run_extra_whitebox_attacks(model, loader, eps=eps))
-    except Exception as e:
-        print(f"  [WARN] CW/DeepFool/JSMA failed for {name}: {e}")
-
-    try:
-        results["Surrogate_Transfer"] = run_surrogate_attack(model, loader, eps=eps)
-    except Exception as e:
-        print(f"  [WARN] surrogate attack failed for {name}: {e}")
-        results["Surrogate_Transfer"] = None
+    safe_set("clean_acc", lambda: sanity_check_accuracy(model, loader), "clean_acc failed")
+    safe_update(
+        lambda: run_fgsm_pgd(model, loader, eps=eps),
+        "FGSM/PGD failed",
+        {"FGSM": lambda: results.get("FGSM", None), "PGD": lambda: results.get("PGD", None)},
+    )
+    safe_set("AutoAttack", lambda: run_autoattack(model, loader, eps=eps), "AutoAttack failed")
+    safe_update(lambda: run_extra_whitebox_attacks(model, loader, eps=eps), "CW/DeepFool/JSMA failed")
+    safe_set("UAP", lambda: run_uap_attack(model, loader, eps=eps), "UAP attack failed")
+    safe_set("Surrogate_Transfer", lambda: run_surrogate_attack(model, loader, eps=eps), "surrogate attack failed")
 
     if fp32_ref is not None:
-        try:
-            results["Transfer_from_FP32"] = transfer_attack(fp32_ref, model, loader, eps=eps)
-        except Exception as e:
-            print(f"  [WARN] transfer_attack failed for {name}: {e}")
-            results["Transfer_from_FP32"] = None
-
-        try:
-            results["MIM_Transfer"] = transfer_attack_mim(fp32_ref, model, loader, eps=eps)
-        except Exception as e:
-            print(f"  [WARN] MIM transfer_attack failed for {name}: {e}")
-            results["MIM_Transfer"] = None
-
-        try:
-            results["UAP_Transfer"] = transfer_uap_attack(fp32_ref, model, loader, eps=eps)
-        except Exception as e:
-            print(f"  [WARN] UAP transfer_attack failed for {name}: {e}")
-            results["UAP_Transfer"] = None
+        safe_set("Transfer_from_FP32", lambda: transfer_attack(fp32_ref, model, loader, eps=eps), "transfer_attack failed")
+        safe_set("MIM_Transfer", lambda: transfer_attack_mim(fp32_ref, model, loader, eps=eps), "MIM transfer_attack failed")
+        safe_set("UAP_Transfer", lambda: transfer_uap_attack(fp32_ref, model, loader, eps=eps), "UAP transfer_attack failed")
 
         if count_quant_layers(model) > 0:
-            try:
-                results["Transfer_to_FP32"] = transfer_attack(model, fp32_ref, loader, eps=eps)
-            except Exception as e:
-                print(f"  [WARN] reverse transfer_attack failed for {name}: {e}")
-                results["Transfer_to_FP32"] = None
+            safe_set("Transfer_to_FP32", lambda: transfer_attack(model, fp32_ref, loader, eps=eps), "reverse transfer_attack failed")
+            safe_set("MIM_Transfer_to_FP32", lambda: transfer_attack_mim(model, fp32_ref, loader, eps=eps), "reverse MIM transfer_attack failed")
+            safe_set("UAP_Transfer_to_FP32", lambda: transfer_uap_attack(model, fp32_ref, loader, eps=eps), "reverse UAP transfer_attack failed")
 
-            try:
-                results["MIM_Transfer_to_FP32"] = transfer_attack_mim(model, fp32_ref, loader, eps=eps)
-            except Exception as e:
-                print(f"  [WARN] reverse MIM transfer_attack failed for {name}: {e}")
-                results["MIM_Transfer_to_FP32"] = None
-
-            try:
-                results["UAP_Transfer_to_FP32"] = transfer_uap_attack(model, fp32_ref, loader, eps=eps)
-            except Exception as e:
-                print(f"  [WARN] reverse UAP transfer_attack failed for {name}: {e}")
-                results["UAP_Transfer_to_FP32"] = None
-
-    try:
-        results.update(run_random_noise_seeded(model, loader, eps=eps))
-    except Exception as e:
-        print(f"  [WARN] random_noise_attack failed for {name}: {e}")
-        results["Random_Noise"] = None
+    safe_update(lambda: run_random_noise_seeded(model, loader, eps=eps), "random_noise_attack failed", {"Random_Noise": None})
 
     try:
         results.update(run_defense_adaptive_attacks(model, loader, eps=eps))
@@ -1365,21 +1248,9 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             results["Adaptive_DetectGuard"] = None
 
     if count_quant_layers(model) > 0:
-        try:
-            results.update(run_bpda(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SUITE))
-        except Exception as e:
-            print(f"  [WARN] BPDA failed for {name}: {e}")
-            results["BPDA_PGD"] = None
-
-        try:
-            results.update(gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=GRAD_DIAG_MAX_BATCHES))
-        except Exception as e:
-            print(f"  [WARN] gradient_diagnostics failed for {name}: {e}")
-
-        try:
-            results.update(staircase_diagnostic(model, loader))
-        except Exception as e:
-            print(f"  [WARN] staircase_diagnostic failed for {name}: {e}")
+        safe_update(lambda: run_bpda(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SUITE), "BPDA failed", {"BPDA_PGD": None})
+        safe_update(lambda: gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=GRAD_DIAG_MAX_BATCHES), "gradient_diagnostics failed")
+        safe_update(lambda: staircase_diagnostic(model, loader), "staircase_diagnostic failed")
 
         try:
             results.update(run_boundary_attack(model, loader, eps=eps, max_images=BOUNDARY_MAX_IMAGES_SUITE, steps=BOUNDARY_STEPS_SUITE, seed=BOUNDARY_SEED))
@@ -1393,23 +1264,22 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             results["Boundary_std_Linf"] = None
             results["Boundary_n"] = 0
 
-        try:
-            results.update(run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=NES_SAMPLES_SUITE, query_chunk=NES_QUERY_CHUNK
-            ))
-        except Exception as e:
-            print(f"  [WARN] NES attack failed for {name}: {e}")
-            results["NES"] = None
+        safe_update(
+            lambda: run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=NES_SAMPLES_SUITE, query_chunk=NES_QUERY_CHUNK),
+            "NES attack failed",
+            {"NES": None},
+        )
 
         try:
             ablation = pgd_steps_ablation(model, loader, eps=eps)
             pd.DataFrame([{"model": name, "steps": k, "acc": v} for k, v in ablation.items()]) \
-                .to_csv(ablation_csv_path(name), index=False)
+                .to_csv(csv_path(name, "ablation"), index=False)
         except Exception as e:
             print(f"  [WARN] pgd_steps_ablation failed for {name}: {e}")
 
         try:
             traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=TRAJECTORY_MAX_BATCHES)
-            with open(trajectory_json_path(name), "w") as f:
+            with open(json_path(name, "trajectory"), "w") as f:
                 json.dump(traj, f, indent=2)
         except Exception as e:
             print(f"  [WARN] pgd_trajectory_diagnostics failed for {name}: {e}")
@@ -1419,20 +1289,20 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             prof_ste = layerwise_grad_profile(model, loader, use_ste=True)
             rows = [{"model": name, "layer": n, "grad_norm_hard": prof_hard.get(n),
                      "grad_norm_ste": prof_ste.get(n)} for n in prof_hard]
-            pd.DataFrame(rows).to_csv(layerwise_csv_path(name), index=False)
+            pd.DataFrame(rows).to_csv(csv_path(name, "layerwise"), index=False)
         except Exception as e:
             print(f"  [WARN] layerwise_grad_profile failed for {name}: {e}")
 
         # weight-only / activation-only / both ablation
         try:
             rows = run_quant_component_ablation(model, loader, name, eps=eps)
-            pd.DataFrame(rows).to_csv(component_ablation_csv_path(name), index=False)
+            pd.DataFrame(rows).to_csv(csv_path(name, "component_ablation"), index=False)
         except Exception as e:
             print(f"  [WARN] run_quant_component_ablation failed for {name}: {e}")
 
         try:
             margins = confidence_margin_diagnostic(model, loader, eps=eps, max_batches=MARGIN_MAX_BATCHES)
-            with open(margin_json_path(name), "w") as f:
+            with open(json_path(name, "margin"), "w") as f:
                 json.dump(margins, f)
         except Exception as e:
             print(f"  [WARN] confidence_margin_diagnostic failed for {name}: {e}")
@@ -1617,7 +1487,7 @@ def plot_epsilon_sweep_curves(df_sweep):
 
 
 def plot_pgd_steps_ablation(model_names):
-    frames = [pd.read_csv(ablation_csv_path(n)) for n in model_names if os.path.exists(ablation_csv_path(n))]
+    frames = [pd.read_csv(csv_path(n, "ablation")) for n in model_names if os.path.exists(csv_path(n, "ablation"))]
     if not frames:
         return
     df_all = pd.concat(frames, ignore_index=True)
@@ -1637,7 +1507,7 @@ def plot_pgd_steps_ablation(model_names):
 def plot_pgd_trajectory(model_names):
     trajs = {}
     for name in model_names:
-        p = trajectory_json_path(name)
+        p = json_path(name, "trajectory")
         if os.path.exists(p):
             with open(p) as f:
                 trajs[name] = json.load(f)
@@ -1669,7 +1539,7 @@ def plot_pgd_trajectory(model_names):
 
 
 def plot_layerwise_grad_profile(model_names):
-    quant_names = [n for n in model_names if os.path.exists(layerwise_csv_path(n))]
+    quant_names = [n for n in model_names if os.path.exists(csv_path(n, "layerwise"))]
     if not quant_names:
         return
 
@@ -1677,7 +1547,7 @@ def plot_layerwise_grad_profile(model_names):
     rows = int(np.ceil(len(quant_names) / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(LAYERWISE_PLOT_WIDTH * cols, LAYERWISE_PLOT_HEIGHT * rows), squeeze=False)
     for i, name in enumerate(quant_names):
-        df = pd.read_csv(layerwise_csv_path(name))
+        df = pd.read_csv(csv_path(name, "layerwise"))
         ax = axes[i // cols][i % cols]
         x = np.arange(len(df))
         ax.plot(x, df["grad_norm_hard"], marker="o", label="hard-round")
@@ -1698,7 +1568,7 @@ def plot_layerwise_grad_profile(model_names):
 
 
 def plot_component_ablation(model_names):
-    frames = [pd.read_csv(component_ablation_csv_path(n)) for n in model_names if os.path.exists(component_ablation_csv_path(n))]
+    frames = [pd.read_csv(csv_path(n, "component_ablation")) for n in model_names if os.path.exists(csv_path(n, "component_ablation"))]
     if not frames:
         return
     df_all = pd.concat(frames, ignore_index=True)
@@ -1712,7 +1582,7 @@ def plot_component_ablation(model_names):
 
 
 def plot_chunk_quantization_attacks(model_names):
-    frames = [pd.read_csv(chunk_quant_csv_path(n)) for n in model_names if os.path.exists(chunk_quant_csv_path(n))]
+    frames = [pd.read_csv(csv_path(n, "chunk_quant")) for n in model_names if os.path.exists(csv_path(n, "chunk_quant"))]
     if not frames:
         return
     df_all = pd.concat(frames, ignore_index=True)
@@ -1762,7 +1632,7 @@ def plot_gradient_masking_summary(df_results):
 def plot_confidence_margin_diagnostic(model_names):
     data = {}
     for name in model_names:
-        p = margin_json_path(name)
+        p = json_path(name, "margin")
         if os.path.exists(p):
             with open(p) as f:
                 data[name] = json.load(f)
@@ -1896,7 +1766,7 @@ def main():
         if entry is None:
             continue
         chunk_model_names.append(arch_key)
-        out_path = chunk_quant_csv_path(arch_key)
+        out_path = csv_path(arch_key, "chunk_quant")
         if os.path.exists(out_path):
             print(f"Skipping chunk quantization for {arch_key} (already in {out_path})")
             continue
