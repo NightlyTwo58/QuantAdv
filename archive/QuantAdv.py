@@ -1485,6 +1485,8 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
         df_defense.to_csv(defense_summary_csv_path(), index=False)
     return model_registry, df_defense
 
+def _palette_for(values):
+    return {v: ATTACK_PALETTE[v] for v in values if v in ATTACK_PALETTE}
 
 def plot_defense_comparison(df_results):
     if df_results is None or df_results.empty:
@@ -1510,7 +1512,7 @@ def plot_defense_comparison(df_results):
     df_long = df_def.melt(id_vars="model", value_vars=cols, var_name="Attack", value_name="Accuracy")
 
     plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
-    sns.barplot(data=df_long, x="model", y="Accuracy", hue="Attack")
+    sns.barplot(data=df_long, x="model", y="Accuracy", hue="Attack", palette=_palette_for(cols))
     plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
     plt.title("Defense Variants: Accuracy under Attack")
     plt.ylim(0, PLOT_MAX_ACCURACY)
@@ -1537,7 +1539,8 @@ def plot_epsilon_sweep_curves(df_sweep):
     fig, axes = plt.subplots(rows, cols, figsize=(SWEEP_PLOT_WIDTH * cols, SWEEP_PLOT_HEIGHT * rows), squeeze=False)
     for i, m in enumerate(models):
         ax = axes[i // cols][i % cols]
-        sns.lineplot(data=df_long[df_long["model"] == m], x="epsilon", y="Accuracy", hue="Attack", marker="o", ax=ax)
+        local = df_long[df_long["model"] == m]
+        sns.lineplot(data=local, x="epsilon", y="Accuracy", hue="Attack", marker="o", palette=_palette_for(value_cols), ax=ax)
         ax.set_title(m)
         ax.set_ylim(0, PLOT_MAX_ACCURACY)
         ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
@@ -1556,7 +1559,7 @@ def plot_pgd_steps_ablation(model_names):
     df_all = pd.concat(frames, ignore_index=True)
 
     plt.figure(figsize=ABLATION_FIGSIZE)
-    sns.lineplot(data=df_all, x="steps", y="acc", hue="model", marker="o")
+    sns.lineplot(data=df_all, x="steps", y="acc", hue="model", marker="o", palette="tab20")
     plt.title("PGD Accuracy vs Number of Steps (Gradient Masking Check)")
     plt.xlabel("PGD steps")
     plt.ylabel("Accuracy")
@@ -1577,11 +1580,12 @@ def plot_pgd_trajectory(model_names):
     if not trajs:
         return
 
+    model_palette = dict(zip(trajs.keys(), sns.color_palette("tab20", n_colors=len(trajs))))
     fig, axes = plt.subplots(1, 2, figsize=TRAJECTORY_FIGSIZE)
     for name, traj in trajs.items():
         steps = range(1, len(traj["grad_norm_per_step"]) + 1)
-        axes[0].plot(steps, traj["grad_norm_per_step"], marker="o", label=name)
-        axes[1].plot(steps, traj["movement_from_random_start_per_step"], marker="o", label=name)
+        axes[0].plot(steps, traj["grad_norm_per_step"], marker="o", label=name, color=model_palette[name])
+        axes[1].plot(steps, traj["movement_from_random_start_per_step"], marker="o", label=name, color=model_palette[name])
 
     axes[0].set_title("Gradient Norm per PGD Step")
     axes[0].set_xlabel("Step")
@@ -1613,8 +1617,8 @@ def plot_layerwise_grad_profile(model_names):
         df = pd.read_csv(csv_path(name, "layerwise"))
         ax = axes[i // cols][i % cols]
         x = np.arange(len(df))
-        ax.plot(x, df["grad_norm_hard"], marker="o", label="hard-round")
-        ax.plot(x, df["grad_norm_ste"], marker="o", label="STE")
+        ax.plot(x, df["grad_norm_hard"], marker="o", label="hard-round", color=ATTACK_PALETTE["hard-round"])
+        ax.plot(x, df["grad_norm_ste"], marker="o", label="STE", color=ATTACK_PALETTE["STE"])
         ax.set_yscale("log")
         ax.set_xticks(x)
         ax.set_xticklabels(df["layer"], rotation=LAYERWISE_XTICK_ROTATION, fontsize=LAYERWISE_XTICK_FONT_SIZE)
@@ -1637,7 +1641,18 @@ def plot_component_ablation(model_names):
     df_all = pd.concat(frames, ignore_index=True)
     df_long = df_all.melt(id_vars=["model", "config"], value_vars=["clean_acc", "PGD_acc"], var_name="Metric", value_name="Accuracy")
 
-    g = sns.catplot(data=df_long, x="config", y="Accuracy", hue="Metric", col="model", kind="bar", col_wrap=COMPONENT_ABLATION_COL_WRAP, height=COMPONENT_ABLATION_HEIGHT, sharey=True)
+    g = sns.catplot(
+        data=df_long,
+        x="config",
+        y="Accuracy",
+        hue="Metric",
+        col="model",
+        kind="bar",
+        col_wrap=COMPONENT_ABLATION_COL_WRAP,
+        height=COMPONENT_ABLATION_HEIGHT,
+        sharey=True,
+        palette=_palette_for(["clean_acc", "PGD_acc"]),
+    )
     g.set_titles("{col_name}")
     g.set(ylim=(0, PLOT_MAX_ACCURACY))
     g.savefig(COMPONENT_ABLATION_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
@@ -1654,7 +1669,18 @@ def plot_chunk_quantization_attacks(model_names):
     if df_long.empty:
         return
 
-    g = sns.catplot(data=df_long, x="chunk_label", y="Accuracy", hue="Metric", col="model", kind="bar", col_wrap=CHUNK_QUANT_COL_WRAP, height=CHUNK_QUANT_HEIGHT, sharey=True)
+    g = sns.catplot(
+        data=df_long,
+        x="chunk_label",
+        y="Accuracy",
+        hue="Metric",
+        col="model",
+        kind="bar",
+        col_wrap=CHUNK_QUANT_COL_WRAP,
+        height=CHUNK_QUANT_HEIGHT,
+        sharey=True,
+        palette=_palette_for(["clean_acc", "PGD_acc"]),
+    )
     g.set_titles("{col_name}")
     g.set_axis_labels("Quantized layer chunk", "Accuracy")
     g.set(ylim=(0, PLOT_MAX_ACCURACY))
@@ -1673,17 +1699,20 @@ def plot_gradient_masking_summary(df_results):
     df["PGD_minus_AutoAttack"] = df["PGD"] - df["AutoAttack"]
 
     fig, axes = plt.subplots(1, 2, figsize=MASKING_SUMMARY_FIGSIZE)
-    sns.barplot(data=df, x="model", y="PGD_minus_AutoAttack", ax=axes[0])
-    axes[0].axhline(0, color="black", linewidth=MASKING_BASELINE_LINEWIDTH)
+    sns.barplot(data=df, x="model", y="PGD_minus_AutoAttack", ax=axes[0], color=ATTACK_PALETTE["PGD"])
+    axes[0].axhline(0, color=BASELINE_COLOR, linewidth=MASKING_BASELINE_LINEWIDTH)
     axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=SUMMARY_XTICK_ROTATION, ha="right")
     axes[0].set_title("PGD - AutoAttack Accuracy Gap")
     axes[0].grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
 
     if "frac_zero_grad_hard" in df.columns:
         df2 = df.dropna(subset=["frac_zero_grad_hard"])
-        sns.scatterplot(data=df2, x="frac_zero_grad_hard", y="PGD_minus_AutoAttack", hue="model", s=MASKING_SCATTER_SIZE, ax=axes[1])
-        axes[1].set_title("Masking Gap vs Fraction of Zero Gradients")
-        axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
+        if not df2.empty:
+            sns.scatterplot(data=df2, x="frac_zero_grad_hard", y="PGD_minus_AutoAttack", hue="model", s=MASKING_SCATTER_SIZE, ax=axes[1], palette="tab20")
+            axes[1].set_title("Masking Gap vs Fraction of Zero Gradients")
+            axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
+        else:
+            axes[1].axis("off")
     else:
         axes[1].axis("off")
 
@@ -1707,8 +1736,8 @@ def plot_confidence_margin_diagnostic(model_names):
     fig, axes = plt.subplots(rows, cols, figsize=(MARGIN_PLOT_WIDTH * cols, MARGIN_PLOT_HEIGHT * rows), squeeze=False)
     for i, (name, margins) in enumerate(data.items()):
         ax = axes[i // cols][i % cols]
-        ax.hist(margins["clean_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="clean", density=True)
-        ax.hist(margins["adv_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="PGD-adv", density=True)
+        ax.hist(margins["clean_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="clean", density=True, color=ATTACK_PALETTE["clean"])
+        ax.hist(margins["adv_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="PGD-adv", density=True, color=ATTACK_PALETTE["PGD-adv"])
         ax.set_title(name)
         ax.set_xlabel("Top1 - Top2 Softmax Margin")
         ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
@@ -1720,6 +1749,41 @@ def plot_confidence_margin_diagnostic(model_names):
     fig.savefig(MARGIN_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
 
+def plot_accuracy_summary(df_results):
+    if df_results is None or df_results.empty:
+        return
+
+    acc_cols = [
+        c for c in [
+            "clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
+            "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
+            "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
+            "Surrogate_Transfer", "Random_Noise", "BPDA_PGD",
+            "BPDA_Adaptive", "EOT_PGD", "Adaptive_Guardrail", "Adaptive_DetectGuard",
+            "NES", "Boundary_acc",
+        ]
+        if c in df_results.columns and df_results[c].notna().any()
+    ]
+
+    if not acc_cols:
+        return
+
+    df_plot = df_results.melt(
+        id_vars="model",
+        value_vars=acc_cols,
+        var_name="Metric",
+        value_name="Accuracy",
+    )
+
+    plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
+    sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Metric", palette=_palette_for(acc_cols))
+    plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
+    plt.title("Model Accuracy under Various Adversarial Attacks")
+    plt.ylim(0, PLOT_MAX_ACCURACY)
+    plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
+    plt.tight_layout()
+    plt.savefig(PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
+    plt.show()
 
 def plot_results_heatmap(df_results):
     if df_results is None or df_results.empty:
@@ -1949,25 +2013,10 @@ def main():
 
     df_results.to_csv(RESULTS_CSV, index=False)
 
-    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
-                             "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
-                             "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
-                             "Surrogate_Transfer", "Random_Noise", "BPDA_PGD",
-                             "BPDA_Adaptive", "EOT_PGD", "Adaptive_Guardrail", "Adaptive_DetectGuard"]
-                if c in df_results.columns]
-
-    if len(acc_cols) > 0:
-        df_plot = df_results.melt(id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy")
-
-        plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
-        sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Attack")
-        plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
-        plt.title("Model Accuracy under Various Adversarial Attacks")
-        plt.ylim(0, PLOT_MAX_ACCURACY)
-        plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
-        plt.tight_layout()
-        plt.savefig(PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-        plt.show()
+    try:
+        plot_accuracy_summary(df_results)
+    except Exception as e:
+        print(f"  [WARN] plot_accuracy_summary failed: {e}")
 
     if os.path.exists(SWEEP_CSV):
         df_sweep = pd.read_csv(SWEEP_CSV)

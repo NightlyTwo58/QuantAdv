@@ -213,3 +213,38 @@ HEATMAP_MIN_WIDTH = 10
 HEATMAP_MIN_HEIGHT = 6
 HEATMAP_ROW_HEIGHT = 0.5
 SUMMARY_PLOT_FIGSIZE = (14, 6)
+
+ATTACK_PALETTE = {
+    "clean_acc": "#4D4D4D",
+    "FGSM": "#1F77B4",
+    "PGD": "#D62728",
+    "CW": "#9467BD",
+    "DeepFool": "#8C564B",
+    "JSMA": "#E377C2",
+    "AutoAttack": "#000000",
+    "Transfer_from_FP32": "#17BECF",
+    "MIM_Transfer": "#2CA02C",
+    "UAP_Transfer": "#BCBD22",
+    "Transfer_to_FP32": "#00A6D6",
+    "MIM_Transfer_to_FP32": "#228B22",
+    "UAP_Transfer_to_FP32": "#9ACD32",
+    "Surrogate_Transfer": "#FF7F0E",
+    "Random_Noise": "#7F7F7F",
+    "BPDA_PGD": "#B22222",
+    "BPDA_Adaptive": "#FF9896",
+    "EOT_PGD": "#C5B0D5",
+    "Adaptive_Guardrail": "#AEC7E8",
+    "Adaptive_DetectGuard": "#FDBF6F",
+    "NES": "#6A3D9A",
+    "Boundary_acc": "#A65628",
+    "PGD_acc": "#D62728",
+    "Random_Noise_acc": "#7F7F7F",
+    "BPDA_acc": "#B22222",
+    "clean": "#4D4D4D",
+    "PGD-adv": "#D62728",
+    "hard-round": "#D62728",
+    "STE": "#1F77B4",
+}
+
+HEATMAP_CMAP = "RdYlGn"
+BASELINE_COLOR = "black"
