@@ -35,7 +35,7 @@ HEATMAP_PLOT_PNG = os.path.join(DATA_DIR, "heatmapplot.png")
 SEEDS = [0, 1, 2]
 
 PRETRAINED_NAMES = {
-    "ResNet20": "cifar10_resnet20",
+    # "ResNet20": "cifar10_resnet20",
     "ResNet56": "cifar10_resnet56",
     # "MobileNetV2": "cifar10_mobilenetv2_x1_0",
     # "VGG16_BN": "cifar10_vgg16_bn",

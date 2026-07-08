@@ -14,6 +14,7 @@ import os
 import json
 import traceback
 import sys
+import warnings
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.amp import autocast, GradScaler
@@ -878,14 +879,8 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=BOUN
 
 def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_IMAGES_DEFAULT, steps=BOUNDARY_STEPS_DEFAULT, seed=BOUNDARY_SEED):
     """
-    Runs the Boundary Attack on up to `max_images` correctly-classified
-    examples (it is inherently per-sample and query-heavy, so the full eval
-    set is not used) and reports:
-      - Boundary_acc: fraction of attacked images whose minimal Linf
-        perturbation exceeds eps, i.e. would still be correctly classified
-        within an eps budget -- directly comparable to the other
-        robust-accuracy columns produced elsewhere in this file.
-      - Boundary_mean_Linf: mean minimal Linf distance to the boundary found.
+    Runs the Boundary Attack on up to `max_images` loader examples and reports
+    estimated robust accuracy over that same subset.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -893,23 +888,31 @@ def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_
     clip_min, clip_max = CLIP_MIN.squeeze(0).to(device), CLIP_MAX.squeeze(0).to(device)
 
     dists = []
-    n_seen = 0
+    total_seen = 0
+    clean_correct = 0
+    robust_correct = 0
     for x, y in loader:
-        if n_seen >= max_images:
+        if total_seen >= max_images:
             break
         x, y = x.to(device), y.to(device)
         with torch.no_grad():
             pred = model(x).argmax(dim=1)
         for i in range(x.size(0)):
-            if n_seen >= max_images:
+            if total_seen >= max_images:
                 break
-            if pred[i] != y[i]:
-                continue  # only attack already-correctly-classified examples
+            total_seen += 1
+            if (pred[i] != y[i]).item():
+                continue
+            clean_correct += 1
             x_adv = boundary_attack_single(model, x[i], y[i], clip_min, clip_max, steps=steps)
-            dists.append((x_adv - x[i]).abs().max().item())
-            n_seen += 1
+            dist = (denormalize_inputs(x_adv.unsqueeze(0)) - denormalize_inputs(x[i].unsqueeze(0))).abs().max().item()
+            adv_found = (_predict_batch(model, x_adv.unsqueeze(0))[0] != y[i]).item()
+            if adv_found:
+                dists.append(dist)
+            if (not adv_found) or dist > eps:
+                robust_correct += 1
 
-    if not dists:
+    if total_seen == 0:
         return {
             "Boundary_acc": None,
             "Boundary_mean_Linf": None,
@@ -921,14 +924,21 @@ def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_
         }
 
     dists = np.array(dists, dtype=float)
+    boundary_acc = robust_correct / total_seen
+    clean_subset_acc = clean_correct / total_seen
+    if boundary_acc > clean_subset_acc + 1e-12:
+        warnings.warn(
+            "Boundary_acc exceeded clean accuracy on the evaluated subset; the old subset-only metric could do this because it divided only by clean-correct attacked samples.",
+            RuntimeWarning,
+        )
     return {
-        "Boundary_acc": float((dists > eps).mean()),
-        "Boundary_mean_Linf": float(dists.mean()),
-        "Boundary_median_Linf": float(np.median(dists)),
-        "Boundary_min_Linf": float(dists.min()),
-        "Boundary_max_Linf": float(dists.max()),
-        "Boundary_std_Linf": float(dists.std()),
-        "Boundary_n": int(len(dists)),
+        "Boundary_acc": float(boundary_acc),
+        "Boundary_mean_Linf": float(dists.mean()) if dists.size else None,
+        "Boundary_median_Linf": float(np.median(dists)) if dists.size else None,
+        "Boundary_min_Linf": float(dists.min()) if dists.size else None,
+        "Boundary_max_Linf": float(dists.max()) if dists.size else None,
+        "Boundary_std_Linf": float(dists.std()) if dists.size else None,
+        "Boundary_n": int(total_seen),
     }
 
 
