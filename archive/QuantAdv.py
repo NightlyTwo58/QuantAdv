@@ -19,10 +19,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.amp import autocast, GradScaler
 
-try:
-    from pytorchcv.model_provider import get_model as ptcv_get_model
-except ImportError:
-    ptcv_get_model = None
+from pytorchcv.model_provider import get_model as ptcv_get_model
 
 import torchattacks
 from autoattack import AutoAttack
@@ -452,50 +449,66 @@ def seed_averaged_metrics(name, seeds, fn):
 
 def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
     model.eval()
-    fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
-    out = {}
+    set_ste_mode(model, True)
+    try:
+        fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
+        out = {}
 
-    out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
+        out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
 
-    def run_seed(seed):
-        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-        return accuracy_under_attack(model, loader, pgd)
+        def run_seed(seed):
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+            return accuracy_under_attack(model, loader, pgd)
 
-    out.update(seed_averaged_metrics("PGD", seeds, run_seed))
-    return out
+        out.update(seed_averaged_metrics("PGD", seeds, run_seed))
+        return out
+    finally:
+        set_ste_mode(model, False)
 
 
 def run_autoattack(model, loader, eps=DEFAULT_EPS):
     model.eval()
-    pixel_model = PixelSpaceModel(model).to(device).eval()
-    adversary = AutoAttack(pixel_model, norm=AUTOATTACK_NORM, eps=eps, version=AUTOATTACK_VERSION, device=device, verbose=AUTOATTACK_VERBOSE)
-    adversary.seed = AUTOATTACK_SEED
-    def adv_fn(x, y):
-        x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
-        return normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
+    set_ste_mode(model, True)
+    try:
+        pixel_model = PixelSpaceModel(model).to(device).eval()
+        adversary = AutoAttack(pixel_model, norm=AUTOATTACK_NORM, eps=eps, version=AUTOATTACK_VERSION, device=device, verbose=AUTOATTACK_VERBOSE)
+        adversary.seed = AUTOATTACK_SEED
+        def adv_fn(x, y):
+            x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
+            return normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
 
-    return accuracy_from_adv_fn(model, loader, adv_fn)
+        return accuracy_from_adv_fn(model, loader, adv_fn)
+    finally:
+        set_ste_mode(model, False)
 
 
 def run_extra_whitebox_attacks(model, loader, eps=DEFAULT_EPS, jsma_max_images=JSMA_MAX_IMAGES):
     model.eval()
-    out = {}
+    set_ste_mode(model, True)
+    try:
+        out = {}
 
-    cw = make_torchattack(torchattacks.CW, model, c=CW_C, kappa=CW_KAPPA, steps=CW_STEPS, lr=CW_LR)
-    out["CW"] = accuracy_under_attack(model, loader, cw)
+        cw = make_torchattack(torchattacks.CW, model, c=CW_C, kappa=CW_KAPPA, steps=CW_STEPS, lr=CW_LR)
+        out["CW"] = accuracy_under_attack(model, loader, cw)
 
-    deepfool = make_torchattack(torchattacks.DeepFool, model, steps=DEEPFOOL_STEPS, overshoot=DEEPFOOL_OVERSHOOT)
-    out["DeepFool"] = accuracy_under_attack(model, loader, deepfool)
+        deepfool = make_torchattack(torchattacks.DeepFool, model, steps=DEEPFOOL_STEPS, overshoot=DEEPFOOL_OVERSHOOT)
+        out["DeepFool"] = accuracy_under_attack(model, loader, deepfool)
 
-    jsma = make_torchattack(torchattacks.JSMA, model, theta=JSMA_THETA, gamma=JSMA_GAMMA)
-    out["JSMA"] = accuracy_under_attack(model, loader, jsma, max_images=jsma_max_images)
+        jsma = make_torchattack(torchattacks.JSMA, model, theta=JSMA_THETA, gamma=JSMA_GAMMA)
+        out["JSMA"] = accuracy_under_attack(model, loader, jsma, max_images=jsma_max_images)
 
-    return out
+        return out
+    finally:
+        set_ste_mode(model, False)
 
 
 def transfer_attack(source_model, target_model, loader, eps=DEFAULT_EPS):
-    pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-    return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
+    set_ste_mode(source_model, True)
+    try:
+        pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+        return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
+    finally:
+        set_ste_mode(source_model, False)
 
 
 def transfer_attack_mim(source_model, target_model, loader, eps=DEFAULT_EPS):
