@@ -83,32 +83,84 @@ def pgd_steps_ablation(model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_ST
     return out
 
 
-def pgd_trajectory_diagnostics(model, loader, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS, max_batches=TRAJECTORY_MAX_BATCHES):
+def pgd_trajectory_diagnostics(
+    model,
+    loader,
+    eps=DEFAULT_EPS,
+    alpha=PGD_ALPHA,
+    steps=PGD_STEPS,
+    max_batches=TRAJECTORY_MAX_BATCHES,
+):
     model.eval()
-    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     step_grad_norms = [0.0] * steps
     step_movement = [0.0] * steps
     n_batches = 0
-    for bi, (x, y) in enumerate(loader):
-        if bi >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        noise = torch.empty_like(x).uniform_(-eps, eps)
-        x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
-        x_adv = x_start.clone()
-        for s in range(steps):
-            x_adv.requires_grad_(True)
-            loss = F.cross_entropy(model(x_adv), y)
-            grad = torch.autograd.grad(loss, x_adv)[0]
-            step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
-            x_adv = x_adv.detach() + alpha * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-            step_movement[s] += (x_adv - x_start).flatten(1).abs().max(dim=1).values.mean().item()
-        n_batches += 1
+
+    # Quantized models need STE so that gradients can pass through rounding.
+    set_ste_mode(model, True)
+
+    try:
+        for bi, (x, y) in enumerate(loader):
+            if bi >= max_batches:
+                break
+
+            x, y = x.to(device), y.to(device)
+
+            # eps and alpha are defined in pixel space.
+            x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
+
+            noise = torch.empty_like(x_pixel).uniform_(-eps, eps)
+            x_start = (x_pixel + noise).clamp(0.0, 1.0).detach()
+            x_adv = x_start.clone()
+
+            for s in range(steps):
+                x_adv.requires_grad_(True)
+
+                # Normalize only when feeding the image into the model.
+                logits = model(normalize_pixels(x_adv))
+                loss = F.cross_entropy(logits, y)
+                grad = torch.autograd.grad(loss, x_adv)[0]
+
+                step_grad_norms[s] += (
+                    grad.flatten(1).norm(dim=1).mean().item()
+                )
+
+                x_adv = x_adv.detach() + alpha * grad.sign()
+
+                # Project into the epsilon ball around the original image.
+                x_adv = torch.max(
+                    torch.min(x_adv, x_pixel + eps),
+                    x_pixel - eps,
+                )
+                x_adv = x_adv.clamp(0.0, 1.0).detach()
+
+                step_movement[s] += (
+                    (x_adv - x_start)
+                    .flatten(1)
+                    .abs()
+                    .max(dim=1)
+                    .values
+                    .mean()
+                    .item()
+                )
+
+            n_batches += 1
+    finally:
+        set_ste_mode(model, False)
+
+    if n_batches == 0:
+        return {
+            "grad_norm_per_step": step_grad_norms,
+            "movement_from_random_start_per_step": step_movement,
+        }
+
     return {
-        "grad_norm_per_step": [g / n_batches for g in step_grad_norms],
-        "movement_from_random_start_per_step": [m / n_batches for m in step_movement],
+        "grad_norm_per_step": [
+            value / n_batches for value in step_grad_norms
+        ],
+        "movement_from_random_start_per_step": [
+            value / n_batches for value in step_movement
+        ],
     }
 
 
