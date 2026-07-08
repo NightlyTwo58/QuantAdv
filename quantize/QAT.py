@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 
+"""
+Not in use currently.
+"""
 
 class FakeIntQuantSTE(torch.autograd.Function):
     """

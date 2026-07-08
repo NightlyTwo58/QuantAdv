@@ -19,6 +19,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.amp import autocast, GradScaler
 
+from pytorchcv.model_provider import get_model as ptcv_get_model
+
 import torchattacks
 from autoattack import AutoAttack
 
@@ -47,7 +49,7 @@ def defense_summary_csv_path():
     return os.path.join(DATA_DIR, "defense_summary.csv")
 
 def check_environment():
-    missing = [pkg for pkg in ("torchattacks", "autoattack") if importlib.util.find_spec(pkg) is None]
+    missing = [pkg for pkg in ("torchattacks", "autoattack", "pytorchcv") if importlib.util.find_spec(pkg) is None]
     if missing:
         raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
     print("All required packages are available.")
@@ -89,8 +91,12 @@ def get_dataloaders(batch_size=DEFAULT_BATCH_SIZE, eval_n=DEFAULT_EVAL_N, finetu
 
 
 def load_pretrained(arch_key):
-    hub_name = PRETRAINED_NAMES[arch_key]
-    model = torch.hub.load("chenyaofo/pytorch-cifar-models", hub_name, pretrained=True)
+    if arch_key != "ResNet56":
+        raise ValueError(f"Unsupported architecture {arch_key!r}; expected 'ResNet56'.")
+    if ptcv_get_model is None:
+        raise ImportError("Missing package 'pytorchcv'. Install via: pip install -r requirements.txt")
+    model_name = PRETRAINED_NAMES[arch_key]
+    model = ptcv_get_model(model_name, pretrained=True, root=PYTORCHCV_MODEL_DIR)
     return model.to(device).eval()
 
 
@@ -280,6 +286,20 @@ def count_quant_layers(model):
     return sum(1 for m in model.modules() if isinstance(m, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)))
 
 
+def verify_quantization_layers(arch_key, fp32_model, quant_model, label, fp32_layer_names=None):
+    fp32_layer_names = quantizable_layer_names(fp32_model) if fp32_layer_names is None else fp32_layer_names
+    if not fp32_layer_names:
+        raise RuntimeError(f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers.")
+    quant_count = count_quant_layers(quant_model)
+    threshold = int(np.ceil(0.8 * len(fp32_layer_names)))
+    print(f"  {label} quantized layers: {quant_count}")
+    if quant_count < threshold:
+        raise RuntimeError(
+            f"{arch_key} {label} replaced {quant_count}/{len(fp32_layer_names)} quantizable layers; expected at least {threshold}."
+        )
+    return quant_count
+
+
 def set_quant_components(model, quant_weight, quant_act):
     for mod in model.modules():
         if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
@@ -429,50 +449,66 @@ def seed_averaged_metrics(name, seeds, fn):
 
 def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
     model.eval()
-    fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
-    out = {}
+    set_ste_mode(model, True)
+    try:
+        fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
+        out = {}
 
-    out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
+        out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
 
-    def run_seed(seed):
-        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-        return accuracy_under_attack(model, loader, pgd)
+        def run_seed(seed):
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+            return accuracy_under_attack(model, loader, pgd)
 
-    out.update(seed_averaged_metrics("PGD", seeds, run_seed))
-    return out
+        out.update(seed_averaged_metrics("PGD", seeds, run_seed))
+        return out
+    finally:
+        set_ste_mode(model, False)
 
 
 def run_autoattack(model, loader, eps=DEFAULT_EPS):
     model.eval()
-    pixel_model = PixelSpaceModel(model).to(device).eval()
-    adversary = AutoAttack(pixel_model, norm=AUTOATTACK_NORM, eps=eps, version=AUTOATTACK_VERSION, device=device, verbose=AUTOATTACK_VERBOSE)
-    adversary.seed = AUTOATTACK_SEED
-    def adv_fn(x, y):
-        x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
-        return normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
+    set_ste_mode(model, True)
+    try:
+        pixel_model = PixelSpaceModel(model).to(device).eval()
+        adversary = AutoAttack(pixel_model, norm=AUTOATTACK_NORM, eps=eps, version=AUTOATTACK_VERSION, device=device, verbose=AUTOATTACK_VERBOSE)
+        adversary.seed = AUTOATTACK_SEED
+        def adv_fn(x, y):
+            x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
+            return normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
 
-    return accuracy_from_adv_fn(model, loader, adv_fn)
+        return accuracy_from_adv_fn(model, loader, adv_fn)
+    finally:
+        set_ste_mode(model, False)
 
 
 def run_extra_whitebox_attacks(model, loader, eps=DEFAULT_EPS, jsma_max_images=JSMA_MAX_IMAGES):
     model.eval()
-    out = {}
+    set_ste_mode(model, True)
+    try:
+        out = {}
 
-    cw = make_torchattack(torchattacks.CW, model, c=CW_C, kappa=CW_KAPPA, steps=CW_STEPS, lr=CW_LR)
-    out["CW"] = accuracy_under_attack(model, loader, cw)
+        cw = make_torchattack(torchattacks.CW, model, c=CW_C, kappa=CW_KAPPA, steps=CW_STEPS, lr=CW_LR)
+        out["CW"] = accuracy_under_attack(model, loader, cw)
 
-    deepfool = make_torchattack(torchattacks.DeepFool, model, steps=DEEPFOOL_STEPS, overshoot=DEEPFOOL_OVERSHOOT)
-    out["DeepFool"] = accuracy_under_attack(model, loader, deepfool)
+        deepfool = make_torchattack(torchattacks.DeepFool, model, steps=DEEPFOOL_STEPS, overshoot=DEEPFOOL_OVERSHOOT)
+        out["DeepFool"] = accuracy_under_attack(model, loader, deepfool)
 
-    jsma = make_torchattack(torchattacks.JSMA, model, theta=JSMA_THETA, gamma=JSMA_GAMMA)
-    out["JSMA"] = accuracy_under_attack(model, loader, jsma, max_images=jsma_max_images)
+        jsma = make_torchattack(torchattacks.JSMA, model, theta=JSMA_THETA, gamma=JSMA_GAMMA)
+        out["JSMA"] = accuracy_under_attack(model, loader, jsma, max_images=jsma_max_images)
 
-    return out
+        return out
+    finally:
+        set_ste_mode(model, False)
 
 
 def transfer_attack(source_model, target_model, loader, eps=DEFAULT_EPS):
-    pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-    return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
+    set_ste_mode(source_model, True)
+    try:
+        pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+        return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
+    finally:
+        set_ste_mode(source_model, False)
 
 
 def transfer_attack_mim(source_model, target_model, loader, eps=DEFAULT_EPS):
@@ -1704,6 +1740,11 @@ def main():
         print(f"\n>>> {arch_key} <<<")
         try:
             fp32 = load_pretrained(arch_key)
+            fp32_layer_names = quantizable_layer_names(fp32)
+            print(f"  FP32 quantizable nn.Conv2d/nn.Linear layers: {len(fp32_layer_names)}")
+            print(f"  first quantizable layers: {fp32_layer_names[:8]}")
+            if not fp32_layer_names:
+                raise RuntimeError(f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers.")
             acc = sanity_check_accuracy(fp32, eval_loader)
             print(f"  loaded pretrained {arch_key}, clean acc: {acc:.3f}")
             model_registry[f"{arch_key}_FP32"] = (fp32, None)
@@ -1714,20 +1755,40 @@ def main():
 
         try:
             int8_ptq = convert_to_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
+            verify_quantization_layers(arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names)
             model_registry[f"{arch_key}_int8_PTQ"] = (int8_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 PTQ for {arch_key}: {e}")
+            traceback.print_exc()
+            raise
+
+        try:
+            int4_ptq = convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True)
+            verify_quantization_layers(arch_key, fp32, int4_ptq, "int4 PTQ", fp32_layer_names)
+            model_registry[f"{arch_key}_int4_PTQ"] = (int4_ptq, fp32)
+        except Exception as e:
+            print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
+            traceback.print_exc()
+            raise
+
+        try:
+            int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS)
+            verify_quantization_layers(arch_key, fp32, int8_qat, "int8 QAT", fp32_layer_names)
+            model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
+        except Exception as e:
+            print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
+            traceback.print_exc()
+            raise
+
+        if QUANTIZATION_DEBUG_ONLY:
+            print("\nQUANTIZATION_DEBUG_ONLY=True; exiting before defenses, attacks, sweeps, and plots.")
+            print("Registry built:", list(model_registry.keys()))
+            return
 
         try:
             model_registry[f"{arch_key}_FP32_Compressed"] = (with_image_compression(fp32), fp32)
         except Exception as e:
             print(f"  [FAIL] compressed FP32 for {arch_key}: {e}")
-
-        try:
-            int4_ptq = convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True)
-            model_registry[f"{arch_key}_int4_PTQ"] = (int4_ptq, fp32)
-        except Exception as e:
-            print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
 
         try:
             chaotic_int8_ptq = convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
@@ -1746,13 +1807,6 @@ def main():
             model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (compressed_chaotic_int8, fp32)
         except Exception as e:
             print(f"  [FAIL] compressed chaotic int8 PTQ for {arch_key}: {e}")
-
-        try:
-            int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS)
-            model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
-        except Exception as e:
-            print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
-            traceback.print_exc()
 
         try:
             chaotic_int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS, chaotic=True)

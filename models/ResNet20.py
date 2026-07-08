@@ -1,5 +1,9 @@
 import torch
 
+"""
+Not in use currently.
+"""
+
 def ResNet3x3Conv(in_channels: int, out_channels: int, stride=1) -> torch.nn.Conv2d:
     """
     3x3 convolution

@@ -18,6 +18,7 @@ PROJECT_ROOT = CONFIG_DIR.parent if CONFIG_DIR.name in {"archive", "src"} else C
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 CIFAR10_DIR = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
+PYTORCHCV_MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "pytorchcv")
 
 RESULTS_CSV = os.path.join(DATA_DIR, "accuracyresult.csv")
 SWEEP_CSV = os.path.join(DATA_DIR, "sweepresult.csv")
@@ -35,13 +36,10 @@ HEATMAP_PLOT_PNG = os.path.join(DATA_DIR, "heatmapplot.png")
 SEEDS = [0, 1, 2]
 
 PRETRAINED_NAMES = {
-    # "ResNet20": "cifar10_resnet20",
-    "ResNet56": "cifar10_resnet56",
-    # "MobileNetV2": "cifar10_mobilenetv2_x1_0",
-    # "VGG16_BN": "cifar10_vgg16_bn",
-    # "ShuffleNetV2": "cifar10_shufflenetv2_x1_0",
-    # "RepVGG_A0": "cifar10_repvgg_a0",
+    "ResNet56": "resnet56_cifar10",
 }
+
+QUANTIZATION_DEBUG_ONLY = False
 
 CIFAR_MEAN_VALUES = (0.4914, 0.4822, 0.4465)
 CIFAR_STD_VALUES = (0.2023, 0.1994, 0.2010)
@@ -52,11 +50,11 @@ CLIP_MAX = (1.0 - CIFAR_MEAN) / CIFAR_STD
 CLIP_MIN_DEV = CLIP_MIN.to(device)
 CLIP_MAX_DEV = CLIP_MAX.to(device)
 
-DEFAULT_BATCH_SIZE = 1024
+DEFAULT_BATCH_SIZE = 512
 DEFAULT_EVAL_N = 2000
 DEFAULT_FINETUNE_N = 4000
 DEFAULT_EVAL_BATCH_SIZE = 100
-MAX_DATA_WORKERS = 16
+MAX_DATA_WORKERS = 8
 PIN_MEMORY = True
 
 CIFAR_IMAGE_SIZE = 32

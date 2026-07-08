@@ -1,10 +1,5 @@
 """
 Central configuration and constants for the quantadv package.
-
-Includes device selection, CIFAR-10 normalization/clipping statistics, the
-project/data directory locations, and the set of pretrained CIFAR-10
-architectures used throughout the quantization + adversarial-robustness
-pipeline.
 """
 import logging
 import os
@@ -12,39 +7,61 @@ from pathlib import Path
 
 import torch
 
-# Silence a noisy torchao/torch.utils._pytree warning that otherwise clutters
-# every run's output.
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE_TYPE = device.type
 USE_AMP = torch.cuda.is_available()
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
+CONFIG_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CONFIG_DIR.parent if CONFIG_DIR.name in {"archive", "src"} else CONFIG_DIR
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+CIFAR10_DIR = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
+PYTORCHCV_MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "pytorchcv")
 
-RESULTS_CSV = os.path.join(DATA_DIR, "results.csv")
-SWEEP_CSV = os.path.join(DATA_DIR, "results_sweep.csv")
-PLOT_PNG = os.path.join(DATA_DIR, "accuracy_plot.png")
+RESULTS_CSV = os.path.join(DATA_DIR, "accuracyresult.csv")
+SWEEP_CSV = os.path.join(DATA_DIR, "sweepresult.csv")
+PLOT_PNG = os.path.join(DATA_DIR, "accuracyplot.png")
+SWEEP_PLOT_PNG = os.path.join(DATA_DIR, "sweepplot.png")
+ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "ablationplot.png")
+TRAJECTORY_PLOT_PNG = os.path.join(DATA_DIR, "trajectoryplot.png")
+LAYERWISE_PLOT_PNG = os.path.join(DATA_DIR, "layerwiseplot.png")
+COMPONENT_ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "componentablationplot.png")
+CHUNK_QUANT_PLOT_PNG = os.path.join(DATA_DIR, "chunkquantplot.png")
+MASKING_SUMMARY_PLOT_PNG = os.path.join(DATA_DIR, "maskingsummaryplot.png")
+MARGIN_PLOT_PNG = os.path.join(DATA_DIR, "marginplot.png")
+HEATMAP_PLOT_PNG = os.path.join(DATA_DIR, "heatmapplot.png")
 
 SEEDS = [0, 1, 2]
 
 PRETRAINED_NAMES = {
-    "ResNet20": "cifar10_resnet20",
-    "ResNet56": "cifar10_resnet56",
-    "MobileNetV2": "cifar10_mobilenetv2_x1_0",
-    "VGG16_BN": "cifar10_vgg16_bn",
-    "ShuffleNetV2": "cifar10_shufflenetv2_x1_0",
-    "RepVGG_A0": "cifar10_repvgg_a0",
+    "ResNet56": "resnet56_cifar10",
 }
 
-CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
-CIFAR_STD = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
+QUANTIZATION_DEBUG_ONLY = False
+
+CIFAR_MEAN_VALUES = (0.4914, 0.4822, 0.4465)
+CIFAR_STD_VALUES = (0.2023, 0.1994, 0.2010)
+CIFAR_MEAN = torch.tensor(CIFAR_MEAN_VALUES).view(1, 3, 1, 1)
+CIFAR_STD = torch.tensor(CIFAR_STD_VALUES).view(1, 3, 1, 1)
 CLIP_MIN = (0.0 - CIFAR_MEAN) / CIFAR_STD
 CLIP_MAX = (1.0 - CIFAR_MEAN) / CIFAR_STD
 CLIP_MIN_DEV = CLIP_MIN.to(device)
 CLIP_MAX_DEV = CLIP_MAX.to(device)
+
+DEFAULT_BATCH_SIZE = 512
+DEFAULT_EVAL_N = 2000
+DEFAULT_FINETUNE_N = 4000
+DEFAULT_EVAL_BATCH_SIZE = 100
+MAX_DATA_WORKERS = 8
+PIN_MEMORY = True
+
+CIFAR_IMAGE_SIZE = 32
+CIFAR_RANDOM_CROP_PADDING = 4
+CIFAR_DOWNLOAD = False
+TRAIN_SHUFFLE = True
+EVAL_SHUFFLE = False
 
 QUANT_SCALE_MIN = 1e-8
 QUANT_DEFAULT_USE_STE = False
@@ -56,6 +73,31 @@ CHAOTIC_QUANT_R = 3.99
 CHAOTIC_QUANT_MU = 1.999
 CHAOTIC_QUANT_DITHER = 0.5
 CHAOTIC_QUANT_WARMUP = 17
+COMPRESS_IMAGE_SIZE = 24
+COMPRESS_IMAGE_BITS = 5
+COMPRESS_IMAGE_MODE = "bilinear"
+COMPRESS_IMAGE_ALIGN_CORNERS = False
+
+SUBSTITUTE_CONV1_CHANNELS = 32
+SUBSTITUTE_CONV2_CHANNELS = 64
+SUBSTITUTE_KERNEL_SIZE = 3
+SUBSTITUTE_CONV_PADDING = 1
+SUBSTITUTE_POOL_KERNEL = 2
+SUBSTITUTE_LINEAR_FEATURE_MAP = 8
+SUBSTITUTE_HIDDEN_DIM = 256
+SUBSTITUTE_RELU_INPLACE = True
+
+PLOT_GRID_ALPHA = 0.6
+SUMMARY_GRID_ALPHA = 0.7
+PLOT_LEGEND_FONT_SIZE = 8
+LAYERWISE_XTICK_ROTATION = 90
+LAYERWISE_XTICK_FONT_SIZE = 6
+SUMMARY_XTICK_ROTATION = 45
+MASKING_BASELINE_LINEWIDTH = 0.8
+MASKING_SCATTER_SIZE = 80
+HEATMAP_VMIN = 0
+HEATMAP_VMAX = 1
+HEATMAP_LINEWIDTHS = 0.5
 
 DEFAULT_EPS = 8 / 255
 PGD_ALPHA = 2 / 255
@@ -71,4 +113,103 @@ QAT_WEIGHT_DECAY = 5e-4
 
 PTQ_BITS = (8, 4)
 
+AUTOATTACK_NORM = "Linf"
+AUTOATTACK_VERSION = "standard"
+AUTOATTACK_SEED = 0
+AUTOATTACK_VERBOSE = False
+
+CW_C = 1
+CW_KAPPA = 0
+CW_STEPS = 50
+CW_LR = 0.01
+
+DEEPFOOL_STEPS = 50
+DEEPFOOL_OVERSHOOT = 0.02
+JSMA_THETA = 1.0
+JSMA_GAMMA = 0.1
+JSMA_MAX_IMAGES = 200
+
+MIFGSM_DECAY = 1.0
+
+UAP_DELTA = 0.2
+UAP_MAX_ITER = 10
+UAP_DEEPFOOL_STEPS = 20
+UAP_OVERSHOOT = 0.02
+UAP_MAX_IMAGES = 1000
+
+BPDA_RESTARTS_DEFAULT = 1
+BPDA_RESTARTS_SUITE = 2
+BPDA_RESTARTS_SWEEP = 3
+
+ADAPTIVE_EOT_SAMPLES = 4
+ADAPTIVE_GUARDRAIL_LAMBDA = 1.0
+ADAPTIVE_DETECTOR_LAMBDA = 1.0
+ADAPTIVE_GUARDRAIL_SCALE = 20.0
+
+NES_SAMPLES_DEFAULT = 20
+NES_SAMPLES_SUITE = 100
+NES_SIGMA = 1e-3
+NES_STEPS = 10
+NES_QUERY_CHUNK = 512
+
+SUBSTITUTE_NUM_CLASSES = 10
+SUBSTITUTE_ROUNDS = 6
+SUBSTITUTE_EPOCHS_PER_ROUND = 10
+SUBSTITUTE_LR = 1e-3
+SUBSTITUTE_LAMBDA = 0.1
+SUBSTITUTE_BATCH_SIZE = 128
+SURROGATE_SEED_N = 500
+
+BOUNDARY_MAX_IMAGES_DEFAULT = 50
+BOUNDARY_MAX_IMAGES_SUITE = 30
+BOUNDARY_STEPS_DEFAULT = 200
+BOUNDARY_STEPS_SUITE = 500
+BOUNDARY_SEED = 0
+BOUNDARY_SPHERICAL_STEP = 1e-2
+BOUNDARY_SOURCE_STEP = 1e-2
+BOUNDARY_STEP_ADAPT = 1.5
+BOUNDARY_INIT_TRIES = 200
+BOUNDARY_INIT_CHUNK = 25
+BOUNDARY_MIN_DIST = 1e-12
+BOUNDARY_ADAPT_INTERVAL = 10
+BOUNDARY_SPH_SUCCESS_HIGH = 0.5
+BOUNDARY_SPH_SUCCESS_LOW = 0.2
+
+GRAD_DIAG_MAX_BATCHES = 3
+GRAD_ZERO_THRESHOLD = 1e-8
 PGD_ABLATION_STEPS = (0, 1, 2, 5, 10, 20, 50)
+TRAJECTORY_MAX_BATCHES = 3
+LAYERWISE_MAX_BATCHES = 3
+STAIRCASE_RADIUS = 1 / 255
+STAIRCASE_N_POINTS = 40
+MARGIN_MAX_BATCHES = 3
+MARGIN_STEPS = 20
+
+SWEEP_EPSILONS = [1 / 255, 2 / 255, 3 / 255, 4 / 255, 6 / 255, 8 / 255, 12 / 255, 16 / 255]
+
+PLOT_DPI = 300
+PLOT_BBOX_INCHES = "tight"
+PLOT_MAX_ACCURACY = 1.0
+SWEEP_PLOT_COLS_MAX = 3
+SWEEP_PLOT_WIDTH = 6
+SWEEP_PLOT_HEIGHT = 4.5
+ABLATION_FIGSIZE = (10, 6)
+TRAJECTORY_FIGSIZE = (14, 5)
+LAYERWISE_PLOT_COLS_MAX = 2
+LAYERWISE_PLOT_WIDTH = 9
+LAYERWISE_PLOT_HEIGHT = 4.5
+COMPONENT_ABLATION_COL_WRAP = 3
+COMPONENT_ABLATION_HEIGHT = 4
+CHUNK_QUANT_NUM_CHUNKS = 4
+CHUNK_QUANT_COL_WRAP = 2
+CHUNK_QUANT_HEIGHT = 4
+MASKING_SUMMARY_FIGSIZE = (14, 5)
+MARGIN_PLOT_COLS_MAX = 3
+MARGIN_PLOT_WIDTH = 6
+MARGIN_PLOT_HEIGHT = 4
+MARGIN_HIST_BINS = 30
+MARGIN_HIST_ALPHA = 0.6
+HEATMAP_MIN_WIDTH = 10
+HEATMAP_MIN_HEIGHT = 6
+HEATMAP_ROW_HEIGHT = 0.5
+SUMMARY_PLOT_FIGSIZE = (14, 6)
