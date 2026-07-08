@@ -1,413 +1,347 @@
-"""
-Experiment entrypoint: orchestrates loading pretrained CIFAR-10 architectures,
-building PTQ/QAT-quantized variants via the Model wrapper, running the full
-adversarial-robustness evaluation suite and epsilon sweep for each, and
-(optionally) dispatching one worker process per GPU for parallel evaluation
-across architectures.
-"""
-import argparse
-import gc
+"""Experiment entrypoint orchestrating the active archive workflow."""
 import importlib.util
 import os
-import subprocess
-import sys
-import time
 import traceback
 
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
-import torch
 
-from . import config
-from .config import PROJECT_ROOT, DATA_DIR, PRETRAINED_NAMES, device
+from .config import *
 from .data import get_dataloaders, load_pretrained
-from .Model import Model as QuantModel
-from .compute import parallelize, maybe_compile
+from .quantization import (
+    convert_to_quant,
+    convert_to_chaotic_quant,
+    prepare_qat,
+    quantizable_layer_names,
+    verify_quantization_layers,
+)
+from .attacks import with_image_compression
+from .compute import parallelize
 from .evaluation import sanity_check_accuracy, run_epsilon_sweep_for_model
-from .suite import run_suite, _model_to_qat_instance
-from .paths import results_csv_path, sweep_csv_path
-from .quantization import convert_to_quant, convert_to_chaotic_quant, prepare_qat as prepare_custom_qat
-
-PLOT_PNG = config.PLOT_PNG
-
-
-def _parse_args():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--arch-key", default=None,
-                        help="Internal: restrict this run to a single architecture.")
-    args, _ = parser.parse_known_args()
-    return args
-
-
-_ARGS = _parse_args()
-
-RESULTS_CSV = config.RESULTS_CSV
-SWEEP_CSV = config.SWEEP_CSV
-
-if _ARGS.arch_key is not None:
-    if _ARGS.arch_key not in PRETRAINED_NAMES:
-        raise ValueError(f"Unknown --arch-key {_ARGS.arch_key!r}, expected one of {list(PRETRAINED_NAMES)}")
-    PRETRAINED_NAMES = {_ARGS.arch_key: PRETRAINED_NAMES[_ARGS.arch_key]}
-    # Per-arch paths are now derived from model names; keep these for backward compat.
-    RESULTS_CSV = os.path.join(DATA_DIR, f"results_{_ARGS.arch_key}.csv")
-    SWEEP_CSV = os.path.join(DATA_DIR, f"results_sweep_{_ARGS.arch_key}.csv")
+from .diagnostics import run_chunk_quantization_attacks
+from .suite import run_suite, run_defense_suite
+from .paths import csv_path
+from .plots import (
+    plot_defense_comparison,
+    plot_epsilon_sweep_curves,
+    plot_pgd_steps_ablation,
+    plot_pgd_trajectory,
+    plot_layerwise_grad_profile,
+    plot_component_ablation,
+    plot_chunk_quantization_attacks,
+    plot_gradient_masking_summary,
+    plot_confidence_margin_diagnostic,
+    plot_results_heatmap,
+)
 
 
-def _startup_checks():
-    missing = [pkg for pkg in ("autoattack",) if importlib.util.find_spec(pkg) is None]
+def check_environment():
+    missing = [pkg for pkg in ("torchattacks", "autoattack", "pytorchcv") if importlib.util.find_spec(pkg) is None]
     if missing:
         raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
     print("All required packages are available.")
-    expected = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
-    if not os.path.isdir(expected):
-        raise FileNotFoundError(f"Expected extracted CIFAR-10 at {expected!r}")
+    print("device:", device)
+    if not os.path.isdir(CIFAR10_DIR):
+        raise FileNotFoundError(f"Expected extracted CIFAR-10 at {CIFAR10_DIR!r}")
 
-
-def _merge_worker_csvs(arch_keys, pattern, merged_path):
-    """Merge per-arch-key CSVs written by dispatch_multi_gpu's workers into
-    the shared results file, de-duplicating on (model[, epsilon])."""
-    frames = []
-    if os.path.exists(merged_path):
-        frames.append(pd.read_csv(merged_path))
-    for arch_key in arch_keys:
-        p = os.path.join(DATA_DIR, pattern.format(arch_key))
-        if os.path.exists(p):
-            frames.append(pd.read_csv(p))
-    if not frames:
-        return
-    merged = pd.concat(frames, ignore_index=True)
-    dedup_cols = ["model", "epsilon"] if "epsilon" in merged.columns else ["model"]
-    merged = merged.drop_duplicates(subset=dedup_cols, keep="last")
-    merged.to_csv(merged_path, index=False)
-
-
-def dispatch_multi_gpu():
-    """
-    Multi-GPU parallel evaluation of independent models.
-    """
-    n_gpus = torch.cuda.device_count()
-    arch_keys = list(PRETRAINED_NAMES.keys())
-    print(f"\n[dispatch] {n_gpus} GPU(s) visible, {len(arch_keys)} architectures -- "
-          f"evaluating architectures in parallel, one process per GPU.")
-
-    def launch(arch_key, gpu_id):
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        print(f"[dispatch] launching {arch_key} on GPU {gpu_id}")
-        return subprocess.Popen(
-            [sys.executable, os.path.join(PROJECT_ROOT, "src", "run_experiment.py"), "--arch-key", arch_key],
-            env=env,
-        )
-
-    pending = list(arch_keys)
-    running = {}  # arch_key -> Popen
-    next_gpu = 0
-    failed = []
-
-    while pending or running:
-        while pending and len(running) < n_gpus:
-            arch_key = pending.pop(0)
-            running[arch_key] = launch(arch_key, next_gpu % n_gpus)
-            next_gpu += 1
-        for arch_key in list(running):
-            ret = running[arch_key].poll()
-            if ret is not None:
-                if ret != 0:
-                    print(f"[dispatch] [WARN] worker for {arch_key} exited with code {ret}")
-                    failed.append(arch_key)
-                del running[arch_key]
-        if running:
-            time.sleep(2)
-
-    # Per-model CSVs are already separate; no merging needed.
-    # (The shared RESULTS_CSV and SWEEP_CSV still get created if --arch-key is used.)
-    if failed:
-        print(f"[dispatch] [WARN] the following architectures failed: {failed}. "
-              f"Their per-model CSVs (if any) remain in the data directory; re-run with "
-              f"--arch-key <name> to retry just that one.")
-    print("[dispatch] all architectures complete. Per-model results written to", DATA_DIR)
-
-
-# Processes one architecture at a time: load, build variants, evaluate, free memory, next.
 def main():
+    check_environment()
     finetune_loader, eval_loader = get_dataloaders()
-
-    eval_batches = [(x.to(device), y.to(device)) for x, y in eval_loader]
-
-    # We no longer need a shared results_df; each model writes its own file.
-    df_results = pd.DataFrame()
+    model_registry = {}
 
     for arch_key in PRETRAINED_NAMES:
         print(f"\n>>> {arch_key} <<<")
         try:
             fp32 = load_pretrained(arch_key)
-            acc = sanity_check_accuracy(fp32, eval_batches)
+            fp32_layer_names = quantizable_layer_names(fp32)
+            print(f"  FP32 quantizable nn.Conv2d/nn.Linear layers: {len(fp32_layer_names)}")
+            print(f"  first quantizable layers: {fp32_layer_names[:8]}")
+            if not fp32_layer_names:
+                raise RuntimeError(f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers.")
+            acc = sanity_check_accuracy(fp32, eval_loader)
             print(f"  loaded pretrained {arch_key}, clean acc: {acc:.3f}")
+            model_registry[f"{arch_key}_FP32"] = (fp32, None)
         except Exception as e:
             print(f"  [FAIL] could not load {arch_key}: {e}")
             traceback.print_exc()
             continue
 
-        # Build the QuantModel wrapper (auto-constructs int8_PTQ)
         try:
-            qat_model = QuantModel(fp32)
+            int8_ptq = convert_to_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
+            verify_quantization_layers(arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names)
+            model_registry[f"{arch_key}_int8_PTQ"] = (int8_ptq, fp32)
         except Exception as e:
-            print(f"  [FAIL] QuantModel wrapper for {arch_key}: {e}")
+            print(f"  [FAIL] int8 PTQ for {arch_key}: {e}")
             traceback.print_exc()
-            continue
-
-        # Build model registry entries for this architecture
-        # (We compile/parallelize just before each run_suite, then free the model after.)
-
-        variants = {
-            f"{arch_key}_FP32": (fp32, None),
-        }
-
-        variants[f"{arch_key}_int8_PTQ"] = (qat_model.int8_PTQ, fp32)
+            raise
 
         try:
-            variants[f"{arch_key}_int4_PTQ"] = (
-                convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True),
-                fp32,
-            )
+            int4_ptq = convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True)
+            verify_quantization_layers(arch_key, fp32, int4_ptq, "int4 PTQ", fp32_layer_names)
+            model_registry[f"{arch_key}_int4_PTQ"] = (int4_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
+            traceback.print_exc()
+            raise
 
         try:
-            variants[f"{arch_key}_chaotic_int8_PTQ"] = (
-                convert_to_chaotic_quant(fp32, bits=8, quant_weight=True, quant_act=True),
-                fp32,
-            )
+            int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS)
+            verify_quantization_layers(arch_key, fp32, int8_qat, "int8 QAT", fp32_layer_names)
+            model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
+        except Exception as e:
+            print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
+            traceback.print_exc()
+            raise
+
+        if QUANTIZATION_DEBUG_ONLY:
+            print("\nQUANTIZATION_DEBUG_ONLY=True; exiting before defenses, attacks, sweeps, and plots.")
+            print("Registry built:", list(model_registry.keys()))
+            return
+
+        try:
+            model_registry[f"{arch_key}_FP32_Compressed"] = (with_image_compression(fp32), fp32)
+        except Exception as e:
+            print(f"  [FAIL] compressed FP32 for {arch_key}: {e}")
+
+        try:
+            chaotic_int8_ptq = convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
+            model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (chaotic_int8_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] chaotic int8 PTQ for {arch_key}: {e}")
 
         try:
-            variants[f"{arch_key}_chaotic_int4_PTQ"] = (
-                convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True),
-                fp32,
-            )
+            chaotic_int4_ptq = convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True)
+            model_registry[f"{arch_key}_chaotic_int4_PTQ"] = (chaotic_int4_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] chaotic int4 PTQ for {arch_key}: {e}")
 
-        # QAT int8
-        qat_int8 = None
         try:
-            qat_int8 = qat_model.train_qat(finetune_loader, epochs=3, bits=8)
-            variants[f"{arch_key}_int8_QAT"] = (qat_int8, fp32)
+            compressed_chaotic_int8 = with_image_compression(convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True))
+            model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (compressed_chaotic_int8, fp32)
         except Exception as e:
-            print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
-            traceback.print_exc()
+            print(f"  [FAIL] compressed chaotic int8 PTQ for {arch_key}: {e}")
 
         try:
-            chaotic_qat_int8 = prepare_custom_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=3, chaotic=True)
-            variants[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_qat_int8, fp32)
+            chaotic_int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS, chaotic=True)
+            model_registry[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
 
-        suffixes = ["int8_PTQ", "int8_QAT"]
-        for name, (variant_model, _) in variants.items():
-            if any(name == f"{arch_key}_{suf}" for suf in suffixes):
-                _model_to_qat_instance[id(variant_model)] = qat_model
+    try:
+        model_registry, df_defense_summary = run_defense_suite(model_registry, finetune_loader, eval_loader)
+        if not df_defense_summary.empty:
+            print("\nDefense summary (guardrail/detector flag rates, certified accuracy):")
+            print(df_defense_summary.to_string(index=False))
+    except Exception as e:
+        print(f"  [FAIL] run_defense_suite failed: {e}")
+        traceback.print_exc()
 
-        # qat_model.summary()
+    chunk_model_names = []
+    for arch_key in PRETRAINED_NAMES:
+        entry = model_registry.get(f"{arch_key}_FP32")
+        if entry is None:
+            continue
+        chunk_model_names.append(arch_key)
+        out_path = csv_path(arch_key, "chunk_quant")
+        if os.path.exists(out_path):
+            print(f"Skipping chunk quantization for {arch_key} (already in {out_path})")
+            continue
+        print(f"\nChunk quantization sweep for {arch_key} ...")
+        try:
+            rows = run_chunk_quantization_attacks(entry[0], eval_loader, arch_key, bits=QAT_BITS, n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS)
+            pd.DataFrame(rows).to_csv(out_path, index=False)
+            print(f"Chunk quantization results saved to {out_path}")
+        except Exception as e:
+            print(f"  [FAIL] chunk quantization sweep failed for {arch_key}: {e}")
+            traceback.print_exc()
 
-        # --- Evaluate each variant one at a time ---
-        for name, (model, ref) in variants.items():
-            model_csv = results_csv_path(name)
-            if os.path.exists(model_csv):
-                df_check = pd.read_csv(model_csv)
-                if not df_check.empty and str(df_check.iloc[0].get("model")) == name:
-                    print(f"  Skipping {name} (results already in {model_csv})")
-                    # Still track it for the final plot
-                    df_results = pd.concat([df_results, pd.read_csv(model_csv)], ignore_index=True)
-                    continue
+    print("\nRegistry built:", list(model_registry.keys()))
 
-            # Compile / parallelize for this run
-            model = maybe_compile(model, name=name)
-            model = parallelize(model)
-            ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
-            ref = parallelize(ref) if ref is not None else None
-            if any(name == f"{arch_key}_{suf}" for suf in suffixes):
-                _model_to_qat_instance[id(model)] = qat_model
+    for k in model_registry:
+        m, r = model_registry[k]
+        model_registry[k] = (parallelize(m), parallelize(r) if r else None)
 
-            print(f"\n  Evaluating {name} ...")
-            try:
-                res = run_suite(model, eval_batches, name, fp32_ref=ref)
-            except Exception as e:
-                print(f"  [FAIL] run_suite failed for {name}: {e}")
-                traceback.print_exc()
-                res = {"model": name}
+    if os.path.exists(RESULTS_CSV):
+        df_results = pd.read_csv(RESULTS_CSV)
+        done = set(df_results["model"].astype(str))
+    else:
+        df_results = pd.DataFrame(columns=["model"])
+        done = set()
 
-            # Write this model's results to its own CSV file
-            pd.DataFrame([res]).to_csv(model_csv, index=False)
-            df_results = pd.concat([df_results, pd.DataFrame([res])], ignore_index=True)
+    for name, (model, ref) in list(model_registry.items()):
+        if name in done:
+            print(f"Skipping {name} (already in {RESULTS_CSV})")
+            continue
 
-            print("  Result:")
-            print(pd.DataFrame([res]).to_string(index=False))
-            print("-" * 100)
+        print(f"\nEvaluating {name} ...")
+        try:
+            res = run_suite(model, eval_loader, name, fp32_ref=ref)
+        except Exception as e:
+            print(f"  [FAIL] run_suite failed for {name}: {e}")
+            traceback.print_exc()
+            res = {"model": name}
 
-            # Free memory before moving to next variant
-            del model
-            if ref is not None:
-                del ref
-            gc.collect()
+        new_row = pd.DataFrame([res])
+        df_results = pd.concat([df_results, new_row], ignore_index=True)
+        df_results.to_csv(RESULTS_CSV, index=False)
 
-        # Free this architecture's models and registry entries before next arch
-        del variants
-        del fp32
-        del qat_model
-        gc.collect()
-
-    # Collect all per-model result CSVs for plotting
-    result_files = [f for f in os.listdir(DATA_DIR) if f.startswith("results_") and f.endswith(".csv") and f != "results.csv"]
-    if result_files:
-        frames = []
-        for rf in result_files:
-            fp = os.path.join(DATA_DIR, rf)
-            df_tmp = pd.read_csv(fp)
-            frames.append(df_tmp)
-        if frames:
-            df_results = pd.concat(frames, ignore_index=True)
+        print("Result:")
+        print(new_row.to_string(index=False))
+        print("-" * 100)
 
     print("\nFinal results:")
     print(df_results)
 
-    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "AutoAttack", "Transfer_from_FP32", "Random_Noise", "BPDA_PGD"]
+    adaptive_cols = [
+        c for c in [
+            "BPDA_PGD",
+            "BPDA_Adaptive",
+            "EOT_PGD",
+            "Adaptive_Guardrail",
+            "Adaptive_DetectGuard",
+            "NES",
+            "Boundary_acc",
+            "AutoAttack",
+        ]
+        if c in df_results.columns
+    ]
+
+    if adaptive_cols:
+        df_results["Worst_Robust_Acc"] = df_results[adaptive_cols].min(axis=1, skipna=True)
+
+    if {"PGD", "Worst_Robust_Acc"}.issubset(df_results.columns):
+        df_results["Gradient_Masking_Gap"] = (
+            df_results["PGD"] - df_results["Worst_Robust_Acc"]
+        )
+
+    fp32_baseline = (
+        df_results[df_results["model"].str.endswith("_FP32")]
+        .assign(
+            Architecture=lambda d: d["model"].str.replace(
+                "_FP32", "", regex=False
+            )
+        )
+        .set_index("Architecture")["Worst_Robust_Acc"]
+    )
+
+    df_results["Architecture"] = (
+        df_results["model"]
+        .str.replace(r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT).*", "", regex=True)
+    )
+
+    df_results["FP32_Worst_Robust_Acc"] = (
+        df_results["Architecture"].map(fp32_baseline)
+    )
+
+    if {
+        "Worst_Robust_Acc",
+        "FP32_Worst_Robust_Acc",
+    }.issubset(df_results.columns):
+        df_results["True_Robustness_Gain"] = (
+            df_results["Worst_Robust_Acc"]
+            - df_results["FP32_Worst_Robust_Acc"]
+        )
+
+    df_results.to_csv(RESULTS_CSV, index=False)
+
+    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
+                             "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
+                             "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
+                             "Surrogate_Transfer", "Random_Noise", "BPDA_PGD",
+                             "BPDA_Adaptive", "EOT_PGD", "Adaptive_Guardrail", "Adaptive_DetectGuard"]
                 if c in df_results.columns]
 
     if len(acc_cols) > 0:
         df_plot = df_results.melt(id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy")
 
-        plt.figure(figsize=(14, 6))
+        plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
         sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Attack")
-        plt.xticks(rotation=45, ha="right")
+        plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
         plt.title("Model Accuracy under Various Adversarial Attacks")
-        plt.ylim(0, 1.0)
-        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.ylim(0, PLOT_MAX_ACCURACY)
+        plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
         plt.tight_layout()
-        plt.savefig(PLOT_PNG, dpi=300, bbox_inches="tight")
+        plt.savefig(PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
         plt.show()
 
-    # Epsilon sweep
-    SWEEP_EPSILONS = [
-        1/255, 2/255, 3/255, 4/255,
-        6/255, 8/255, 12/255, 16/255
-    ]
+    if os.path.exists(SWEEP_CSV):
+        df_sweep = pd.read_csv(SWEEP_CSV)
+        sweep_done = set(zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6)))
+    else:
+        df_sweep = pd.DataFrame()
+        sweep_done = set()
 
-    # Per-model sweep files
-    sweep_rows = []
-
-    for arch_key in PRETRAINED_NAMES:
-        print(f"\n>>> Sweep: {arch_key} <<<")
-        try:
-            fp32 = load_pretrained(arch_key)
-            qat_model = QuantModel(fp32)
-        except Exception as e:
-            print(f"  [FAIL] could not build for sweep {arch_key}: {e}")
+    for name, (model, ref) in model_registry.items():
+        print(f"\nSweeping {name} ...")
+        pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done]
+        if not pending_eps:
+            print(f"  Skipping {name} (already done)")
             continue
-
-        sweep_variants = {
-            f"{arch_key}_FP32": (fp32, None),
-            f"{arch_key}_int8_PTQ": (qat_model.int8_PTQ, fp32),
-        }
-
         try:
-            sweep_variants[f"{arch_key}_int4_PTQ"] = (
-                convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True),
-                fp32,
-            )
+            rows = run_epsilon_sweep_for_model(model, eval_loader, name, pending_eps)
+            if rows:
+                new_sweep = pd.DataFrame(rows)
+                df_sweep = pd.concat([df_sweep, new_sweep], ignore_index=True)
+                df_sweep.to_csv(SWEEP_CSV, index=False)
         except Exception as e:
-            print(f"  [FAIL] int4 PTQ for sweep {arch_key}: {e}")
-
-        try:
-            sweep_variants[f"{arch_key}_chaotic_int8_PTQ"] = (
-                convert_to_chaotic_quant(fp32, bits=8, quant_weight=True, quant_act=True),
-                fp32,
-            )
-        except Exception as e:
-            print(f"  [FAIL] chaotic int8 PTQ for sweep {arch_key}: {e}")
-
-        try:
-            sweep_variants[f"{arch_key}_chaotic_int4_PTQ"] = (
-                convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True),
-                fp32,
-            )
-        except Exception as e:
-            print(f"  [FAIL] chaotic int4 PTQ for sweep {arch_key}: {e}")
-
-        try:
-            qat_int8 = qat_model.train_qat(finetune_loader, epochs=5, bits=8)
-            sweep_variants[f"{arch_key}_int8_QAT"] = (qat_int8, fp32)
-        except Exception as e:
-            print(f"  [FAIL] int8 QAT for sweep {arch_key}: {e}")
+            print(f"  [FAIL] epsilon sweep failed for {name}: {e}")
             traceback.print_exc()
 
-        try:
-            chaotic_qat_int8 = prepare_custom_qat(fp32, bits=8, finetune_loader=finetune_loader, epochs=5, chaotic=True)
-            sweep_variants[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_qat_int8, fp32)
-        except Exception as e:
-            print(f"  [FAIL] chaotic int8 QAT for sweep {arch_key}: {e}")
-            traceback.print_exc()
+    print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
 
-        for name, (variant_model, _) in sweep_variants.items():
-            if any(name == f"{arch_key}_{suf}" for suf in ["int8_PTQ", "int8_QAT"]):
-                _model_to_qat_instance[id(variant_model)] = qat_model
+    model_names = list(model_registry.keys())
 
-        # Evaluate each variant in this architecture
-        for name, (model, ref) in sweep_variants.items():
-            model_sweep_csv = sweep_csv_path(name)
-            # Check if this model already has sweep results
-            if model is None:
-                print(f"  Skipping sweep for {name} (QAT not trained)")
-                continue
+    try:
+        plot_epsilon_sweep_curves(df_sweep)
+    except Exception as e:
+        print(f"  [WARN] plot_epsilon_sweep_curves failed: {e}")
 
-            existing_rows = []
-            if os.path.exists(model_sweep_csv):
-                existing_df = pd.read_csv(model_sweep_csv)
-                if not existing_df.empty:
-                    sweep_done_existing = set(
-                        (str(row["model"]), round(row["epsilon"], 6))
-                        for _, row in existing_df.iterrows()
-                        if "model" in row and "epsilon" in row
-                    )
-                    existing_rows = existing_df.to_dict("records")
-                else:
-                    sweep_done_existing = set()
-            else:
-                sweep_done_existing = set()
+    try:
+        plot_pgd_steps_ablation(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_pgd_steps_ablation failed: {e}")
 
-            pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done_existing]
-            if not pending_eps:
-                if existing_rows:
-                    sweep_rows.extend(existing_rows)
-                print(f"  Sweep already done for {name}")
-                continue
+    try:
+        plot_pgd_trajectory(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_pgd_trajectory failed: {e}")
 
-            print(f"\n  Sweeping {name} ...")
-            model = maybe_compile(model, name=name)
-            model = parallelize(model)
-            ref = maybe_compile(ref, name=f"{name}_ref") if ref is not None else None
-            ref = parallelize(ref) if ref is not None else None
-            if any(name == f"{arch_key}_{suf}" for suf in ["int8_PTQ", "int8_QAT"]):
-                _model_to_qat_instance[id(model)] = qat_model
-            try:
-                new_rows = run_epsilon_sweep_for_model(model, eval_batches, name, pending_eps, backward_model=ref)
-                if new_rows:
-                    sweep_rows.extend(existing_rows + new_rows)
-                    all_new = existing_rows + new_rows
-                    pd.DataFrame(all_new).to_csv(model_sweep_csv, index=False)
-            except Exception as e:
-                print(f"  [FAIL] epsilon sweep failed for {name}: {e}")
-                traceback.print_exc()
-            del model
-            if ref is not None:
-                del ref
-            gc.collect()
+    try:
+        plot_layerwise_grad_profile(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_layerwise_grad_profile failed: {e}")
 
-    # Save combined sweep if any rows exist
-    if sweep_rows:
-        pd.DataFrame(sweep_rows).to_csv(SWEEP_CSV, index=False)
-    print("\nEpsilon sweep completed. Per-model results saved to individual sweep CSVs.")
+    try:
+        plot_component_ablation(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_component_ablation failed: {e}")
+
+    try:
+        plot_chunk_quantization_attacks(chunk_model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_chunk_quantization_attacks failed: {e}")
+
+    try:
+        plot_gradient_masking_summary(df_results)
+    except Exception as e:
+        print(f"  [WARN] plot_gradient_masking_summary failed: {e}")
+
+    try:
+        plot_confidence_margin_diagnostic(model_names)
+    except Exception as e:
+        print(f"  [WARN] plot_confidence_margin_diagnostic failed: {e}")
+
+    try:
+        plot_results_heatmap(df_results)
+    except Exception as e:
+        print(f"  [WARN] plot_results_heatmap failed: {e}")
+
+    try:
+        plot_defense_comparison(df_results)
+    except Exception as e:
+        print(f"  [WARN] plot_defense_comparison failed: {e}")
+
     print("All done.")

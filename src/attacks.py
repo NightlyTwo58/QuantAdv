@@ -1,328 +1,81 @@
-"""
-Adversarial attack implementations (FGSM, PGD, BPDA-style PGD, random-noise
-baseline, transfer attack) and small helpers (AMP context, gradient-masking
-tolerance) shared across the evaluation and diagnostics modules.
-"""
-import warnings
-from contextlib import nullcontext, contextmanager
+"""Adversarial attacks, input defenses, adaptive attacks, and transfer helpers."""
+import copy
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchattacks
+from autoattack import AutoAttack
+from torch.amp import autocast
 
-from .config import device, USE_AMP, CLIP_MIN_DEV, CLIP_MAX_DEV
-
-# Static loss-scaling factor used only to reduce FP16 gradient underflow when
-# USE_AMP is on. autocast computes the forward pass in FP16, and a small
-# cross-entropy loss can underflow to zero before autograd ever gets to the
-# input -- which is indistinguishable, downstream, from a genuinely masked
-# gradient. Scaling the loss up before differentiating and dividing the
-# resulting gradient back down mitigates that without requiring a full
-# GradScaler/optimizer-step integration (there's no optimizer step here).
-AMP_GRAD_SCALE = 1024.0
+from .config import *
+from . import defense as dfn
+from .quantization import set_ste_mode
 
 
-def amp_ctx():
-    if USE_AMP:
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
-    return nullcontext()
+class PixelSpaceModel(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.register_buffer("mean", CIFAR_MEAN.clone())
+        self.register_buffer("std", CIFAR_STD.clone())
+
+    def forward(self, x):
+        return self.model((x - self.mean.to(x.device)) / self.std.to(x.device))
 
 
-def attack_precision_ctx():
-    """
-    Attack generation is intentionally full precision.
+class ImageCompressionSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, bits):
+        levels = float(2 ** bits - 1)
+        return torch.round(x * levels).div(levels)
 
-    The archived reference generated FGSM/PGD/BPDA gradients without AMP.
-    Autocast can change gradients enough to mask failures, especially around
-    hard quantization. Keep AMP for cheap inference paths, but not for the
-    optimization loop that constructs adversarial examples.
-    """
-    return nullcontext()
-
-
-def set_ste_mode(model, flag):
-    """
-    Toggle straight-through fake-quantization modules when the model exposes
-    the archived `use_ste` convention. Returns the number of modules toggled.
-    """
-    toggled = 0
-    for mod in model.modules():
-        if hasattr(mod, "use_ste"):
-            mod.use_ste = flag
-            toggled += 1
-    return toggled
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
 
 
-@contextmanager
-def tolerate_masked_gradients():
-    real_grad = torch.autograd.grad
+class CompressedInputModel(nn.Module):
+    def __init__(self, model, size=COMPRESS_IMAGE_SIZE, bits=COMPRESS_IMAGE_BITS, mode=COMPRESS_IMAGE_MODE):
+        super().__init__()
+        self.model = model
+        self.size = size
+        self.bits = bits
+        self.mode = mode
 
-    def _patched_grad(outputs, inputs, *args, **kwargs):
-        kwargs.setdefault("allow_unused", True)
-        grads = real_grad(outputs, inputs, *args, **kwargs)
-        inputs_seq = [inputs] if isinstance(inputs, torch.Tensor) else list(inputs)
-        return tuple(
-            torch.zeros_like(inp) if g is None else g
-            for g, inp in zip(grads, inputs_seq)
-        )
-
-    torch.autograd.grad = _patched_grad
-    try:
-        yield
-    finally:
-        torch.autograd.grad = real_grad
-
-
-def _compute_gradient(loss, x_adv, *, name="attack step", scale=1.0):
-    """
-    Compute d(loss)/d(x_adv), tolerating a fully masked (`None`) gradient.
-    """
-    if scale != 1.0:
-        loss = loss * scale
-    try:
-        grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
-    except RuntimeError as e:
-        warnings.warn(
-            f"Gradient computation raised during {name} ({e}). This usually means "
-            "the forward pass contains an op with no autograd backward defined at "
-            "all -- common with true integer/quantized kernels -- rather than just "
-            "a masked gradient. Falling back to a zero-gradient step, which will "
-            "UNDERSTATE the true attack strength. Use bpda_pgd_attack with an "
-            "explicit `backward_model` (e.g. the pre-quantization fp32 model) "
-            "instead of trusting plain PGD/FGSM results here.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        return torch.zeros_like(x_adv)
-    if grad is None:
-        warnings.warn(
-            f"Gradient masked/unavailable during {name}: "
-            "torch.autograd.grad returned None. Falling back to a "
-            "zero-gradient step, which will UNDERSTATE the true attack "
-            "strength against this model. If this is expected (e.g. a "
-            "defense with a non-differentiable component), use "
-            "bpda_pgd_attack with an explicit `backward_model` "
-            "approximation instead of trusting plain PGD/FGSM results.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        return torch.zeros_like(x_adv)
-    if scale != 1.0:
-        grad = grad / scale
-    return grad
+    def forward(self, x):
+        pixels = denormalize_inputs(x).clamp(0.0, 1.0)
+        if self.size and self.size < pixels.shape[-1]:
+            kwargs = {"mode": self.mode}
+            if self.mode in ("linear", "bilinear", "bicubic", "trilinear"):
+                kwargs["align_corners"] = COMPRESS_IMAGE_ALIGN_CORNERS
+            pixels = F.interpolate(pixels, size=(self.size, self.size), **kwargs)
+            pixels = F.interpolate(pixels, size=(CIFAR_IMAGE_SIZE, CIFAR_IMAGE_SIZE), **kwargs)
+        if self.bits is not None:
+            pixels = ImageCompressionSTE.apply(pixels, self.bits)
+        return self.model(normalize_pixels(pixels.clamp(0.0, 1.0)))
 
 
-def _worst_of_restarts(x, y, model, candidate, best_adv, best_score):
-    """
-    Given a newly-generated `candidate` adversarial batch, keep the
-    per-example worst case (highest loss, with any misclassification always
-    beating any correct classification) against `best_adv`/`best_score` so
-    far. Used to implement multi-restart PGD/BPDA.
-    """
-    with torch.no_grad(), amp_ctx():
-        logits = model(candidate)
-        loss_per_example = F.cross_entropy(logits, y, reduction="none")
-        correct = logits.argmax(dim=1) == y
-    score = loss_per_example + (~correct).float() * 1e6
-    if best_adv is None:
-        return candidate, score
-    improve = score > best_score
-    view_shape = (-1,) + (1,) * (x.dim() - 1)
-    best_adv = torch.where(improve.view(view_shape), candidate, best_adv)
-    best_score = torch.where(improve, score, best_score)
-    return best_adv, best_score
+def with_image_compression(model, size=COMPRESS_IMAGE_SIZE, bits=COMPRESS_IMAGE_BITS, mode=COMPRESS_IMAGE_MODE):
+    return CompressedInputModel(copy.deepcopy(model), size=size, bits=bits, mode=mode).to(device).eval()
 
 
-def pgd_step(model, x_adv, x, y, eps, alpha, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV, return_grad=False):
-    """One PGD update: gradient-sign ascent step, L_inf projection onto the
-    eps-ball around `x`, and a clip to the valid data range."""
-    x_adv = x_adv.clone().requires_grad_(True)
-    with attack_precision_ctx():
-        loss = F.cross_entropy(model(x_adv), y)
-    grad = _compute_gradient(loss, x_adv, name="pgd_step")
-    x_adv = x_adv.detach() + alpha * grad.sign()
-    x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-    if return_grad:
-        return x_adv, grad
-    return x_adv
+def normalize_pixels(x):
+    return (x - CIFAR_MEAN.to(x.device)) / CIFAR_STD.to(x.device)
 
 
-def fgsm_attack(model, x, y, eps, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV):
-    """Single-step FGSM."""
-    x_adv = x.clone().detach().requires_grad_(True)
-    with attack_precision_ctx():
-        loss = F.cross_entropy(model(x_adv), y)
-    grad = _compute_gradient(loss, x_adv, name="fgsm_attack")
-    x_adv = x_adv.detach() + eps * grad.sign()
-    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-    return x_adv
-
-
-def pgd_attack(model, x, y, eps, alpha=2 / 255, steps=20, random_start=True,
-               clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV, n_restarts=1):
-    best_adv, best_score = None, None
-    for _ in range(n_restarts):
-        if random_start:
-            x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-        else:
-            x_adv = x.clone().detach()
-        for _ in range(steps):
-            x_adv = pgd_step(model, x_adv, x, y, eps, alpha, clip_min=clip_min, clip_max=clip_max)
-        if n_restarts == 1:
-            return x_adv
-        best_adv, best_score = _worst_of_restarts(x, y, model, x_adv, best_adv, best_score)
-    return best_adv
-
-
-def bpda_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=20, n_restarts=1,
-                     backward_model=None, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV):
-    """
-    BPDA-style PGD (Athalye et al., 2018, "Obfuscated Gradients Give a
-    False Sense of Security").
-
-    Plain PGD/FGSM fail against defenses with non-differentiable or
-    gradient-masking components (quantization, JPEG-style compression,
-    randomized/stochastic transforms, hard thresholds, etc): the gradient
-    through those components comes back None or near-zero, the attack
-    silently does nothing, and the defense looks robust without ever
-    actually being tested. BPDA addresses this by computing gradients
-    through a differentiable *approximation* of the offending component,
-    while still measuring real attack success (loss/misclassification)
-    against the true, non-differentiable `model`.
-
-    Args:
-        model: the real model under attack; its forward pass is what
-            defines success/failure and what the final adversarial batch
-            is evaluated against. May be non-differentiable or contain
-            gradient-masking components.
-        backward_model: a differentiable stand-in used ONLY to compute
-            gradients on the backward pass -- e.g. `model` with a hard
-            quantization/thresholding op swapped for a smooth
-            approximation, or wrapped with a straight-through estimator
-            (`y = nondiff_op(x).detach() + x - x.detach()`). This is the
-            piece that makes BPDA meaningfully different from, and
-            stronger than, plain PGD against a masked-gradient defense.
-            If omitted, defaults to `model` itself: gradients are then
-            computed directly through the real model, which is
-            equivalent to `pgd_attack` when it is fully differentiable,
-            and will emit a `RuntimeWarning` via `_compute_gradient`
-            (rather than silently zero-filling) if it still is not.
-        n_restarts: see `pgd_attack`; worst case is selected by evaluating
-            each restart's final adversarial batch against the true
-            `model`, not `backward_model`.
-
-    Note: if you don't have a specific differentiable approximation to
-    supply and the model is fully differentiable, use `pgd_attack`
-    instead -- this function only earns its name when `backward_model`
-    is a genuine substitute for a non-differentiable component.
-    """
-    # Prefer the archived behavior when available: use the true quantized model
-    # for both forward and backward, but turn on its STE path during gradient
-    # construction. Torchao converted models do not expose `use_ste`, so those
-    # fall back to the supplied differentiable fp32 shadow model.
-    use_model_ste = set_ste_mode(model, True) > 0
-    if use_model_ste:
-        backward_model = model
-    else:
-        backward_model = backward_model if backward_model is not None else model
-
-    def _bpda_step(x_adv):
-        x_adv = x_adv.clone().requires_grad_(True)
-        with attack_precision_ctx():
-            loss = F.cross_entropy(backward_model(x_adv), y)
-        grad = _compute_gradient(loss, x_adv, name="bpda_pgd_attack")
-        x_adv = x_adv.detach() + alpha * grad.sign()
-        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-        return x_adv
-
-    try:
-        best_adv, best_score = None, None
-        for _ in range(n_restarts):
-            x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-            for _ in range(steps):
-                x_adv = _bpda_step(x_adv)
-            x_adv = x_adv.detach()
-            if n_restarts == 1:
-                return x_adv
-            # Success is judged against the real model, not the backward surrogate.
-            best_adv, best_score = _worst_of_restarts(x, y, model, x_adv, best_adv, best_score)
-        return best_adv.detach()
-    finally:
-        if use_model_ste:
-            set_ste_mode(model, False)
-
-
-def evaluate_under_attack(model, loader, attack_fn):
-    """Run `attack_fn(x, y) -> x_adv` over `loader` and report clean-label
-    accuracy of `model` on the resulting adversarial batches."""
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = attack_fn(x, y)
-        with torch.no_grad(), amp_ctx():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
-
-
-def random_noise_attack(model, loader, eps=8 / 255, n_restarts=1, seed=None):
-    """
-    Non-adaptive uniform-noise baseline, no gradient is used at all.
-    """
-    if seed is not None:
-        torch.manual_seed(seed)
-    model.eval()
-    correct, total = 0, 0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
-            for _ in range(n_restarts):
-                noise = torch.empty_like(x).uniform_(-eps, eps)
-                x_adv = torch.max(torch.min(x + noise, CLIP_MAX_DEV), CLIP_MIN_DEV)
-                with amp_ctx():
-                    pred = model(x_adv).argmax(dim=1)
-                worst_correct &= (pred == y)
-            correct += worst_correct.sum().item()
-            total += y.size(0)
-    return correct / total
-
-
-def transfer_attack(source_model, target_model, loader, eps=8 / 255, n_restarts=1):
-    """Black-box transfer attack: craft adversarial examples with PGD
-    against `source_model` only, then evaluate them against `target_model`
-    (which is never queried for gradients)."""
-    return evaluate_under_attack(
-        target_model, loader,
-        lambda x, y: pgd_attack(source_model, x, y, eps, alpha=2 / 255, steps=20,
-                                 random_start=True, n_restarts=n_restarts))
+def denormalize_inputs(x):
+    return x * CIFAR_STD.to(x.device) + CIFAR_MEAN.to(x.device)
 
 
 def make_torchattack(attack_cls, model, *args, **kwargs):
-    """
-    Build a torchattacks attack instance configured with identity
-    normalization (mean=0, std=1), so it operates directly on this
-    pipeline's already-normalized input tensors and clip bounds
-    (CLIP_MIN_DEV/CLIP_MAX_DEV), matching fgsm_attack/pgd_attack above
-    rather than assuming raw [0, 1] pixel inputs.
-    """
     attack = attack_cls(model, *args, **kwargs)
-    attack.set_normalization_used(mean=(0.0, 0.0, 0.0), std=(1.0, 1.0, 1.0))
+    attack.set_normalization_used(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
     return attack
 
 
-def accuracy_under_torchattack(model, loader, attack, target_model=None, max_images=None):
-    """Same contract as evaluate_under_attack, but for torchattacks-based
-    attacks built via make_torchattack, with optional cross-model transfer
-    evaluation and an optional cap on the number of images attacked (useful
-    for query-heavy attacks like JSMA)."""
+def accuracy_from_adv_fn(model, loader, adv_fn=None, target_model=None, max_images=None, use_autocast=False):
     target = target_model if target_model is not None else model
     correct, total, n_seen = 0, 0, 0
     for x, y in loader:
@@ -332,33 +85,113 @@ def accuracy_under_torchattack(model, loader, attack, target_model=None, max_ima
             remaining = max_images - n_seen
             x, y = x[:remaining], y[:remaining]
         x, y = x.to(device), y.to(device)
-        x_adv = attack(x, y)
-        with torch.no_grad(), amp_ctx():
-            pred = target(x_adv).argmax(dim=1)
+        x_adv = adv_fn(x, y) if adv_fn is not None else x
+        with torch.no_grad():
+            if use_autocast:
+                with autocast(device_type=device.type):
+                    pred = target(x_adv).argmax(dim=1)
+            else:
+                pred = target(x_adv).argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
         n_seen += y.size(0)
     return correct / total if total else None
 
 
-def transfer_attack_mim(source_model, target_model, loader, eps=8 / 255):
-    """Black-box transfer attack using MI-FGSM (momentum iterative FGSM)
-    instead of plain PGD as the source attack."""
-    mim = make_torchattack(torchattacks.MIFGSM, source_model, eps=eps, alpha=2 / 255, steps=20, decay=1.0)
-    return accuracy_under_torchattack(source_model, loader, mim, target_model=target_model)
+def accuracy_under_attack(model, loader, attack, target_model=None, max_images=None):
+    def adv_fn(x, y):
+        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
+        return normalize_pixels(attack(x_pixel, y))
+
+    return accuracy_from_adv_fn(model, loader, adv_fn, target_model=target_model, max_images=max_images)
 
 
-def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps=20,
-              overshoot=0.02, max_images=1000):
-    """
-    Universal Adversarial Perturbation (Moosavi-Dezfooli et al., 2017): a
-    single perturbation `v`, shared across all inputs, built by repeatedly
-    running DeepFool against still-correctly-classified examples and
-    accumulating the minimal per-example perturbation into `v`, clipped to
-    the L_inf eps-ball. Iterates until the fooling rate exceeds `1 - delta`
-    or `max_iter` rounds are exhausted.
-    """
+def seed_averaged_metrics(name, seeds, fn):
+    accs = []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        accs.append(fn(seed))
+    mean = float(np.mean(accs))
+    return {
+        name: mean,
+        f"{name}_mean": mean,
+        f"{name}_std": float(np.std(accs)),
+    }
+
+
+def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
     model.eval()
+    set_ste_mode(model, True)
+    try:
+        fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
+        out = {}
+
+        out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
+
+        def run_seed(seed):
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+            return accuracy_under_attack(model, loader, pgd)
+
+        out.update(seed_averaged_metrics("PGD", seeds, run_seed))
+        return out
+    finally:
+        set_ste_mode(model, False)
+
+
+def run_autoattack(model, loader, eps=DEFAULT_EPS):
+    model.eval()
+    set_ste_mode(model, True)
+    try:
+        pixel_model = PixelSpaceModel(model).to(device).eval()
+        adversary = AutoAttack(pixel_model, norm=AUTOATTACK_NORM, eps=eps, version=AUTOATTACK_VERSION, device=device, verbose=AUTOATTACK_VERBOSE)
+        adversary.seed = AUTOATTACK_SEED
+        def adv_fn(x, y):
+            x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
+            return normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
+
+        return accuracy_from_adv_fn(model, loader, adv_fn)
+    finally:
+        set_ste_mode(model, False)
+
+
+def run_extra_whitebox_attacks(model, loader, eps=DEFAULT_EPS, jsma_max_images=JSMA_MAX_IMAGES):
+    model.eval()
+    set_ste_mode(model, True)
+    try:
+        out = {}
+
+        cw = make_torchattack(torchattacks.CW, model, c=CW_C, kappa=CW_KAPPA, steps=CW_STEPS, lr=CW_LR)
+        out["CW"] = accuracy_under_attack(model, loader, cw)
+
+        deepfool = make_torchattack(torchattacks.DeepFool, model, steps=DEEPFOOL_STEPS, overshoot=DEEPFOOL_OVERSHOOT)
+        out["DeepFool"] = accuracy_under_attack(model, loader, deepfool)
+
+        jsma = make_torchattack(torchattacks.JSMA, model, theta=JSMA_THETA, gamma=JSMA_GAMMA)
+        out["JSMA"] = accuracy_under_attack(model, loader, jsma, max_images=jsma_max_images)
+
+        return out
+    finally:
+        set_ste_mode(model, False)
+
+
+def transfer_attack(source_model, target_model, loader, eps=DEFAULT_EPS):
+    set_ste_mode(source_model, True)
+    try:
+        pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+        return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
+    finally:
+        set_ste_mode(source_model, False)
+
+
+def transfer_attack_mim(source_model, target_model, loader, eps=DEFAULT_EPS):
+    mim = make_torchattack(torchattacks.MIFGSM, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, decay=MIFGSM_DECAY)
+    return accuracy_under_attack(source_model, loader, mim, target_model=target_model)
+
+
+def build_uap(model, loader, eps=DEFAULT_EPS, delta=UAP_DELTA, max_iter=UAP_MAX_ITER, deepfool_steps=UAP_DEEPFOOL_STEPS,
+              overshoot=UAP_OVERSHOOT, max_images=UAP_MAX_IMAGES):
+    model.eval()
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     sample_x, _ = next(iter(loader))
     v = torch.zeros(1, *sample_x.shape[1:], device=device)
     deepfool = make_torchattack(torchattacks.DeepFool, model, steps=deepfool_steps, overshoot=overshoot)
@@ -370,7 +203,7 @@ def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps
             if n_seen >= max_images:
                 break
             x, y = x.to(device), y.to(device)
-            x_pert = torch.max(torch.min(x + v, CLIP_MAX_DEV), CLIP_MIN_DEV)
+            x_pert = torch.max(torch.min(x + v, clip_max), clip_min)
             with torch.no_grad():
                 pred_orig = model(x).argmax(dim=1)
                 pred_pert = model(x_pert).argmax(dim=1)
@@ -386,46 +219,183 @@ def build_uap(model, loader, eps=8 / 255, delta=0.2, max_iter=10, deepfool_steps
     return v.detach()
 
 
-def run_uap_attack(model, loader, eps=8 / 255, max_images=1000):
-    """White-box UAP: build the perturbation against `model` itself and
-    report `model`'s accuracy on the perturbed inputs."""
-    v = build_uap(model, loader, eps=eps, max_images=max_images)
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = torch.max(torch.min(x + v, CLIP_MAX_DEV), CLIP_MIN_DEV)
-        with torch.no_grad(), amp_ctx():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
-
-
-def transfer_uap_attack(source_model, target_model, loader, eps=8 / 255, max_images=1000):
-    """Black-box UAP transfer: build the perturbation against `source_model`
-    and evaluate it against `target_model`."""
+def _run_uap_attack(source_model, target_model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
     v = build_uap(source_model, loader, eps=eps, max_images=max_images)
-    correct, total = 0, 0
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+
+    def adv_fn(x, y):
+        return torch.max(torch.min(x + v, clip_max), clip_min)
+
+    return accuracy_from_adv_fn(source_model, loader, adv_fn, target_model=target_model)
+
+
+def run_uap_attack(model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
+    return _run_uap_attack(model, model, loader, eps=eps, max_images=max_images)
+
+
+def transfer_uap_attack(source_model, target_model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
+    return _run_uap_attack(source_model, target_model, loader, eps=eps, max_images=max_images)
+
+
+def projected_pgd_attack(x, y, eps, alpha, steps, grad_fn):
+    clip_min = CLIP_MIN.to(device)
+    clip_max = CLIP_MAX.to(device)
+    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    for _ in range(steps):
+        grad = grad_fn(x_adv, y)
+        grad = torch.zeros_like(x_adv) if grad is None else grad
+        x_adv = x_adv.detach() + alpha * grad.sign()
+        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+    return x_adv.detach()
+
+
+def bpda_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS, backward_model=None):
+    set_ste_mode(model, True)
+    backward_model = backward_model if backward_model is not None else model
+    if backward_model is not model:
+        set_ste_mode(backward_model, True)
+    try:
+        def grad_fn(x_adv, labels):
+            x_adv.requires_grad_(True)
+            loss = F.cross_entropy(backward_model(x_adv), labels)
+            grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+            return grad
+
+        return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
+    finally:
+        set_ste_mode(model, False)
+        if backward_model is not model:
+            set_ste_mode(backward_model, False)
+
+
+def _run_bpda_once(model, loader, eps, n_restarts):
+    correct_masks = []
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        x_adv = torch.max(torch.min(x + v, CLIP_MAX_DEV), CLIP_MIN_DEV)
-        with torch.no_grad(), amp_ctx():
-            pred = target_model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+        worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
+        for _ in range(n_restarts):
+            x_adv = bpda_pgd_attack(model, x, y, eps=eps)
+            with torch.no_grad():
+                pred = model(x_adv).argmax(dim=1)
+            worst_correct &= (pred == y)
+        correct_masks.append(worst_correct)
+    all_correct = torch.cat(correct_masks)
+    return all_correct.float().mean().item()
 
 
-def nes_estimate_gradient(model, x, y, n_samples=20, sigma=1e-3, query_chunk=512):
+def run_bpda(model, loader, eps=DEFAULT_EPS, n_restarts=BPDA_RESTARTS_DEFAULT, seeds=SEEDS):
+    return seed_averaged_metrics("BPDA_PGD", seeds, lambda seed: _run_bpda_once(model, loader, eps, n_restarts))
+
+
+def evaluate_normalized_attack(model, loader, attack_fn):
+    model.eval()
+    return accuracy_from_adv_fn(model, loader, attack_fn)
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def adaptive_pgd_attack(model, x, y, loss_fn, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS):
+    set_ste_mode(model, True)
+    try:
+        def grad_fn(x_adv, labels):
+            x_adv.requires_grad_(True)
+            loss = loss_fn(x_adv, labels)
+            grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+            return grad
+
+        return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
+    finally:
+        set_ste_mode(model, False)
+
+
+def run_sanitized_bpda(model, loader, eps=DEFAULT_EPS):
+    defense_model = unwrap_model(model)
+    backward_model = defense_model.model if hasattr(defense_model, "model") else model
+    acc = evaluate_normalized_attack(
+        model,
+        loader,
+        lambda x, y: bpda_pgd_attack(model, x, y, eps=eps, backward_model=backward_model),
+    )
+    return {"BPDA_Adaptive": acc}
+
+
+def run_eot_pgd(model, loader, eps=DEFAULT_EPS, eot_samples=ADAPTIVE_EOT_SAMPLES):
+    defense_model = unwrap_model(model)
+
+    def attack(x, y):
+        def loss_fn(x_adv, labels):
+            loss = 0.0
+            base_model = defense_model.model if hasattr(defense_model, "model") else model
+            sigma = getattr(defense_model, "sigma", 0.0)
+            clip_min = CLIP_MIN.to(x_adv.device)
+            clip_max = CLIP_MAX.to(x_adv.device)
+            for _ in range(eot_samples):
+                noisy = (x_adv + torch.randn_like(x_adv) * sigma).clamp(clip_min, clip_max)
+                loss = loss + F.cross_entropy(base_model(noisy), labels)
+            return loss / eot_samples
+
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+
+    return {"EOT_PGD": evaluate_normalized_attack(model, loader, attack)}
+
+
+def run_adaptive_guardrail(model, loader, eps=DEFAULT_EPS, lam=ADAPTIVE_GUARDRAIL_LAMBDA):
+    defense_model = unwrap_model(model)
+
+    def attack(x, y):
+        def loss_fn(x_adv, labels):
+            logits = defense_model.model(x_adv)
+            conf = F.softmax(logits, dim=1).max(dim=1).values
+            threshold = getattr(defense_model, "conf_threshold", 0.55)
+            guardrail_penalty = F.softplus(ADAPTIVE_GUARDRAIL_SCALE * (threshold - conf)).mean()
+            return F.cross_entropy(logits, labels) - lam * guardrail_penalty
+
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+
+    return {"Adaptive_Guardrail": evaluate_normalized_attack(model, loader, attack)}
+
+
+def run_adaptive_detect_guard(model, loader, eps=DEFAULT_EPS, lam=ADAPTIVE_DETECTOR_LAMBDA):
+    defense_model = unwrap_model(model)
+
+    def attack(x, y):
+        def loss_fn(x_adv, labels):
+            logits = defense_model.model(x_adv)
+            benign = torch.zeros(labels.size(0), dtype=torch.long, device=labels.device)
+            detector_penalty = F.cross_entropy(defense_model.detector(x_adv), benign)
+            return F.cross_entropy(logits, labels) - lam * detector_penalty
+
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+
+    return {"Adaptive_DetectGuard": evaluate_normalized_attack(model, loader, attack)}
+
+
+def run_defense_adaptive_attacks(model, loader, eps=DEFAULT_EPS):
+    defense_model = unwrap_model(model)
+    if isinstance(defense_model, dfn.SanitizedModel):
+        return run_sanitized_bpda(model, loader, eps=eps)
+    if isinstance(defense_model, dfn.SmoothedModel):
+        return run_eot_pgd(model, loader, eps=eps)
+    if isinstance(defense_model, dfn.GuardrailModel):
+        return run_adaptive_guardrail(model, loader, eps=eps)
+    if isinstance(defense_model, dfn.DetectGuardModel):
+        return run_adaptive_detect_guard(model, loader, eps=eps)
+    return {}
+
+
+def nes_estimate_gradient(model, x, y, n_samples=NES_SAMPLES_DEFAULT, sigma=NES_SIGMA, query_chunk=NES_QUERY_CHUNK):
     """
-    Antithetic NES (Natural Evolution Strategies) gradient estimate of
-    d(loss)/dx, computed from forward passes only -- no backprop through
-    the model. This is the query-only, ZOO/NES-style estimate used as the
-    basis of a genuinely black-box attack, unaffected by gradient masking
-    since no autograd call is made through `model` at all.
+    Estimates d(loss)/dx via antithetic NES sampling: for random directions
+    u, the finite-difference loss(x + sigma*u) - loss(x - sigma*u) weights u
+    in the gradient average. Uses only forward passes -- no backprop through
+    the model. x: (B,C,H,W), y: (B,). Returns a gradient estimate shaped like x.
     """
     if n_samples % 2 != 0:
-        n_samples += 1
+        n_samples += 1  # antithetic pairs require an even sample count
     n_pairs = n_samples // 2
     B = x.size(0)
     grad_acc = torch.zeros_like(x)
@@ -438,9 +408,9 @@ def nes_estimate_gradient(model, x, y, n_samples=20, sigma=1e-3, query_chunk=512
         x_minus = (x.unsqueeze(0) - sigma * u).view(chunk * B, *x.shape[1:])
         y_rep = y.repeat(chunk)
 
-        with torch.no_grad(), amp_ctx():
-            loss_plus = F.cross_entropy(model(x_plus), y_rep, reduction="none").view(chunk, B)
-            loss_minus = F.cross_entropy(model(x_minus), y_rep, reduction="none").view(chunk, B)
+        with torch.no_grad():
+            loss_plus = F.cross_entropy(model(x_plus), y_rep, reduction='none').view(chunk, B)
+            loss_minus = F.cross_entropy(model(x_minus), y_rep, reduction='none').view(chunk, B)
 
         weight = (loss_plus - loss_minus).view(chunk, B, 1, 1, 1)
         grad_acc += (weight * u).sum(dim=0)
@@ -449,73 +419,55 @@ def nes_estimate_gradient(model, x, y, n_samples=20, sigma=1e-3, query_chunk=512
     return grad_acc / (2 * n_pairs * sigma)
 
 
-def nes_pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, steps=10, n_samples=20,
-                    sigma=1e-3, query_chunk=512, clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV):
-    """Black-box L_inf PGD that substitutes the NES gradient estimate above
-    for the true gradient; otherwise identical in structure to pgd_attack."""
-    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-    x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+def nes_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=NES_STEPS, n_samples=NES_SAMPLES_DEFAULT,
+                    sigma=NES_SIGMA, query_chunk=NES_QUERY_CHUNK):
+    def grad_fn(x_adv, labels):
+        return nes_estimate_gradient(model, x_adv, labels, n_samples=n_samples,
+                                      sigma=sigma, query_chunk=query_chunk)
 
-    for _ in range(steps):
-        grad = nes_estimate_gradient(model, x_adv, y, n_samples=n_samples, sigma=sigma, query_chunk=query_chunk)
-        x_adv = x_adv + alpha * grad.sign()
-        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
-        x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-    return x_adv.detach()
+    return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
 
 
-def nes_attack(model, loader, eps=8 / 255, n_samples=20, sigma=1e-3, alpha=2 / 255,
-               steps=10, seed=None, query_chunk=512):
-    """Single-seed black-box NES attack accuracy over the whole loader."""
+def nes_attack(model, loader, eps=DEFAULT_EPS, n_samples=NES_SAMPLES_DEFAULT, sigma=NES_SIGMA, alpha=PGD_ALPHA,
+               steps=NES_STEPS, seed=None, query_chunk=NES_QUERY_CHUNK):
+    """Single-seed NES attack accuracy over the whole loader."""
     if seed is not None:
         torch.manual_seed(seed)
     model.eval()
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        x_adv = nes_pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps,
+    def adv_fn(x, y):
+        return nes_pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps,
                                 n_samples=n_samples, sigma=sigma, query_chunk=query_chunk)
-        with torch.no_grad(), amp_ctx():
-            pred = model(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct / total
+
+    return accuracy_from_adv_fn(model, loader, adv_fn)
+
+
+def run_nes_attack(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, **kwargs):
+    return seed_averaged_metrics("NES", seeds, lambda seed: nes_attack(model, loader, eps=eps, seed=seed, **kwargs))
 
 
 class SubstituteCNN(nn.Module):
-    """Small CNN used as the substitute/surrogate model trained via Jacobian-
-    based dataset augmentation for the black-box surrogate attack below."""
-
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=SUBSTITUTE_NUM_CLASSES):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
+            nn.Conv2d(3, SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.Conv2d(SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.MaxPool2d(SUBSTITUTE_POOL_KERNEL),
+            nn.Conv2d(SUBSTITUTE_CONV1_CHANNELS, SUBSTITUTE_CONV2_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.Conv2d(SUBSTITUTE_CONV2_CHANNELS, SUBSTITUTE_CONV2_CHANNELS, SUBSTITUTE_KERNEL_SIZE, padding=SUBSTITUTE_CONV_PADDING), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.MaxPool2d(SUBSTITUTE_POOL_KERNEL),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, num_classes),
+            nn.Linear(SUBSTITUTE_CONV2_CHANNELS * SUBSTITUTE_LINEAR_FEATURE_MAP * SUBSTITUTE_LINEAR_FEATURE_MAP, SUBSTITUTE_HIDDEN_DIM), nn.ReLU(inplace=SUBSTITUTE_RELU_INPLACE),
+            nn.Linear(SUBSTITUTE_HIDDEN_DIM, num_classes),
         )
 
     def forward(self, x):
         return self.classifier(self.features(x))
 
 
-def train_substitute(target_model, seed_x, rounds=6, epochs_per_round=10, lr=1e-3,
-                      lam=0.1, batch_size=128):
-    """
-    Trains a SubstituteCNN to mimic `target_model`'s predicted labels
-    (Papernot et al., 2017, "Practical Black-Box Attacks against Machine
-    Learning"), using Jacobian-based dataset augmentation: after each
-    training round (except the last), the seed set is doubled with FGSM-
-    perturbed copies (perturbed w.r.t. the substitute's own gradient) so
-    later rounds probe the target's decision boundary more finely.
-    """
+def train_substitute(target_model, seed_x, rounds=SUBSTITUTE_ROUNDS, epochs_per_round=SUBSTITUTE_EPOCHS_PER_ROUND, lr=SUBSTITUTE_LR,
+                      lam=SUBSTITUTE_LAMBDA, batch_size=SUBSTITUTE_BATCH_SIZE):
     target_model.eval()
     substitute = SubstituteCNN().to(device)
     opt = torch.optim.Adam(substitute.parameters(), lr=lr)
@@ -527,7 +479,7 @@ def train_substitute(target_model, seed_x, rounds=6, epochs_per_round=10, lr=1e-
 
         substitute.train()
         ds = torch.utils.data.TensorDataset(x, y)
-        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=TRAIN_SHUFFLE)
         for _ in range(epochs_per_round):
             for xb, yb in dl:
                 opt.zero_grad(set_to_none=True)
@@ -547,11 +499,7 @@ def train_substitute(target_model, seed_x, rounds=6, epochs_per_round=10, lr=1e-
     return substitute
 
 
-def run_surrogate_attack(model, loader, eps=8 / 255, seed_n=500, rounds=6):
-    """Trains a substitute model against `model`'s hard labels, crafts PGD
-    adversarial examples against the substitute, and reports `model`'s
-    accuracy on those examples: a fully black-box (query-only for training,
-    then zero-query for attack generation) robustness check."""
+def run_surrogate_attack(model, loader, eps=DEFAULT_EPS, seed_n=SURROGATE_SEED_N, rounds=SUBSTITUTE_ROUNDS):
     x_seed, n = [], 0
     for x, _ in loader:
         x_seed.append(x)
@@ -569,19 +517,17 @@ def _predict_batch(model, x):
         return model(x).argmax(dim=1)
 
 
-def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
-                            spherical_step=1e-2, source_step=1e-2, step_adapt=1.5,
-                            init_tries=200, init_chunk=25):
+def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=BOUNDARY_STEPS_DEFAULT,
+                            spherical_step=BOUNDARY_SPHERICAL_STEP, source_step=BOUNDARY_SOURCE_STEP, step_adapt=BOUNDARY_STEP_ADAPT,
+                            init_tries=BOUNDARY_INIT_TRIES, init_chunk=BOUNDARY_INIT_CHUNK):
     """
     Decision-based Boundary Attack (Brendel, Bethge, 2018) for a single
-    already-correctly-classified image: starts from a large random
-    perturbation that is already misclassified, then walks along the
-    decision boundary while shrinking distance to `x_orig`, using only
-    hard-label predictions (no gradients, no confidence scores at all).
+    already-correctly-classified image.
     """
     clip_min = clip_min.to(x_orig.device)
     clip_max = clip_max.to(x_orig.device)
 
+    # 1. find an initial point that the model already misclassifies
     x_adv = None
     tries_left = init_tries
     while tries_left > 0 and x_adv is None:
@@ -595,6 +541,7 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
         tries_left -= chunk
 
     if x_adv is None:
+        # no adversarial start found within the query budget -> treat as robust
         return x_orig.clone()
 
     sph_step, src_step = spherical_step, source_step
@@ -603,15 +550,17 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
     for i in range(steps):
         diff = x_orig - x_adv
         dist = diff.norm()
-        if dist.item() < 1e-12:
+        if dist.item() < BOUNDARY_MIN_DIST:
             break
 
+        # random move orthogonal to the direction toward x_orig, same radius
         perturb = torch.randn_like(x_adv)
         perturb = perturb - (perturb * diff).sum() / (dist ** 2) * diff
-        perturb = perturb / (perturb.norm() + 1e-12) * dist * sph_step
+        perturb = perturb / (perturb.norm() + BOUNDARY_MIN_DIST) * dist * sph_step
         cand = x_adv + perturb
+        # re-project onto the sphere of radius `dist` around x_orig
         new_diff = x_orig - cand
-        cand = x_orig - new_diff / (new_diff.norm() + 1e-12) * dist
+        cand = x_orig - new_diff / (new_diff.norm() + BOUNDARY_MIN_DIST) * dist
         cand = torch.clamp(cand, clip_min, clip_max)
 
         sph_ok = (_predict_batch(model, cand.unsqueeze(0))[0] != y_true).item()
@@ -624,57 +573,102 @@ def boundary_attack_single(model, x_orig, y_true, clip_min, clip_max, steps=200,
             if src_ok:
                 x_adv = cand2
 
-        if (i + 1) % 10 == 0:
+        # adapt step sizes every 10 iters based on recent local success rate
+        if (i + 1) % BOUNDARY_ADAPT_INTERVAL == 0:
             if sph_hist:
                 rate = np.mean(sph_hist[-10:])
-                sph_step *= step_adapt if rate > 0.5 else (1 / step_adapt if rate < 0.2 else 1.0)
+                sph_step *= step_adapt if rate > BOUNDARY_SPH_SUCCESS_HIGH else (1 / step_adapt if rate < BOUNDARY_SPH_SUCCESS_LOW else 1.0)
             if src_hist:
                 rate = np.mean(src_hist[-10:])
-                src_step *= step_adapt if rate > 0.5 else (1 / step_adapt if rate < 0.2 else 1.0)
+                src_step *= step_adapt if rate > BOUNDARY_SPH_SUCCESS_HIGH else (1 / step_adapt if rate < BOUNDARY_SPH_SUCCESS_LOW else 1.0)
 
     return x_adv.detach()
 
 
-def run_boundary_attack(model, loader, eps=8 / 255, max_images=50, steps=200, seed=0,
-                         clip_min=CLIP_MIN_DEV, clip_max=CLIP_MAX_DEV):
+def run_boundary_attack(model, loader, eps=DEFAULT_EPS, max_images=BOUNDARY_MAX_IMAGES_DEFAULT, steps=BOUNDARY_STEPS_DEFAULT, seed=BOUNDARY_SEED):
     """
-    Runs the Boundary Attack on up to `max_images` correctly-classified
-    examples (inherently per-sample and query-heavy, so the full eval set
-    is not used) and reports:
-      - Boundary_acc: fraction of attacked images whose minimal L_inf
-        perturbation exceeds eps, i.e. would still be correctly classified
-        within an eps budget -- directly comparable to the other robust-
-        accuracy columns produced elsewhere in this pipeline.
-      - Boundary_mean_Linf: mean minimal L_inf distance to the boundary
-        found.
+    Runs the Boundary Attack on up to `max_images` loader examples and reports
+    estimated robust accuracy over that same subset.
     """
     if seed is not None:
         torch.manual_seed(seed)
     model.eval()
-    clip_min, clip_max = clip_min.squeeze(0), clip_max.squeeze(0)
+    clip_min, clip_max = CLIP_MIN.squeeze(0).to(device), CLIP_MAX.squeeze(0).to(device)
 
     dists = []
-    n_seen = 0
+    total_seen = 0
+    clean_correct = 0
+    robust_correct = 0
     for x, y in loader:
-        if n_seen >= max_images:
+        if total_seen >= max_images:
             break
         x, y = x.to(device), y.to(device)
         with torch.no_grad():
             pred = model(x).argmax(dim=1)
         for i in range(x.size(0)):
-            if n_seen >= max_images:
+            if total_seen >= max_images:
                 break
-            if pred[i] != y[i]:
+            total_seen += 1
+            if (pred[i] != y[i]).item():
                 continue
+            clean_correct += 1
             x_adv = boundary_attack_single(model, x[i], y[i], clip_min, clip_max, steps=steps)
-            dists.append((x_adv - x[i]).abs().max().item())
-            n_seen += 1
+            dist = (denormalize_inputs(x_adv.unsqueeze(0)) - denormalize_inputs(x[i].unsqueeze(0))).abs().max().item()
+            adv_found = (_predict_batch(model, x_adv.unsqueeze(0))[0] != y[i]).item()
+            if adv_found:
+                dists.append(dist)
+            if (not adv_found) or dist > eps:
+                robust_correct += 1
 
-    if not dists:
-        return {"Boundary_acc": None, "Boundary_mean_Linf": None}
+    if total_seen == 0:
+        return {
+            "Boundary_acc": None,
+            "Boundary_mean_Linf": None,
+            "Boundary_median_Linf": None,
+            "Boundary_min_Linf": None,
+            "Boundary_max_Linf": None,
+            "Boundary_std_Linf": None,
+            "Boundary_n": 0,
+        }
 
-    dists = np.array(dists)
+    dists = np.array(dists, dtype=float)
+    boundary_acc = robust_correct / total_seen
+    clean_subset_acc = clean_correct / total_seen
+    if boundary_acc > clean_subset_acc + 1e-12:
+        warnings.warn(
+            "Boundary_acc exceeded clean accuracy on the evaluated subset; the old subset-only metric could do this because it divided only by clean-correct attacked samples.",
+            RuntimeWarning,
+        )
     return {
-        "Boundary_acc": float((dists > eps).mean()),
-        "Boundary_mean_Linf": float(dists.mean()),
+        "Boundary_acc": float(boundary_acc),
+        "Boundary_mean_Linf": float(dists.mean()) if dists.size else None,
+        "Boundary_median_Linf": float(np.median(dists)) if dists.size else None,
+        "Boundary_min_Linf": float(dists.min()) if dists.size else None,
+        "Boundary_max_Linf": float(dists.max()) if dists.size else None,
+        "Boundary_std_Linf": float(dists.std()) if dists.size else None,
+        "Boundary_n": int(total_seen),
     }
+
+
+def random_noise_attack(model, loader, eps=DEFAULT_EPS, n_restarts=1, seed=None):
+    if seed is not None:
+        torch.manual_seed(seed)
+    model.eval()
+    clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
+            for _ in range(n_restarts):
+                noise = torch.empty_like(x).uniform_(-eps, eps)
+                x_adv = torch.max(torch.min(x + noise, clip_max), clip_min)
+                pred = model(x_adv).argmax(dim=1)
+                worst_correct &= (pred == y)
+            correct += worst_correct.sum().item()
+            total += y.size(0)
+    return correct / total
+
+
+def run_random_noise_seeded(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
+    return seed_averaged_metrics("Random_Noise", seeds, lambda seed: random_noise_attack(model, loader, eps=eps, seed=seed))

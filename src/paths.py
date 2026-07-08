@@ -1,43 +1,47 @@
-"""
-Filesystem path helpers for per-model result files.
-
-All per-run artifacts (results, sweeps, ablations, layerwise profiles,
-trajectories, and their combined/aggregated counterparts) are namespaced by
-model name and centralized here so that both the experiment runner and the
-result-combining/plotting code agree on where files live.
-"""
+"""Filesystem path helpers for QuantAdv artifacts."""
 import os
 
 from .config import DATA_DIR
 
 
+def csv_path(model_name, type):
+    return os.path.join(DATA_DIR, f"{type}_{model_name}.csv")
+
+
+def json_path(model_name, type):
+    return os.path.join(DATA_DIR, f"{type}_{model_name}.json")
+
+
+def defense_summary_csv_path():
+    return os.path.join(DATA_DIR, "defense_summary.csv")
+
+
+# Backward-compatible names used by older callers.
 def results_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"results_{model_name}.csv")
+    return csv_path(model_name, "results")
 
 
 def sweep_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"sweep_{model_name}.csv")
+    return csv_path(model_name, "sweep")
 
 
 def ablation_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"ablation_{model_name}.csv")
+    return csv_path(model_name, "ablation")
 
 
 def layerwise_csv_path(model_name):
-    return os.path.join(DATA_DIR, f"layerwise_{model_name}.csv")
+    return csv_path(model_name, "layerwise")
 
 
 def trajectory_json_path(model_name):
-    return os.path.join(DATA_DIR, f"trajectory_{model_name}.json")
+    return json_path(model_name, "trajectory")
 
 
 def component_ablation_csv_path(model_name):
-    """weight-only vs activation-only vs both quantization ablation."""
-    return os.path.join(DATA_DIR, f"component_ablation_{model_name}.csv")
+    return csv_path(model_name, "component_ablation")
 
 
-# --- Combined / aggregated result paths (used by quantadv.combine) --------
-
+# Combined / aggregated result paths used by the older combine module.
 RESULTS_GLOB = os.path.join(DATA_DIR, "results_*.csv")
 SWEEP_GLOB = os.path.join(DATA_DIR, "sweep_*.csv")
 ABLATION_GLOB = os.path.join(DATA_DIR, "ablation_*.csv")
@@ -57,3 +61,6 @@ ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "ablation_plot.png")
 TRAJECTORY_PLOT_PNG = os.path.join(DATA_DIR, "trajectory_plot.png")
 LAYERWISE_PLOT_PNG = os.path.join(DATA_DIR, "layerwise_plot.png")
 SCORECARD_PLOT_PNG = os.path.join(DATA_DIR, "masking_scorecard_plot.png")
+
+
+
