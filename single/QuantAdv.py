@@ -40,7 +40,7 @@ from ResourceMonitor import ResourceMonitor
 from attack import *
 
 """
-Modernized non-threaded analysis of metrics of attacks per model and eplison
+Actively developed analysis of metrics of attacks per model and eplison
 """
 
 

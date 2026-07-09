@@ -24,10 +24,13 @@ or set Download=true
 To run  
 `python src/run_experiment.py`  
 `python src/combine_results`  
-`python archive/QuantAdv.py`  
+`python single/QuantAdv.py`  
 
 Parallelized (obsolete)  
 `python archive/launcher.py`
+
+To combine incomplete results  
+`python single/combine.py`
 
 > **Notice:** You may need to adjust pathing or move the scripts to root for obsolete files.
 
@@ -35,6 +38,8 @@ Results are in ./data
 
 ![Attack Accuracy](demo/accuracy_plot.png)
 ![Elipson](demo/accuracyperturb.png)
+![HeatMap](demo/heatmapplot.png)
+
 
 <!-- <p align="center">
   <img src="data/demo/accuracy_plot.png" alt="Attack Accuracy" width="400"/>

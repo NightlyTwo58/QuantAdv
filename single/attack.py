@@ -1,19 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-attack.py
-
-All adversarial-attack logic factored out of the main analysis script:
+All adversarial-attack logic
 - generic PGD/attack helpers (make_torchattack, accuracy_from_adv_fn family)
 - white-box attacks (FGSM/PGD, AutoAttack, CW/DeepFool/JSMA)
 - transfer attacks (PGD/MIM transfer, UAP, surrogate/substitute training)
 - black-box attacks (NES, Boundary attack)
 - defense-adaptive attacks (BPDA, EOT-PGD, adaptive guardrail/detector attacks)
 - diagnostics that are attack-driven (trajectory, margins, staircase, PGD-steps ablation)
-
-This module intentionally has no knowledge of quantization internals beyond
-calling `set_ste_mode` (passed in from the caller's model) so it can be
-imported independently of the quantization/model-registry code.
 """
 
 import math
