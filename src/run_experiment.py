@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 """CLI entrypoint for the active QuantAdv experiment."""
+
 import sys
 from pathlib import Path
 

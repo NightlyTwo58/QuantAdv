@@ -1,4 +1,5 @@
 """Clean accuracy and epsilon-sweep evaluation routines."""
+
 import os
 import traceback
 
@@ -43,7 +44,14 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
         try:
-            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+            pgd = make_torchattack(
+                torchattacks.PGD,
+                model,
+                eps=eps,
+                alpha=PGD_ALPHA,
+                steps=PGD_STEPS,
+                random_start=PGD_RANDOM_START,
+            )
             row["PGD_acc"] = accuracy_under_attack(model, loader, pgd)
         except Exception as e:
             print(f"  [WARN] PGD sweep failed for {name} eps={eps:.4f}: {e}")
@@ -57,7 +65,9 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
 
         if is_quant:
             try:
-                row["BPDA_acc"] = _run_bpda_once(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SWEEP)
+                row["BPDA_acc"] = _run_bpda_once(
+                    model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SWEEP
+                )
             except Exception as e:
                 print(f"  [WARN] BPDA sweep failed for {name} eps={eps:.4f}: {e}")
                 row["BPDA_acc"] = None

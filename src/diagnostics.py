@@ -1,4 +1,5 @@
 """Gradient-masking diagnostics and quantization ablations."""
+
 import json
 
 import numpy as np
@@ -26,7 +27,9 @@ from .quantization import (
 )
 
 
-def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX_BATCHES):
+def gradient_diagnostics(
+    model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX_BATCHES
+):
     set_ste_mode(model, False)
     frac_zero_hard, norm_hard = [], []
     frac_zero_ste, norm_ste = [], []
@@ -41,7 +44,9 @@ def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX
         x_in = x.clone().requires_grad_(True)
         loss = F.cross_entropy(model(x_in), y)
         g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
-        frac_zero_hard.append((g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item())
+        frac_zero_hard.append(
+            (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
+        )
         norm_hard.append(g_hard.norm().item())
 
         set_ste_mode(model, True)
@@ -57,7 +62,9 @@ def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX
             x_ref = x.clone().requires_grad_(True)
             loss_ref = F.cross_entropy(fp32_ref(x_ref), y)
             g_ref = torch.autograd.grad(loss_ref, x_ref)[0].flatten()
-            cos_sims.append(F.cosine_similarity(g_ste.unsqueeze(0), g_ref.unsqueeze(0)).item())
+            cos_sims.append(
+                F.cosine_similarity(g_ste.unsqueeze(0), g_ref.unsqueeze(0)).item()
+            )
 
     diagnostics = {
         "frac_zero_grad_hard": float(np.mean(frac_zero_hard)),
@@ -77,7 +84,14 @@ def pgd_steps_ablation(model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_ST
         if steps == 0:
             acc = random_noise_attack(model, loader, eps=eps, seed=0)
         else:
-            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=steps, random_start=PGD_RANDOM_START)
+            pgd = make_torchattack(
+                torchattacks.PGD,
+                model,
+                eps=eps,
+                alpha=PGD_ALPHA,
+                steps=steps,
+                random_start=PGD_RANDOM_START,
+            )
             acc = accuracy_under_attack(model, loader, pgd)
         out[steps] = acc
     return out
@@ -121,9 +135,7 @@ def pgd_trajectory_diagnostics(
                 loss = F.cross_entropy(logits, y)
                 grad = torch.autograd.grad(loss, x_adv)[0]
 
-                step_grad_norms[s] += (
-                    grad.flatten(1).norm(dim=1).mean().item()
-                )
+                step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
 
                 x_adv = x_adv.detach() + alpha * grad.sign()
 
@@ -135,13 +147,7 @@ def pgd_trajectory_diagnostics(
                 x_adv = x_adv.clamp(0.0, 1.0).detach()
 
                 step_movement[s] += (
-                    (x_adv - x_start)
-                    .flatten(1)
-                    .abs()
-                    .max(dim=1)
-                    .values
-                    .mean()
-                    .item()
+                    (x_adv - x_start).flatten(1).abs().max(dim=1).values.mean().item()
                 )
 
             n_batches += 1
@@ -155,9 +161,7 @@ def pgd_trajectory_diagnostics(
         }
 
     return {
-        "grad_norm_per_step": [
-            value / n_batches for value in step_grad_norms
-        ],
+        "grad_norm_per_step": [value / n_batches for value in step_grad_norms],
         "movement_from_random_start_per_step": [
             value / n_batches for value in step_movement
         ],
@@ -165,7 +169,11 @@ def pgd_trajectory_diagnostics(
 
 
 def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BATCHES):
-    quant_layers = [(n, m) for n, m in model.named_modules() if isinstance(m, (QuantConv2d, QuantLinear))]
+    quant_layers = [
+        (n, m)
+        for n, m in model.named_modules()
+        if isinstance(m, (QuantConv2d, QuantLinear))
+    ]
     norms = {n: [] for n, _ in quant_layers}
     handles = []
 
@@ -197,10 +205,14 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
         set_ste_mode(model, False)
 
     ordered_names = [n for n, _ in quant_layers]
-    return {n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names}
+    return {
+        n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names
+    }
 
 
-def staircase_diagnostic(model, loader, radius=STAIRCASE_RADIUS, n_points=STAIRCASE_N_POINTS):
+def staircase_diagnostic(
+    model, loader, radius=STAIRCASE_RADIUS, n_points=STAIRCASE_N_POINTS
+):
     model.eval()
     x, y = next(iter(loader))
     x = x.to(device)
@@ -233,7 +245,14 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
         clean_acc = sanity_check_accuracy(model, loader)
 
         torch.manual_seed(0)
-        pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+        pgd = make_torchattack(
+            torchattacks.PGD,
+            model,
+            eps=eps,
+            alpha=PGD_ALPHA,
+            steps=PGD_STEPS,
+            random_start=PGD_RANDOM_START,
+        )
         pgd_acc = accuracy_under_attack(model, loader, pgd)
 
         x, y = next(iter(loader))
@@ -243,24 +262,38 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
         g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
         frac_zero = (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
 
-        rows.append({
-            "model": name, "config": label,
-            "quant_weight": qw, "quant_act": qa,
-            "clean_acc": clean_acc, "PGD_acc": pgd_acc,
-            "frac_zero_grad_hard": frac_zero,
-        })
+        rows.append(
+            {
+                "model": name,
+                "config": label,
+                "quant_weight": qw,
+                "quant_act": qa,
+                "clean_acc": clean_acc,
+                "PGD_acc": pgd_acc,
+                "frac_zero_grad_hard": frac_zero,
+            }
+        )
 
     # restore original (both quantized) state
     set_quant_components(model, True, True)
     return rows
 
 
-def run_chunk_quantization_attacks(fp32_model, loader, name, bits=QAT_BITS, n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS):
+def run_chunk_quantization_attacks(
+    fp32_model,
+    loader,
+    name,
+    bits=QAT_BITS,
+    n_chunks=CHUNK_QUANT_NUM_CHUNKS,
+    eps=DEFAULT_EPS,
+):
     layer_names = quantizable_layer_names(fp32_model)
     chunks = quant_layer_chunks(layer_names, n_chunks)
     rows = []
     for i, chunk in enumerate(chunks, start=1):
-        chunk_model = convert_layer_chunk_to_quant(fp32_model, chunk, bits=bits, quant_weight=True, quant_act=True)
+        chunk_model = convert_layer_chunk_to_quant(
+            fp32_model, chunk, bits=bits, quant_weight=True, quant_act=True
+        )
         row = {
             "model": name,
             "bits": bits,
@@ -275,10 +308,19 @@ def run_chunk_quantization_attacks(fp32_model, loader, name, bits=QAT_BITS, n_ch
         try:
             row["clean_acc"] = sanity_check_accuracy(chunk_model, loader)
         except Exception as e:
-            print(f"  [WARN] chunk clean_acc failed for {name} {row['chunk_label']}: {e}")
+            print(
+                f"  [WARN] chunk clean_acc failed for {name} {row['chunk_label']}: {e}"
+            )
             row["clean_acc"] = None
         try:
-            pgd = make_torchattack(torchattacks.PGD, chunk_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+            pgd = make_torchattack(
+                torchattacks.PGD,
+                chunk_model,
+                eps=eps,
+                alpha=PGD_ALPHA,
+                steps=PGD_STEPS,
+                random_start=PGD_RANDOM_START,
+            )
             row["PGD_acc"] = accuracy_under_attack(chunk_model, loader, pgd)
         except Exception as e:
             print(f"  [WARN] chunk PGD failed for {name} {row['chunk_label']}: {e}")
@@ -290,9 +332,18 @@ def run_chunk_quantization_attacks(fp32_model, loader, name, bits=QAT_BITS, n_ch
     return rows
 
 
-def confidence_margin_diagnostic(model, loader, eps=DEFAULT_EPS, steps=MARGIN_STEPS, max_batches=MARGIN_MAX_BATCHES):
+def confidence_margin_diagnostic(
+    model, loader, eps=DEFAULT_EPS, steps=MARGIN_STEPS, max_batches=MARGIN_MAX_BATCHES
+):
     model.eval()
-    pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=steps, random_start=PGD_RANDOM_START)
+    pgd = make_torchattack(
+        torchattacks.PGD,
+        model,
+        eps=eps,
+        alpha=PGD_ALPHA,
+        steps=steps,
+        random_start=PGD_RANDOM_START,
+    )
     clean_margins, adv_margins = [], []
     for bi, (x, y) in enumerate(loader):
         if bi >= max_batches:

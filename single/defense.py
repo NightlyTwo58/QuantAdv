@@ -37,7 +37,9 @@ def _quantize_tensor(t, bits):
     if bits is None:
         return t
     qmax = 2 ** (bits - 1) - 1
-    scale = torch.clamp(t.detach().abs().max() / qmax, min=_cfg("QUANT_SCALE_MIN", 1e-8))
+    scale = torch.clamp(
+        t.detach().abs().max() / qmax, min=_cfg("QUANT_SCALE_MIN", 1e-8)
+    )
     q = torch.round(t / scale).clamp(-qmax - 1, qmax)
     return q * scale
 
@@ -76,7 +78,9 @@ def _to_quant_module(module, bits):
         return new
 
     if isinstance(module, nn.Linear):
-        new = _QuantLinear(module.in_features, module.out_features, bias=module.bias is not None)
+        new = _QuantLinear(
+            module.in_features, module.out_features, bias=module.bias is not None
+        )
         new.weight = module.weight
         if module.bias is not None:
             new.bias = module.bias
@@ -103,7 +107,11 @@ def quantized_copy(model, bits):
 
 def prepare_adversarial_training(base_model, loader, bits=None):
     dev = _device()
-    model = quantized_copy(base_model, bits) if bits is not None else copy.deepcopy(base_model).to(dev)
+    model = (
+        quantized_copy(base_model, bits)
+        if bits is not None
+        else copy.deepcopy(base_model).to(dev)
+    )
     model.train()
 
     epochs = _cfg("DEFENSE_AT_EPOCHS", 1)
@@ -119,7 +127,9 @@ def prepare_adversarial_training(base_model, loader, bits=None):
         weight_decay=_cfg("QAT_WEIGHT_DECAY", 5e-4),
     )
     scaler = GradScaler(device=dev.type)
-    attack = make_attack(torchattacks.PGD, model, eps=eps, alpha=alpha, steps=steps, random_start=True)
+    attack = make_attack(
+        torchattacks.PGD, model, eps=eps, alpha=alpha, steps=steps, random_start=True
+    )
 
     for _ in range(epochs):
         for x, y in loader:
@@ -150,9 +160,19 @@ class SanitizedModel(nn.Module):
     def forward(self, x):
         pixels = denormalize_inputs(x).clamp(0.0, 1.0)
         pixels = T.functional.gaussian_blur(pixels, kernel_size=3)
-        pixels = F.interpolate(pixels, size=(self.resize, self.resize), mode="bilinear", align_corners=False)
-        pixels = F.interpolate(pixels, size=(CIFAR_IMAGE_SIZE, CIFAR_IMAGE_SIZE), mode="bilinear", align_corners=False)
-        levels = float(2 ** self.bits - 1)
+        pixels = F.interpolate(
+            pixels,
+            size=(self.resize, self.resize),
+            mode="bilinear",
+            align_corners=False,
+        )
+        pixels = F.interpolate(
+            pixels,
+            size=(CIFAR_IMAGE_SIZE, CIFAR_IMAGE_SIZE),
+            mode="bilinear",
+            align_corners=False,
+        )
+        levels = float(2**self.bits - 1)
         pixels = torch.round(pixels * levels).div(levels)
         return self.model(normalize_pixels(pixels.clamp(0.0, 1.0)))
 
@@ -169,10 +189,14 @@ class SmoothedModel(nn.Module):
             logits = 0.0
             for _ in range(self.samples):
                 noise = torch.randn_like(x) * self.sigma
-                logits = logits + self.model((x + noise).clamp(CLIP_MIN.to(x.device), CLIP_MAX.to(x.device)))
+                logits = logits + self.model(
+                    (x + noise).clamp(CLIP_MIN.to(x.device), CLIP_MAX.to(x.device))
+                )
             return logits / self.samples
         noise = torch.randn_like(x) * self.sigma
-        return self.model((x + noise).clamp(CLIP_MIN.to(x.device), CLIP_MAX.to(x.device)))
+        return self.model(
+            (x + noise).clamp(CLIP_MIN.to(x.device), CLIP_MAX.to(x.device))
+        )
 
 
 class GuardrailModel(nn.Module):
@@ -223,8 +247,19 @@ def train_adversarial_detector(base_model, loader):
     alpha = _cfg("PGD_ALPHA", 2 / 255)
     steps = _cfg("DEFENSE_DETECTOR_PGD_STEPS", 3)
 
-    opt = torch.optim.AdamW(detector.parameters(), lr=lr, weight_decay=_cfg("DEFENSE_DETECTOR_WEIGHT_DECAY", 1e-4))
-    attack = make_attack(torchattacks.PGD, base_model, eps=eps, alpha=alpha, steps=steps, random_start=True)
+    opt = torch.optim.AdamW(
+        detector.parameters(),
+        lr=lr,
+        weight_decay=_cfg("DEFENSE_DETECTOR_WEIGHT_DECAY", 1e-4),
+    )
+    attack = make_attack(
+        torchattacks.PGD,
+        base_model,
+        eps=eps,
+        alpha=alpha,
+        steps=steps,
+        random_start=True,
+    )
 
     for _ in range(epochs):
         for x, y in loader:
@@ -235,10 +270,12 @@ def train_adversarial_detector(base_model, loader):
             x_adv = normalize_pixels(x_adv_pixel).detach()
 
             xb = torch.cat([x, x_adv], dim=0)
-            yb = torch.cat([
-                torch.zeros(x.size(0), dtype=torch.long, device=dev),
-                torch.ones(x_adv.size(0), dtype=torch.long, device=dev),
-            ])
+            yb = torch.cat(
+                [
+                    torch.zeros(x.size(0), dtype=torch.long, device=dev),
+                    torch.ones(x_adv.size(0), dtype=torch.long, device=dev),
+                ]
+            )
 
             opt.zero_grad(set_to_none=True)
             loss = F.cross_entropy(detector(xb), yb)
