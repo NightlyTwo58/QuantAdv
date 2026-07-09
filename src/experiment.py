@@ -1,4 +1,5 @@
 """Experiment entrypoint orchestrating the active archive workflow."""
+
 import importlib.util
 import os
 import traceback
@@ -38,13 +39,20 @@ from .plots import (
 
 
 def check_environment():
-    missing = [pkg for pkg in ("torchattacks", "autoattack", "pytorchcv") if importlib.util.find_spec(pkg) is None]
+    missing = [
+        pkg
+        for pkg in ("torchattacks", "autoattack", "pytorchcv")
+        if importlib.util.find_spec(pkg) is None
+    ]
     if missing:
-        raise ImportError(f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt")
+        raise ImportError(
+            f"Missing packages: {missing}.\nInstall via: pip install -r requirements.txt"
+        )
     print("All required packages are available.")
     print("device:", device)
     if not os.path.isdir(CIFAR10_DIR):
         raise FileNotFoundError(f"Expected extracted CIFAR-10 at {CIFAR10_DIR!r}")
+
 
 def main():
     check_environment()
@@ -56,10 +64,14 @@ def main():
         try:
             fp32 = load_pretrained(arch_key)
             fp32_layer_names = quantizable_layer_names(fp32)
-            print(f"  FP32 quantizable nn.Conv2d/nn.Linear layers: {len(fp32_layer_names)}")
+            print(
+                f"  FP32 quantizable nn.Conv2d/nn.Linear layers: {len(fp32_layer_names)}"
+            )
             print(f"  first quantizable layers: {fp32_layer_names[:8]}")
             if not fp32_layer_names:
-                raise RuntimeError(f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers.")
+                raise RuntimeError(
+                    f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers."
+                )
             acc = sanity_check_accuracy(fp32, eval_loader)
             print(f"  loaded pretrained {arch_key}, clean acc: {acc:.3f}")
             model_registry[f"{arch_key}_FP32"] = (fp32, None)
@@ -69,8 +81,12 @@ def main():
             continue
 
         try:
-            int8_ptq = convert_to_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
-            verify_quantization_layers(arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names)
+            int8_ptq = convert_to_quant(
+                fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+            )
+            verify_quantization_layers(
+                arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names
+            )
             model_registry[f"{arch_key}_int8_PTQ"] = (int8_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 PTQ for {arch_key}: {e}")
@@ -79,7 +95,9 @@ def main():
 
         try:
             int4_ptq = convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True)
-            verify_quantization_layers(arch_key, fp32, int4_ptq, "int4 PTQ", fp32_layer_names)
+            verify_quantization_layers(
+                arch_key, fp32, int4_ptq, "int4 PTQ", fp32_layer_names
+            )
             model_registry[f"{arch_key}_int4_PTQ"] = (int4_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
@@ -87,8 +105,15 @@ def main():
             raise
 
         try:
-            int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS)
-            verify_quantization_layers(arch_key, fp32, int8_qat, "int8 QAT", fp32_layer_names)
+            int8_qat = prepare_qat(
+                fp32,
+                bits=QAT_BITS,
+                finetune_loader=finetune_loader,
+                epochs=QAT_MAIN_EPOCHS,
+            )
+            verify_quantization_layers(
+                arch_key, fp32, int8_qat, "int8 QAT", fp32_layer_names
+            )
             model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
@@ -96,44 +121,70 @@ def main():
             raise
 
         if QUANTIZATION_DEBUG_ONLY:
-            print("\nQUANTIZATION_DEBUG_ONLY=True; exiting before defenses, attacks, sweeps, and plots.")
+            print(
+                "\nQUANTIZATION_DEBUG_ONLY=True; exiting before defenses, attacks, sweeps, and plots."
+            )
             print("Registry built:", list(model_registry.keys()))
             return
 
         try:
-            model_registry[f"{arch_key}_FP32_Compressed"] = (with_image_compression(fp32), fp32)
+            model_registry[f"{arch_key}_FP32_Compressed"] = (
+                with_image_compression(fp32),
+                fp32,
+            )
         except Exception as e:
             print(f"  [FAIL] compressed FP32 for {arch_key}: {e}")
 
         try:
-            chaotic_int8_ptq = convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
+            chaotic_int8_ptq = convert_to_chaotic_quant(
+                fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+            )
             model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (chaotic_int8_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] chaotic int8 PTQ for {arch_key}: {e}")
 
         try:
-            chaotic_int4_ptq = convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True)
+            chaotic_int4_ptq = convert_to_chaotic_quant(
+                fp32, bits=4, quant_weight=True, quant_act=True
+            )
             model_registry[f"{arch_key}_chaotic_int4_PTQ"] = (chaotic_int4_ptq, fp32)
         except Exception as e:
             print(f"  [FAIL] chaotic int4 PTQ for {arch_key}: {e}")
 
         try:
-            compressed_chaotic_int8 = with_image_compression(convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True))
-            model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (compressed_chaotic_int8, fp32)
+            compressed_chaotic_int8 = with_image_compression(
+                convert_to_chaotic_quant(
+                    fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+                )
+            )
+            model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (
+                compressed_chaotic_int8,
+                fp32,
+            )
         except Exception as e:
             print(f"  [FAIL] compressed chaotic int8 PTQ for {arch_key}: {e}")
 
         try:
-            chaotic_int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS, chaotic=True)
+            chaotic_int8_qat = prepare_qat(
+                fp32,
+                bits=QAT_BITS,
+                finetune_loader=finetune_loader,
+                epochs=QAT_MAIN_EPOCHS,
+                chaotic=True,
+            )
             model_registry[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
 
     try:
-        model_registry, df_defense_summary = run_defense_suite(model_registry, finetune_loader, eval_loader)
+        model_registry, df_defense_summary = run_defense_suite(
+            model_registry, finetune_loader, eval_loader
+        )
         if not df_defense_summary.empty:
-            print("\nDefense summary (guardrail/detector flag rates, certified accuracy):")
+            print(
+                "\nDefense summary (guardrail/detector flag rates, certified accuracy):"
+            )
             print(df_defense_summary.to_string(index=False))
     except Exception as e:
         print(f"  [FAIL] run_defense_suite failed: {e}")
@@ -151,7 +202,14 @@ def main():
             continue
         print(f"\nChunk quantization sweep for {arch_key} ...")
         try:
-            rows = run_chunk_quantization_attacks(entry[0], eval_loader, arch_key, bits=QAT_BITS, n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS)
+            rows = run_chunk_quantization_attacks(
+                entry[0],
+                eval_loader,
+                arch_key,
+                bits=QAT_BITS,
+                n_chunks=CHUNK_QUANT_NUM_CHUNKS,
+                eps=DEFAULT_EPS,
+            )
             pd.DataFrame(rows).to_csv(out_path, index=False)
             print(f"Chunk quantization results saved to {out_path}")
         except Exception as e:
@@ -196,7 +254,8 @@ def main():
     print(df_results)
 
     adaptive_cols = [
-        c for c in [
+        c
+        for c in [
             "BPDA_PGD",
             "BPDA_Adaptive",
             "EOT_PGD",
@@ -210,7 +269,9 @@ def main():
     ]
 
     if adaptive_cols:
-        df_results["Worst_Robust_Acc"] = df_results[adaptive_cols].min(axis=1, skipna=True)
+        df_results["Worst_Robust_Acc"] = df_results[adaptive_cols].min(
+            axis=1, skipna=True
+        )
 
     if {"PGD", "Worst_Robust_Acc"}.issubset(df_results.columns):
         df_results["Gradient_Masking_Gap"] = (
@@ -219,43 +280,60 @@ def main():
 
     fp32_baseline = (
         df_results[df_results["model"].str.endswith("_FP32")]
-        .assign(
-            Architecture=lambda d: d["model"].str.replace(
-                "_FP32", "", regex=False
-            )
-        )
+        .assign(Architecture=lambda d: d["model"].str.replace("_FP32", "", regex=False))
         .set_index("Architecture")["Worst_Robust_Acc"]
     )
 
-    df_results["Architecture"] = (
-        df_results["model"]
-        .str.replace(r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT).*", "", regex=True)
+    df_results["Architecture"] = df_results["model"].str.replace(
+        r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT).*", "", regex=True
     )
 
-    df_results["FP32_Worst_Robust_Acc"] = (
-        df_results["Architecture"].map(fp32_baseline)
-    )
+    df_results["FP32_Worst_Robust_Acc"] = df_results["Architecture"].map(fp32_baseline)
 
     if {
         "Worst_Robust_Acc",
         "FP32_Worst_Robust_Acc",
     }.issubset(df_results.columns):
         df_results["True_Robustness_Gain"] = (
-            df_results["Worst_Robust_Acc"]
-            - df_results["FP32_Worst_Robust_Acc"]
+            df_results["Worst_Robust_Acc"] - df_results["FP32_Worst_Robust_Acc"]
         )
 
     df_results.to_csv(RESULTS_CSV, index=False)
 
-    acc_cols = [c for c in ["clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
-                             "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
-                             "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
-                             "Surrogate_Transfer", "Random_Noise", "BPDA_PGD",
-                             "BPDA_Adaptive", "EOT_PGD", "Adaptive_Guardrail", "Adaptive_DetectGuard"]
-                if c in df_results.columns]
+    acc_cols = [
+        c
+        for c in [
+            "clean_acc",
+            "FGSM",
+            "PGD",
+            "CW",
+            "DeepFool",
+            "JSMA",
+            "AutoAttack",
+            "Transfer_from_FP32",
+            "MIM_Transfer",
+            "UAP_Transfer",
+            "Transfer_to_FP32",
+            "MIM_Transfer_to_FP32",
+            "UAP_Transfer_to_FP32",
+            "Surrogate_Transfer",
+            "Random_Noise",
+            "BPDA_PGD",
+            "BPDA_Adaptive",
+            "EOT_PGD",
+            "Adaptive_Guardrail",
+            "Adaptive_DetectGuard",
+        ]
+        if c in df_results.columns
+    ]
 
     if len(acc_cols) > 0:
-        df_plot = df_results.melt(id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy")
+        df_plot = df_results.melt(
+            id_vars="model",
+            value_vars=acc_cols,
+            var_name="Attack",
+            value_name="Accuracy",
+        )
 
         plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
         sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Attack")
@@ -269,14 +347,18 @@ def main():
 
     if os.path.exists(SWEEP_CSV):
         df_sweep = pd.read_csv(SWEEP_CSV)
-        sweep_done = set(zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6)))
+        sweep_done = set(
+            zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6))
+        )
     else:
         df_sweep = pd.DataFrame()
         sweep_done = set()
 
     for name, (model, ref) in model_registry.items():
         print(f"\nSweeping {name} ...")
-        pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done]
+        pending_eps = [
+            eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done
+        ]
         if not pending_eps:
             print(f"  Skipping {name} (already done)")
             continue

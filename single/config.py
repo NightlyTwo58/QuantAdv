@@ -1,6 +1,7 @@
 """
 Central configuration and constants for QuantAdvOld.py.
 """
+
 import logging
 import os
 from pathlib import Path
@@ -41,7 +42,9 @@ DEFENSE_PLOT_PNG = os.path.join(DATA_DIR, "defense_comparison.png")
 ABLATION_COMBINED_CSV = os.path.join(DATA_DIR, "ablation_combined.csv")
 LAYERWISE_COMBINED_CSV = os.path.join(DATA_DIR, "layerwise_combined.csv")
 TRAJECTORY_COMBINED_CSV = os.path.join(DATA_DIR, "trajectory_combined.csv")
-COMPONENT_ABLATION_COMBINED_CSV = os.path.join(DATA_DIR, "component_ablation_combined.csv")
+COMPONENT_ABLATION_COMBINED_CSV = os.path.join(
+    DATA_DIR, "component_ablation_combined.csv"
+)
 MARGIN_COMBINED_CSV = os.path.join(DATA_DIR, "margin_combined.csv")
 CHUNK_COMBINED_CSV = os.path.join(DATA_DIR, "chunk_quant_combined.csv")
 DEFENSE_SUMMARY_CSV = os.path.join(DATA_DIR, "defense_summary.csv")
@@ -221,7 +224,16 @@ STAIRCASE_N_POINTS = 40
 MARGIN_MAX_BATCHES = 3
 MARGIN_STEPS = 20
 
-SWEEP_EPSILONS = [1 / 255, 2 / 255, 3 / 255, 4 / 255, 6 / 255, 8 / 255, 12 / 255, 16 / 255]
+SWEEP_EPSILONS = [
+    1 / 255,
+    2 / 255,
+    3 / 255,
+    4 / 255,
+    6 / 255,
+    8 / 255,
+    12 / 255,
+    16 / 255,
+]
 
 PLOT_DPI = 300
 PLOT_BBOX_INCHES = "tight"
