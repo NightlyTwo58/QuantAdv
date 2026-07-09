@@ -7,7 +7,7 @@ import pandas as pd
 import seaborn as sns
 
 from .config import *
-from .paths import csv_path, json_path
+from .paths import csv_path, json_path, SCORECARD_CSV, SCORECARD_PLOT_PNG
 
 
 def plot_defense_comparison(df_results):
@@ -292,3 +292,28 @@ def plot_results_heatmap_by_category(df_results):
         plt.tight_layout()
         plt.savefig(os.path.join(DATA_DIR, f"heatmap_{title}.png"), dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
         plt.show()
+
+
+def plot_masking_scorecard(df_scorecard=None):
+    """Read the masking scorecard (or accept it directly) and plot gaps that
+    should be ~0 for genuinely robust (non-masked) quantized models."""
+    if df_scorecard is None:
+        if not os.path.exists(SCORECARD_CSV):
+            return
+        df_scorecard = pd.read_csv(SCORECARD_CSV)
+    if df_scorecard is None or df_scorecard.empty:
+        return
+    plot_cols = [c for c in ["pgd_minus_transfer_gap", "pgd_minus_random_gap"] if c in df_scorecard.columns]
+    if not plot_cols:
+        return
+    df_plot = df_scorecard.melt(id_vars="model", value_vars=plot_cols, var_name="metric", value_name="value")
+    plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
+    sns.barplot(data=df_plot, x="model", y="value", hue="metric")
+    plt.axhline(0, color="black", linewidth=MASKING_BASELINE_LINEWIDTH)
+    plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
+    plt.title("Masking Scorecard: Gaps Near 0 Indicate Genuine Robustness")
+    plt.ylabel("Accuracy Gap (PGD minus reference attack)")
+    plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
+    plt.tight_layout()
+    plt.savefig(SCORECARD_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
+    plt.show()
