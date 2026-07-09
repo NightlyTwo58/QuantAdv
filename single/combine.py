@@ -24,6 +24,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+try:
+    from . import data as shared_data
+except ImportError:
+    import data as shared_data
+
 
 try:
     import config as _config
@@ -550,20 +555,14 @@ def plot_all(dfs: dict[str, pd.DataFrame]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Combine QuantAdv per-model CSV/JSON outputs and regenerate plots.")
-    parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help="Directory containing result files.")
-    parser.add_argument("--no-plots", action="store_true", help="Only write combined CSVs; do not regenerate PNG plots.")
+    parser = argparse.ArgumentParser(description="Merge incomplete QuantAdv outputs and regenerate reports.")
+    parser.add_argument("--data-dir", type=Path, default=shared_data.DATA_DIR)
+    parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
-
-    data_dir = args.data_dir
-
-    print(f"combining files in {data_dir}")
-    dfs = combine_all(data_dir)
-
+    dfs = shared_data.combine_all(args.data_dir)
     if not args.no_plots:
-        plot_all(dfs)
-
-    print("done")
+        shared_data.plot_all(dfs, args.data_dir)
+    shared_data.print_report(dfs)
 
 
 if __name__ == "__main__":

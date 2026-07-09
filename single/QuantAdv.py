@@ -15,8 +15,10 @@ import json
 import traceback
 import sys
 import warnings
-import matplotlib.pyplot as plt
-import seaborn as sns
+import math
+import time
+import threading
+import psutil
 from torch.amp import autocast, GradScaler
 
 from pytorchcv.model_provider import get_model as ptcv_get_model
@@ -25,6 +27,7 @@ import torchattacks
 from autoattack import AutoAttack
 
 import defense as dfn
+import data as report_data
 
 import sys
 from pathlib import Path
@@ -34,6 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import *
+from ResourceMonitor import ResourceMonitor
 
 """
 Modernized non-threaded analysis of metrics of attacks per model and eplison
@@ -81,10 +85,12 @@ def get_dataloaders(batch_size=DEFAULT_BATCH_SIZE, eval_n=DEFAULT_EVAL_N, finetu
     workers = min(MAX_DATA_WORKERS, os.cpu_count() or 1)
 
     finetune_loader = torch.utils.data.DataLoader(
-        finetune_subset, batch_size=batch_size, shuffle=TRAIN_SHUFFLE, num_workers=workers, pin_memory=PIN_MEMORY
+        finetune_subset, batch_size=batch_size, shuffle=TRAIN_SHUFFLE,
+        num_workers=workers, pin_memory=PIN_MEMORY, persistent_workers=workers > 0,
     )
     eval_loader = torch.utils.data.DataLoader(
-        eval_subset, batch_size=DEFAULT_EVAL_BATCH_SIZE, shuffle=EVAL_SHUFFLE, num_workers=workers, pin_memory=PIN_MEMORY
+        eval_subset, batch_size=DEFAULT_EVAL_BATCH_SIZE, shuffle=EVAL_SHUFFLE,
+        num_workers=workers, pin_memory=PIN_MEMORY, persistent_workers=workers > 0,
     )
 
     return finetune_loader, eval_loader
@@ -108,7 +114,7 @@ def sanity_check_accuracy(model, loader):
 class FakeQuantSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        return torch.round(x).clone()
+        return torch.round(x)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -143,13 +149,13 @@ def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP
     return z.view_as(t).to(dtype=t.dtype)
 
 
-def chaotic_quantize_tensor(t, bits, use_ste, quantize=True):
+def chaotic_quantize_tensor(t, bits, use_ste, quantize=True, dither_amplitude=CHAOTIC_QUANT_DITHER):
     if bits is None or not quantize:
         return t
     qmax = 2 ** (bits - 1) - 1
     scale = torch.clamp(t.detach().abs().max() / qmax, min=QUANT_SCALE_MIN)
     chaos = chaotic_sequence_like(t)
-    dither = (chaos - 0.5) * CHAOTIC_QUANT_DITHER
+    dither = (chaos - 0.5) * dither_amplitude
     t_scaled = t / scale + dither
     t_round = FakeQuantSTE.apply(t_scaled) if use_ste else torch.round(t_scaled)
     t_round = torch.clamp(t_round, -qmax - 1, qmax)
@@ -168,7 +174,10 @@ class _QuantizedLayerMixin:
 
     def _quantize(self, t, bits, use_ste, enabled=True):
         if self.chaotic:
-            return chaotic_quantize_tensor(t, bits, use_ste, enabled)
+            return chaotic_quantize_tensor(
+                t, bits, use_ste, enabled,
+                getattr(self, "dither_amplitude", CHAOTIC_QUANT_DITHER),
+            )
         return quantize_tensor(t, bits, use_ste) if enabled else t
 
 
@@ -179,7 +188,7 @@ class QuantConv2d(_QuantizedLayerMixin, nn.Conv2d):
         out = self._conv_forward(x, w, self.bias)
         if quant_act:
             out = self._quantize(out, bits, use_ste, quant_act)
-        return out.clone()
+        return out
 
 
 class ChaoticQuantConv2d(QuantConv2d):
@@ -193,14 +202,14 @@ class QuantLinear(_QuantizedLayerMixin, nn.Linear):
         out = F.linear(x, w, self.bias)
         if quant_act:
             out = self._quantize(out, bits, use_ste, quant_act)
-        return out.clone()
+        return out
 
 
 class ChaoticQuantLinear(QuantLinear):
     chaotic = True
 
 
-def _to_quant_module(mod, bits, quant_weight=True, quant_act=True, chaotic=False):
+def _to_quant_module(mod, bits, quant_weight=True, quant_act=True, chaotic=False, dither_amplitude=CHAOTIC_QUANT_DITHER):
     if isinstance(mod, nn.Conv2d):
         cls = ChaoticQuantConv2d if chaotic else QuantConv2d
         new = cls(mod.in_channels, mod.out_channels, mod.kernel_size,
@@ -210,6 +219,7 @@ def _to_quant_module(mod, bits, quant_weight=True, quant_act=True, chaotic=False
         if mod.bias is not None:
             new.bias = mod.bias
         new.bits, new.use_ste, new.quant_weight, new.quant_act = bits, QUANT_DEFAULT_USE_STE, quant_weight, quant_act
+        new.dither_amplitude = dither_amplitude
         return new
     if isinstance(mod, nn.Linear):
         cls = ChaoticQuantLinear if chaotic else QuantLinear
@@ -218,27 +228,31 @@ def _to_quant_module(mod, bits, quant_weight=True, quant_act=True, chaotic=False
         if mod.bias is not None:
             new.bias = mod.bias
         new.bits, new.use_ste, new.quant_weight, new.quant_act = bits, QUANT_DEFAULT_USE_STE, quant_weight, quant_act
+        new.dither_amplitude = dither_amplitude
         return new
     return None
 
 
-def _replace_recursive(module, bits, quant_weight=True, quant_act=True, chaotic=False):
+def _replace_recursive(module, bits, quant_weight=True, quant_act=True, chaotic=False, dither_amplitude=CHAOTIC_QUANT_DITHER):
     for name, child in list(module.named_children()):
-        nc = _to_quant_module(child, bits, quant_weight, quant_act, chaotic=chaotic)
+        nc = _to_quant_module(child, bits, quant_weight, quant_act, chaotic=chaotic, dither_amplitude=dither_amplitude)
         if nc is not None:
             setattr(module, name, nc)
         else:
-            _replace_recursive(child, bits, quant_weight, quant_act, chaotic=chaotic)
+            _replace_recursive(child, bits, quant_weight, quant_act, chaotic=chaotic, dither_amplitude=dither_amplitude)
 
 
-def convert_to_quant(model, bits, quant_weight=True, quant_act=True, chaotic=False):
+def convert_to_quant(model, bits, quant_weight=True, quant_act=True, chaotic=False, dither_amplitude=CHAOTIC_QUANT_DITHER):
     m = copy.deepcopy(model)
-    _replace_recursive(m, bits, quant_weight, quant_act, chaotic=chaotic)
+    _replace_recursive(m, bits, quant_weight, quant_act, chaotic=chaotic, dither_amplitude=dither_amplitude)
     return m
 
 
-def convert_to_chaotic_quant(model, bits, quant_weight=True, quant_act=True):
-    return convert_to_quant(model, bits, quant_weight=quant_weight, quant_act=quant_act, chaotic=True)
+def convert_to_chaotic_quant(model, bits, quant_weight=True, quant_act=True, dither_amplitude=CHAOTIC_QUANT_DITHER):
+    return convert_to_quant(
+        model, bits, quant_weight=quant_weight, quant_act=quant_act,
+        chaotic=True, dither_amplitude=dither_amplitude,
+    )
 
 
 def quantizable_layer_names(model):
@@ -403,9 +417,11 @@ def make_torchattack(attack_cls, model, *args, **kwargs):
     return attack
 
 
-def accuracy_from_adv_fn(model, loader, adv_fn=None, target_model=None, max_images=None, use_autocast=False):
+def accuracy_from_adv_fn(model, loader, adv_fn=None, target_model=None, max_images=None,
+                         use_autocast=False, return_vector=False):
     target = target_model if target_model is not None else model
     correct, total, n_seen = 0, 0, 0
+    correct_vectors = []
     for x, y in loader:
         if max_images is not None:
             if n_seen >= max_images:
@@ -420,18 +436,121 @@ def accuracy_from_adv_fn(model, loader, adv_fn=None, target_model=None, max_imag
                     pred = target(x_adv).argmax(dim=1)
             else:
                 pred = target(x_adv).argmax(dim=1)
-        correct += (pred == y).sum().item()
+        batch_correct = pred == y
+        correct += batch_correct.sum().item()
+        if return_vector:
+            correct_vectors.append(batch_correct.detach().cpu())
         total += y.size(0)
         n_seen += y.size(0)
-    return correct / total if total else None
+    accuracy = correct / total if total else None
+    if return_vector:
+        vector = torch.cat(correct_vectors).numpy().astype(bool) if correct_vectors else np.empty(0, dtype=bool)
+        return accuracy, vector
+    return accuracy
 
 
-def accuracy_under_attack(model, loader, attack, target_model=None, max_images=None):
+def wilson_interval(correct, total, confidence=CI_CONFIDENCE):
+    """Dependency-free Wilson score interval for a binomial proportion."""
+    if total <= 0:
+        return None, None
+    # 1.95996 is the two-sided 95% normal quantile; keep the configured
+    # confidence explicit and use statistics.NormalDist for other levels.
+    from statistics import NormalDist
+    z = NormalDist().inv_cdf(0.5 + confidence / 2)
+    p = correct / total
+    denom = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / denom
+    radius = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denom
+    return max(0.0, centre - radius), min(1.0, centre + radius)
+
+
+def clopper_pearson_interval(correct, total, confidence=CI_CONFIDENCE):
+    """Exact binomial interval when scipy is present; Wilson is a safe fallback."""
+    if total <= 0:
+        return None, None
+    try:
+        from scipy.stats import beta
+        alpha = 1 - confidence
+        low = 0.0 if correct == 0 else float(beta.ppf(alpha / 2, correct, total - correct + 1))
+        high = 1.0 if correct == total else float(beta.ppf(1 - alpha / 2, correct + 1, total - correct))
+        return low, high
+    except ImportError:
+        return wilson_interval(correct, total, confidence)
+
+
+def add_binomial_statistics(results, metric, correct_vector):
+    vector = np.asarray(correct_vector, dtype=bool)
+    n = int(vector.size)
+    k = int(vector.sum())
+    wlo, whi = wilson_interval(k, n)
+    clo, chi = clopper_pearson_interval(k, n)
+    results.update({
+        f"{metric}_n": n, f"{metric}_correct": k,
+        f"{metric}_wilson_low": wlo, f"{metric}_wilson_high": whi,
+        f"{metric}_wilson_pm": (whi - wlo) / 2 if wlo is not None else None,
+        f"{metric}_cp_low": clo, f"{metric}_cp_high": chi,
+        f"{metric}_cp_pm": (chi - clo) / 2 if clo is not None else None,
+    })
+
+
+def mcnemar_exact(vector_a, vector_b):
+    """Two-sided exact McNemar test over paired correctness outcomes."""
+    a = np.asarray(vector_a, dtype=bool)
+    b = np.asarray(vector_b, dtype=bool)
+    if a.shape != b.shape:
+        raise ValueError(f"McNemar vectors must have equal shape, got {a.shape} and {b.shape}")
+    a_only = int(np.sum(a & ~b))
+    b_only = int(np.sum(~a & b))
+    discordant = a_only + b_only
+    if discordant == 0:
+        p_value = 1.0
+    else:
+        tail = sum(math.comb(discordant, i) for i in range(min(a_only, b_only) + 1)) / (2 ** discordant)
+        p_value = min(1.0, 2.0 * tail)
+    return {"a_only": a_only, "b_only": b_only, "discordant": discordant, "p_value": p_value}
+
+
+def save_correctness_vectors(model_name, vectors):
+    os.makedirs(PER_EXAMPLE_DIR, exist_ok=True)
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in model_name)
+    path = os.path.join(PER_EXAMPLE_DIR, f"{safe_name}.npz")
+    np.savez_compressed(path, **{key: np.asarray(value, dtype=bool) for key, value in vectors.items()})
+    return path
+
+
+def add_paired_fp32_mcnemar_tests(df_results):
+    """Post-hoc paired tests between each variant and its architecture's FP32 model."""
+    if "correctness_vectors_path" not in df_results:
+        return df_results
+    for idx, row in df_results.iterrows():
+        model_name = str(row["model"])
+        architecture = model_name.split("_", 1)[0]
+        baseline_rows = df_results[df_results["model"].astype(str) == f"{architecture}_FP32"]
+        if baseline_rows.empty or not isinstance(row.get("correctness_vectors_path"), str):
+            continue
+        baseline_path = baseline_rows.iloc[0].get("correctness_vectors_path")
+        if not isinstance(baseline_path, str) or not os.path.exists(baseline_path):
+            continue
+        if not os.path.exists(row["correctness_vectors_path"]):
+            continue
+        with np.load(baseline_path) as baseline, np.load(row["correctness_vectors_path"]) as variant:
+            for metric in sorted(set(baseline.files) & set(variant.files)):
+                test = mcnemar_exact(baseline[metric], variant[metric])
+                prefix = f"McNemar_vs_FP32_{metric}"
+                for key, value in test.items():
+                    df_results.loc[idx, f"{prefix}_{key}"] = value
+    return df_results
+
+
+def accuracy_under_attack(model, loader, attack, target_model=None, max_images=None, return_vector=False):
     def adv_fn(x, y):
         x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
         return normalize_pixels(attack(x_pixel, y))
 
-    return accuracy_from_adv_fn(model, loader, adv_fn, target_model=target_model, max_images=max_images)
+    return accuracy_from_adv_fn(
+        model, loader, adv_fn, target_model=target_model,
+        max_images=max_images, return_vector=return_vector,
+    )
 
 
 def seed_averaged_metrics(name, seeds, fn):
@@ -447,26 +566,42 @@ def seed_averaged_metrics(name, seeds, fn):
     }
 
 
-def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
+def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vectors=False):
     model.eval()
     set_ste_mode(model, True)
     try:
         fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
         out = {}
 
-        out["FGSM"] = accuracy_under_attack(model, loader, fgsm)
+        def attack_vector(attack):
+            def adv_fn(x, y):
+                return normalize_pixels(attack(denormalize_inputs(x).clamp(0.0, 1.0), y))
+            return accuracy_from_adv_fn(model, loader, adv_fn, return_vector=True)
 
-        def run_seed(seed):
+        fgsm_acc, fgsm_vector = attack_vector(fgsm)
+        out["FGSM"] = fgsm_acc
+        pgd_vectors = []
+        pgd_accs = []
+        for seed in seeds:
+            torch.manual_seed(seed)
             pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-            return accuracy_under_attack(model, loader, pgd)
-
-        out.update(seed_averaged_metrics("PGD", seeds, run_seed))
+            acc, vector = attack_vector(pgd)
+            pgd_accs.append(acc)
+            pgd_vectors.append(vector)
+        # A multi-restart attack is the intersection of per-restart correctness,
+        # not the mean of restart accuracies.
+        pgd_vector = np.logical_and.reduce(pgd_vectors)
+        out["PGD"] = float(pgd_vector.mean())
+        out["PGD_mean"] = float(np.mean(pgd_accs))
+        out["PGD_std"] = float(np.std(pgd_accs))
+        if return_vectors:
+            out["_vectors"] = {"FGSM": fgsm_vector, "PGD": pgd_vector}
         return out
     finally:
         set_ste_mode(model, False)
 
 
-def run_autoattack(model, loader, eps=DEFAULT_EPS):
+def run_autoattack(model, loader, eps=DEFAULT_EPS, return_vector=False):
     model.eval()
     set_ste_mode(model, True)
     try:
@@ -477,7 +612,7 @@ def run_autoattack(model, loader, eps=DEFAULT_EPS):
             x_pixels = denormalize_inputs(x).clamp(0.0, 1.0)
             return normalize_pixels(adversary.run_standard_evaluation(x_pixels, y, bs=x.size(0)))
 
-        return accuracy_from_adv_fn(model, loader, adv_fn)
+        return accuracy_from_adv_fn(model, loader, adv_fn, return_vector=return_vector)
     finally:
         set_ste_mode(model, False)
 
@@ -502,18 +637,24 @@ def run_extra_whitebox_attacks(model, loader, eps=DEFAULT_EPS, jsma_max_images=J
         set_ste_mode(model, False)
 
 
-def transfer_attack(source_model, target_model, loader, eps=DEFAULT_EPS):
+def transfer_attack(source_model, target_model, loader, eps=DEFAULT_EPS, return_vector=False):
     set_ste_mode(source_model, True)
     try:
         pgd = make_torchattack(torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-        return accuracy_under_attack(source_model, loader, pgd, target_model=target_model)
+        return accuracy_under_attack(
+            source_model, loader, pgd, target_model=target_model,
+            return_vector=return_vector,
+        )
     finally:
         set_ste_mode(source_model, False)
 
 
-def transfer_attack_mim(source_model, target_model, loader, eps=DEFAULT_EPS):
+def transfer_attack_mim(source_model, target_model, loader, eps=DEFAULT_EPS, return_vector=False):
     mim = make_torchattack(torchattacks.MIFGSM, source_model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, decay=MIFGSM_DECAY)
-    return accuracy_under_attack(source_model, loader, mim, target_model=target_model)
+    return accuracy_under_attack(
+        source_model, loader, mim, target_model=target_model,
+        return_vector=return_vector,
+    )
 
 
 def build_uap(model, loader, eps=DEFAULT_EPS, delta=UAP_DELTA, max_iter=UAP_MAX_ITER, deepfool_steps=UAP_DEEPFOOL_STEPS,
@@ -568,13 +709,15 @@ def transfer_uap_attack(source_model, target_model, loader, eps=DEFAULT_EPS, max
 def projected_pgd_attack(x, y, eps, alpha, steps, grad_fn):
     clip_min = CLIP_MIN.to(device)
     clip_max = CLIP_MAX.to(device)
-    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+    eps_normalized = eps / CIFAR_STD.to(x.device)
+    alpha_normalized = alpha / CIFAR_STD.to(x.device)
+    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-1, 1) * eps_normalized
     x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     for _ in range(steps):
         grad = grad_fn(x_adv, y)
         grad = torch.zeros_like(x_adv) if grad is None else grad
-        x_adv = x_adv.detach() + alpha * grad.sign()
-        x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+        x_adv = x_adv.detach() + alpha_normalized * grad.sign()
+        x_adv = torch.min(torch.max(x_adv, x - eps_normalized), x + eps_normalized)
         x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     return x_adv.detach()
 
@@ -598,7 +741,7 @@ def bpda_pgd_attack(model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STE
             set_ste_mode(backward_model, False)
 
 
-def _run_bpda_once(model, loader, eps, n_restarts):
+def _run_bpda_once(model, loader, eps, n_restarts, return_vector=False):
     correct_masks = []
     for x, y in loader:
         x, y = x.to(device), y.to(device)
@@ -610,11 +753,27 @@ def _run_bpda_once(model, loader, eps, n_restarts):
             worst_correct &= (pred == y)
         correct_masks.append(worst_correct)
     all_correct = torch.cat(correct_masks)
-    return all_correct.float().mean().item()
+    accuracy = all_correct.float().mean().item()
+    return (accuracy, all_correct.cpu().numpy().astype(bool)) if return_vector else accuracy
 
 
-def run_bpda(model, loader, eps=DEFAULT_EPS, n_restarts=BPDA_RESTARTS_DEFAULT, seeds=SEEDS):
-    return seed_averaged_metrics("BPDA_PGD", seeds, lambda seed: _run_bpda_once(model, loader, eps, n_restarts))
+def run_bpda(model, loader, eps=DEFAULT_EPS, n_restarts=BPDA_RESTARTS_DEFAULT,
+             seeds=SEEDS, return_vector=False):
+    vectors, accuracies = [], []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        accuracy, vector = _run_bpda_once(model, loader, eps, n_restarts, return_vector=True)
+        accuracies.append(accuracy)
+        vectors.append(vector)
+    worst_vector = np.logical_and.reduce(vectors)
+    out = {
+        "BPDA_PGD": float(worst_vector.mean()),
+        "BPDA_PGD_mean": float(np.mean(accuracies)),
+        "BPDA_PGD_std": float(np.std(accuracies)),
+    }
+    if return_vector:
+        out["_vectors"] = {"BPDA_PGD": worst_vector}
+    return out
 
 
 def evaluate_normalized_attack(model, loader, attack_fn):
@@ -1037,28 +1196,49 @@ def gradient_diagnostics(model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX
     return diagnostics
 
 
-def random_noise_attack(model, loader, eps=DEFAULT_EPS, n_restarts=1, seed=None):
+def random_noise_attack(model, loader, eps=DEFAULT_EPS, n_restarts=1, seed=None, return_vector=False):
     if seed is not None:
         torch.manual_seed(seed)
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
-    correct, total = 0, 0
+    eps_normalized = eps / CIFAR_STD.to(device)
+    correct, total, vectors = 0, 0, []
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
             for _ in range(n_restarts):
-                noise = torch.empty_like(x).uniform_(-eps, eps)
+                noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
                 x_adv = torch.max(torch.min(x + noise, clip_max), clip_min)
                 pred = model(x_adv).argmax(dim=1)
                 worst_correct &= (pred == y)
             correct += worst_correct.sum().item()
             total += y.size(0)
-    return correct / total
+            if return_vector:
+                vectors.append(worst_correct.cpu())
+    accuracy = correct / total
+    if return_vector:
+        return accuracy, torch.cat(vectors).numpy().astype(bool)
+    return accuracy
 
 
-def run_random_noise_seeded(model, loader, eps=DEFAULT_EPS, seeds=SEEDS):
-    return seed_averaged_metrics("Random_Noise", seeds, lambda seed: random_noise_attack(model, loader, eps=eps, seed=seed))
+def run_random_noise_seeded(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vector=False):
+    accuracies, vectors = [], []
+    for seed in seeds:
+        accuracy, vector = random_noise_attack(
+            model, loader, eps=eps, seed=seed, return_vector=True
+        )
+        accuracies.append(accuracy)
+        vectors.append(vector)
+    worst_vector = np.logical_and.reduce(vectors)
+    out = {
+        "Random_Noise": float(worst_vector.mean()),
+        "Random_Noise_mean": float(np.mean(accuracies)),
+        "Random_Noise_std": float(np.std(accuracies)),
+    }
+    if return_vector:
+        out["_vectors"] = {"Random_Noise": worst_vector}
+    return out
 
 
 def pgd_steps_ablation(model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_STEPS):
@@ -1077,6 +1257,8 @@ def pgd_steps_ablation(model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_ST
 def pgd_trajectory_diagnostics(model, loader, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS, max_batches=TRAJECTORY_MAX_BATCHES):
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    eps_normalized = eps / CIFAR_STD.to(device)
+    alpha_normalized = alpha / CIFAR_STD.to(device)
     step_grad_norms = [0.0] * steps
     step_movement = [0.0] * steps
     n_batches = 0
@@ -1084,7 +1266,7 @@ def pgd_trajectory_diagnostics(model, loader, eps=DEFAULT_EPS, alpha=PGD_ALPHA, 
         if bi >= max_batches:
             break
         x, y = x.to(device), y.to(device)
-        noise = torch.empty_like(x).uniform_(-eps, eps)
+        noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
         x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
         x_adv = x_start.clone()
         for s in range(steps):
@@ -1092,8 +1274,8 @@ def pgd_trajectory_diagnostics(model, loader, eps=DEFAULT_EPS, alpha=PGD_ALPHA, 
             loss = F.cross_entropy(model(x_adv), y)
             grad = torch.autograd.grad(loss, x_adv)[0]
             step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
-            x_adv = x_adv.detach() + alpha * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x - eps), x + eps)
+            x_adv = x_adv.detach() + alpha_normalized * grad.sign()
+            x_adv = torch.min(torch.max(x_adv, x - eps_normalized), x + eps_normalized)
             x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
             step_movement[s] += (x_adv - x_start).flatten(1).abs().max(dim=1).values.mean().item()
         n_batches += 1
@@ -1147,12 +1329,13 @@ def staircase_diagnostic(model, loader, radius=STAIRCASE_RADIUS, n_points=STAIRC
     flat_norm = direction.flatten(1).norm(dim=1).view(-1, *([1] * (x.dim() - 1)))
     direction = direction / flat_norm
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+    radius_normalized = radius / CIFAR_STD.to(device)
 
     with torch.no_grad():
         prev_logits = model(x)
         plateau_hits = 0.0
         for i in range(1, n_points + 1):
-            step = x + direction * (radius * i / n_points)
+            step = x + direction * radius_normalized * (i / n_points)
             step = torch.max(torch.min(step, clip_max), clip_min)
             logits = model(step)
             plateau_hits += (logits == prev_logits).all(dim=1).float().mean().item()
@@ -1251,125 +1434,216 @@ def confidence_margin_diagnostic(model, loader, eps=DEFAULT_EPS, steps=MARGIN_ST
     return {"clean_margins": clean_margins, "adv_margins": adv_margins}
 
 
+def safe_call(fn, warning, *, context=None, default=None, show_traceback=False, level="WARN"):
+    """Run an optional experiment stage with consistent warning and fallback handling."""
+    try:
+        return fn()
+    except Exception as exc:
+        suffix = f" for {context}" if context else ""
+        print(f"  [{level}] {warning}{suffix}: {exc}")
+        if show_traceback:
+            traceback.print_exc()
+        return default() if callable(default) else default
+
+
+def safe_set(target, key, fn, warning, *, context=None, default=None):
+    target[key] = safe_call(fn, warning, context=context, default=default)
+    return target[key]
+
+
+def safe_update(target, fn, warning, *, context=None, defaults=None):
+    update = safe_call(fn, warning, context=context, default=None)
+    if update is not None:
+        target.update(update)
+        return True
+    if defaults:
+        target.update({
+            key: value() if callable(value) else value
+            for key, value in defaults.items()
+        })
+    return False
+
+
+def safe_set_vector(results, vectors, metric, fn, warning, *, context=None):
+    pair = safe_call(fn, warning, context=context, default=None)
+    if pair is None:
+        results[metric] = None
+        return False
+    results[metric], vectors[metric] = pair
+    return True
+
+
+def safe_update_vectors(results, vectors, fn, warning, *, context=None, defaults=None):
+    update = safe_call(fn, warning, context=context, default=None)
+    if update is None:
+        if defaults:
+            results.update(defaults)
+        return False
+    vectors.update(update.pop("_vectors", {}))
+    results.update(update)
+    return True
+
+
+def save_json(path, data, *, indent=None):
+    with open(path, "w") as handle:
+        json.dump(data, handle, indent=indent)
+
+
 def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     model.eval()
     results = {"model": name}
+    vectors = {}
 
-    def safe_set(key, fn, warning, default=None):
-        try:
-            results[key] = fn()
-        except Exception as e:
-            print(f"  [WARN] {warning} for {name}: {e}")
-            results[key] = default
-
-    def safe_update(fn, warning, defaults=None):
-        try:
-            results.update(fn())
-        except Exception as e:
-            print(f"  [WARN] {warning} for {name}: {e}")
-            if defaults:
-                for key, value in defaults.items():
-                    results[key] = value() if callable(value) else value
-
-    safe_set("clean_acc", lambda: sanity_check_accuracy(model, loader), "clean_acc failed")
-    safe_update(
-        lambda: run_fgsm_pgd(model, loader, eps=eps),
-        "FGSM/PGD failed",
-        {"FGSM": lambda: results.get("FGSM", None), "PGD": lambda: results.get("PGD", None)},
+    safe_set_vector(
+        results, vectors, "clean_acc",
+        lambda: accuracy_from_adv_fn(model, loader, use_autocast=True, return_vector=True),
+        "clean_acc failed", context=name,
     )
-    safe_set("AutoAttack", lambda: run_autoattack(model, loader, eps=eps), "AutoAttack failed")
-    safe_update(lambda: run_extra_whitebox_attacks(model, loader, eps=eps), "CW/DeepFool/JSMA failed")
-    safe_set("UAP", lambda: run_uap_attack(model, loader, eps=eps), "UAP attack failed")
-    safe_set("Surrogate_Transfer", lambda: run_surrogate_attack(model, loader, eps=eps), "surrogate attack failed")
+    safe_update_vectors(
+        results, vectors,
+        lambda: run_fgsm_pgd(model, loader, eps=eps, return_vectors=True),
+        "FGSM/PGD failed", context=name, defaults={"FGSM": None, "PGD": None},
+    )
+    safe_set_vector(
+        results, vectors, "AutoAttack",
+        lambda: run_autoattack(model, loader, eps=eps, return_vector=True),
+        "AutoAttack failed", context=name,
+    )
+    if RUN_EXTRA_WHITEBOX_ATTACKS:
+        safe_update(results, lambda: run_extra_whitebox_attacks(model, loader, eps=eps), "CW/DeepFool/JSMA failed", context=name)
+    if RUN_UAP_ATTACKS:
+        safe_set(results, "UAP", lambda: run_uap_attack(model, loader, eps=eps), "UAP attack failed", context=name)
+    if RUN_SURROGATE_ATTACK:
+        safe_set(results, "Surrogate_Transfer", lambda: run_surrogate_attack(model, loader, eps=eps), "surrogate attack failed", context=name)
 
     if fp32_ref is not None:
-        safe_set("Transfer_from_FP32", lambda: transfer_attack(fp32_ref, model, loader, eps=eps), "transfer_attack failed")
-        safe_set("MIM_Transfer", lambda: transfer_attack_mim(fp32_ref, model, loader, eps=eps), "MIM transfer_attack failed")
-        safe_set("UAP_Transfer", lambda: transfer_uap_attack(fp32_ref, model, loader, eps=eps), "UAP transfer_attack failed")
+        safe_set_vector(
+            results, vectors, "Transfer_from_FP32",
+            lambda: transfer_attack(fp32_ref, model, loader, eps=eps, return_vector=True),
+            "transfer_attack failed", context=name,
+        )
+        safe_set_vector(
+            results, vectors, "MIM_Transfer",
+            lambda: transfer_attack_mim(fp32_ref, model, loader, eps=eps, return_vector=True),
+            "MIM transfer_attack failed", context=name,
+        )
+        if RUN_UAP_ATTACKS:
+            safe_set(results, "UAP_Transfer", lambda: transfer_uap_attack(fp32_ref, model, loader, eps=eps), "UAP transfer_attack failed", context=name)
 
-        if count_quant_layers(model) > 0:
-            safe_set("Transfer_to_FP32", lambda: transfer_attack(model, fp32_ref, loader, eps=eps), "reverse transfer_attack failed")
-            safe_set("MIM_Transfer_to_FP32", lambda: transfer_attack_mim(model, fp32_ref, loader, eps=eps), "reverse MIM transfer_attack failed")
-            safe_set("UAP_Transfer_to_FP32", lambda: transfer_uap_attack(model, fp32_ref, loader, eps=eps), "reverse UAP transfer_attack failed")
+        if RUN_REVERSE_TRANSFERS and count_quant_layers(model) > 0:
+            safe_set(results, "Transfer_to_FP32", lambda: transfer_attack(model, fp32_ref, loader, eps=eps), "reverse transfer_attack failed", context=name)
+            safe_set(results, "MIM_Transfer_to_FP32", lambda: transfer_attack_mim(model, fp32_ref, loader, eps=eps), "reverse MIM transfer_attack failed", context=name)
+            safe_set(results, "UAP_Transfer_to_FP32", lambda: transfer_uap_attack(model, fp32_ref, loader, eps=eps), "reverse UAP transfer_attack failed", context=name)
 
-    safe_update(lambda: run_random_noise_seeded(model, loader, eps=eps), "random_noise_attack failed", {"Random_Noise": None})
+    safe_update_vectors(
+        results, vectors,
+        lambda: run_random_noise_seeded(model, loader, eps=eps, return_vector=True),
+        "random_noise_attack failed", context=name, defaults={"Random_Noise": None},
+    )
 
-    try:
-        results.update(run_defense_adaptive_attacks(model, loader, eps=eps))
-    except Exception as e:
-        print(f"  [WARN] adaptive defense attack failed for {name}: {e}")
-        defense_model = unwrap_model(model)
-        if isinstance(defense_model, dfn.SanitizedModel):
-            results["BPDA_Adaptive"] = None
-        elif isinstance(defense_model, dfn.SmoothedModel):
-            results["EOT_PGD"] = None
-        elif isinstance(defense_model, dfn.GuardrailModel):
-            results["Adaptive_Guardrail"] = None
-        elif isinstance(defense_model, dfn.DetectGuardModel):
-            results["Adaptive_DetectGuard"] = None
+    defense_model = unwrap_model(model)
+    adaptive_defaults = {}
+    if isinstance(defense_model, dfn.SanitizedModel):
+        adaptive_defaults["BPDA_Adaptive"] = None
+    elif isinstance(defense_model, dfn.SmoothedModel):
+        adaptive_defaults["EOT_PGD"] = None
+    elif isinstance(defense_model, dfn.GuardrailModel):
+        adaptive_defaults["Adaptive_Guardrail"] = None
+    elif isinstance(defense_model, dfn.DetectGuardModel):
+        adaptive_defaults["Adaptive_DetectGuard"] = None
+    safe_update(
+        results, lambda: run_defense_adaptive_attacks(model, loader, eps=eps),
+        "adaptive defense attack failed", context=name, defaults=adaptive_defaults,
+    )
 
     if count_quant_layers(model) > 0:
-        safe_update(lambda: run_bpda(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SUITE), "BPDA failed", {"BPDA_PGD": None})
-        safe_update(lambda: gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=GRAD_DIAG_MAX_BATCHES), "gradient_diagnostics failed")
-        safe_update(lambda: staircase_diagnostic(model, loader), "staircase_diagnostic failed")
-
-        try:
-            results.update(run_boundary_attack(model, loader, eps=eps, max_images=BOUNDARY_MAX_IMAGES_SUITE, steps=BOUNDARY_STEPS_SUITE, seed=BOUNDARY_SEED))
-        except Exception as e:
-            print(f"  [WARN] boundary_attack failed for {name}: {e}")
-            results["Boundary_acc"] = None
-            results["Boundary_mean_Linf"] = None
-            results["Boundary_median_Linf"] = None
-            results["Boundary_min_Linf"] = None
-            results["Boundary_max_Linf"] = None
-            results["Boundary_std_Linf"] = None
-            results["Boundary_n"] = 0
-            results["Boundary_init_failed"] = None
-            results["Boundary_init_failed_rate"] = None
-
-        safe_update(
-            lambda: run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=NES_SAMPLES_SUITE, query_chunk=NES_QUERY_CHUNK),
-            "NES attack failed",
-            {"NES": None},
+        safe_update_vectors(
+            results, vectors,
+            lambda: run_bpda(
+                model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SUITE,
+                return_vector=True,
+            ),
+            "BPDA failed", context=name, defaults={"BPDA_PGD": None},
         )
+        safe_update(
+            results,
+            lambda: gradient_diagnostics(model, loader, fp32_ref=fp32_ref, max_batches=GRAD_DIAG_MAX_BATCHES),
+            "gradient_diagnostics failed", context=name,
+        )
+        safe_update(results, lambda: staircase_diagnostic(model, loader), "staircase_diagnostic failed", context=name)
 
-        try:
+        boundary_defaults = {
+            "Boundary_acc": None, "Boundary_mean_Linf": None,
+            "Boundary_median_Linf": None, "Boundary_min_Linf": None,
+            "Boundary_max_Linf": None, "Boundary_std_Linf": None,
+            "Boundary_n": 0, "Boundary_init_failed": None,
+            "Boundary_init_failed_rate": None,
+        }
+        if RUN_BOUNDARY_ATTACK:
+            safe_update(
+                results,
+                lambda: run_boundary_attack(
+                    model, loader, eps=eps, max_images=BOUNDARY_MAX_IMAGES_SUITE,
+                    steps=BOUNDARY_STEPS_SUITE, seed=BOUNDARY_SEED,
+                ),
+                "boundary_attack failed", context=name, defaults=boundary_defaults,
+            )
+        else:
+            results.update(boundary_defaults)
+
+        if RUN_NES_ATTACK:
+            safe_update(
+                results,
+                lambda: run_nes_attack(model, loader, eps=eps, seeds=SEEDS, n_samples=NES_SAMPLES_SUITE, query_chunk=NES_QUERY_CHUNK),
+                "NES attack failed", context=name, defaults={"NES": None},
+            )
+
+        def save_pgd_ablation():
             ablation = pgd_steps_ablation(model, loader, eps=eps)
             pd.DataFrame([{"model": name, "steps": k, "acc": v} for k, v in ablation.items()]) \
                 .to_csv(csv_path(name, "ablation"), index=False)
-        except Exception as e:
-            print(f"  [WARN] pgd_steps_ablation failed for {name}: {e}")
 
-        try:
-            traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=TRAJECTORY_MAX_BATCHES)
-            with open(json_path(name, "trajectory"), "w") as f:
-                json.dump(traj, f, indent=2)
-        except Exception as e:
-            print(f"  [WARN] pgd_trajectory_diagnostics failed for {name}: {e}")
+        safe_call(save_pgd_ablation, "pgd_steps_ablation failed", context=name)
 
-        try:
-            prof_hard = layerwise_grad_profile(model, loader, use_ste=False)
-            prof_ste = layerwise_grad_profile(model, loader, use_ste=True)
-            rows = [{"model": name, "layer": n, "grad_norm_hard": prof_hard.get(n),
-                     "grad_norm_ste": prof_ste.get(n)} for n in prof_hard]
-            pd.DataFrame(rows).to_csv(csv_path(name, "layerwise"), index=False)
-        except Exception as e:
-            print(f"  [WARN] layerwise_grad_profile failed for {name}: {e}")
+        if RUN_PGD_TRAJECTORY:
+            def save_trajectory():
+                traj = pgd_trajectory_diagnostics(model, loader, eps=eps, max_batches=TRAJECTORY_MAX_BATCHES)
+                save_json(json_path(name, "trajectory"), traj, indent=2)
+
+            safe_call(save_trajectory, "pgd_trajectory_diagnostics failed", context=name)
+
+        if RUN_LAYERWISE_PROFILE:
+            def save_layerwise_profile():
+                prof_hard = layerwise_grad_profile(model, loader, use_ste=False)
+                prof_ste = layerwise_grad_profile(model, loader, use_ste=True)
+                rows = [{"model": name, "layer": n, "grad_norm_hard": prof_hard.get(n),
+                         "grad_norm_ste": prof_ste.get(n)} for n in prof_hard]
+                pd.DataFrame(rows).to_csv(csv_path(name, "layerwise"), index=False)
+
+            safe_call(save_layerwise_profile, "layerwise_grad_profile failed", context=name)
 
         # weight-only / activation-only / both ablation
-        try:
-            rows = run_quant_component_ablation(model, loader, name, eps=eps)
-            pd.DataFrame(rows).to_csv(csv_path(name, "component_ablation"), index=False)
-        except Exception as e:
-            print(f"  [WARN] run_quant_component_ablation failed for {name}: {e}")
+        if RUN_COMPONENT_ABLATION:
+            def save_component_ablation():
+                rows = run_quant_component_ablation(model, loader, name, eps=eps)
+                pd.DataFrame(rows).to_csv(csv_path(name, "component_ablation"), index=False)
 
-        try:
-            margins = confidence_margin_diagnostic(model, loader, eps=eps, max_batches=MARGIN_MAX_BATCHES)
-            with open(json_path(name, "margin"), "w") as f:
-                json.dump(margins, f)
-        except Exception as e:
-            print(f"  [WARN] confidence_margin_diagnostic failed for {name}: {e}")
+            safe_call(save_component_ablation, "run_quant_component_ablation failed", context=name)
 
+        if RUN_CONFIDENCE_MARGIN:
+            def save_confidence_margins():
+                margins = confidence_margin_diagnostic(model, loader, eps=eps, max_batches=MARGIN_MAX_BATCHES)
+                save_json(json_path(name, "margin"), margins)
+
+            safe_call(save_confidence_margins, "confidence_margin_diagnostic failed", context=name)
+
+    for metric, vector in vectors.items():
+        add_binomial_statistics(results, metric, vector)
+    if "PGD" in vectors and "BPDA_PGD" in vectors:
+        test = mcnemar_exact(vectors["PGD"], vectors["BPDA_PGD"])
+        results.update({f"McNemar_PGD_vs_BPDA_{key}": value for key, value in test.items()})
+    if vectors:
+        results["correctness_vectors_path"] = save_correctness_vectors(name, vectors)
     return results
 
 
@@ -1378,25 +1652,25 @@ def run_epsilon_sweep_for_model(model, loader, name, epsilons):
     is_quant = count_quant_layers(model) > 0
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
-        try:
-            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
-            row["PGD_acc"] = accuracy_under_attack(model, loader, pgd)
-        except Exception as e:
-            print(f"  [WARN] PGD sweep failed for {name} eps={eps:.4f}: {e}")
-            row["PGD_acc"] = None
 
-        try:
-            row["Random_Noise_acc"] = random_noise_attack(model, loader, eps=eps)
-        except Exception as e:
-            print(f"  [WARN] random_noise sweep failed for {name} eps={eps:.4f}: {e}")
-            row["Random_Noise_acc"] = None
+        def run_pgd_sweep():
+            pgd = make_torchattack(torchattacks.PGD, model, eps=eps, alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
+            return accuracy_under_attack(model, loader, pgd)
+
+        context = f"{name} eps={eps:.4f}"
+        safe_set(row, "PGD_acc", run_pgd_sweep, "PGD sweep failed", context=context)
+        safe_set(
+            row, "Random_Noise_acc",
+            lambda: random_noise_attack(model, loader, eps=eps),
+            "random_noise sweep failed", context=context,
+        )
 
         if is_quant:
-            try:
-                row["BPDA_acc"] = _run_bpda_once(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SWEEP)
-            except Exception as e:
-                print(f"  [WARN] BPDA sweep failed for {name} eps={eps:.4f}: {e}")
-                row["BPDA_acc"] = None
+            safe_set(
+                row, "BPDA_acc",
+                lambda: _run_bpda_once(model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SWEEP),
+                "BPDA sweep failed", context=context,
+            )
         rows.append(row)
     return rows
 
@@ -1414,71 +1688,65 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
             continue
         fp32_model = fp32_entry[0]
 
-        try:
+        def add_fp32_at():
             fp32_at = dfn.prepare_adversarial_training(fp32_model, finetune_loader, bits=None)
             model_registry[f"{arch_key}_FP32_AT"] = (fp32_at, fp32_model)
-        except Exception as e:
-            print(f"  [FAIL] adversarial training (FP32) for {arch_key}: {e}")
-            traceback.print_exc()
 
-        try:
+        safe_call(add_fp32_at, "adversarial training (FP32) failed", context=arch_key, show_traceback=True, level="FAIL")
+
+        def add_int8_at():
             int8_at = dfn.prepare_adversarial_training(fp32_model, finetune_loader, bits=QAT_BITS)
             model_registry[f"{arch_key}_int8_QAT_AT"] = (int8_at, fp32_model)
-        except Exception as e:
-            print(f"  [FAIL] adversarial training (int8) for {arch_key}: {e}")
-            traceback.print_exc()
+
+        safe_call(add_int8_at, "adversarial training (int8) failed", context=arch_key, show_traceback=True, level="FAIL")
 
         wrap_targets = [("FP32", fp32_model)]
         if qat_entry is not None:
             wrap_targets.append(("int8_QAT", qat_entry[0]))
 
-        detector = None
-        try:
-            detector = dfn.train_adversarial_detector(fp32_model, finetune_loader)
-        except Exception as e:
-            print(f"  [FAIL] adversarial detector training for {arch_key}: {e}")
-            traceback.print_exc()
+        detector = safe_call(
+            lambda: dfn.train_adversarial_detector(fp32_model, finetune_loader),
+            "adversarial detector training failed", context=arch_key,
+            show_traceback=True, level="FAIL",
+        )
 
         for tag, base_model in wrap_targets:
             entry_name = f"{arch_key}_{tag}"
 
-            try:
+            def add_sanitized():
                 sanitized = dfn.SanitizedModel(base_model).to(device).eval()
                 model_registry[f"{entry_name}_Sanitized"] = (sanitized, fp32_model)
-            except Exception as e:
-                print(f"  [FAIL] SanitizedModel for {entry_name}: {e}")
 
-            try:
+            safe_call(add_sanitized, "SanitizedModel failed", context=entry_name, level="FAIL")
+
+            def add_smoothed():
                 smoothed = dfn.SmoothedModel(base_model).to(device).eval()
                 model_registry[f"{entry_name}_Smoothed"] = (smoothed, fp32_model)
                 cert_stats = dfn.run_certified_accuracy(smoothed, eval_loader)
                 summary_rows.append({"model": entry_name, "defense": "randomized_smoothing", **cert_stats})
-            except Exception as e:
-                print(f"  [FAIL] SmoothedModel/certification for {entry_name}: {e}")
-                traceback.print_exc()
 
-            try:
+            safe_call(add_smoothed, "SmoothedModel/certification failed", context=entry_name, show_traceback=True, level="FAIL")
+
+            def add_guardrail():
                 guardrail = dfn.GuardrailModel(base_model).to(device).eval()
                 model_registry[f"{entry_name}_Guardrail"] = (guardrail, fp32_model)
                 pgd_for_flagging = make_torchattack(torchattacks.PGD, guardrail, eps=DEFAULT_EPS,
                                                      alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
                 flag_stats = dfn.run_guardrail_flagging_rate(guardrail, eval_loader, attack=pgd_for_flagging)
                 summary_rows.append({"model": entry_name, "defense": "guardrail", **flag_stats})
-            except Exception as e:
-                print(f"  [FAIL] GuardrailModel for {entry_name}: {e}")
-                traceback.print_exc()
+
+            safe_call(add_guardrail, "GuardrailModel failed", context=entry_name, show_traceback=True, level="FAIL")
 
             if detector is not None:
-                try:
+                def add_detect_guard():
                     detect_guard = dfn.DetectGuardModel(base_model, detector).to(device).eval()
                     model_registry[f"{entry_name}_DetectGuard"] = (detect_guard, fp32_model)
                     pgd_for_detect = make_torchattack(torchattacks.PGD, detect_guard, eps=DEFAULT_EPS,
                                                        alpha=PGD_ALPHA, steps=PGD_STEPS, random_start=PGD_RANDOM_START)
                     catch_stats = dfn.run_detector_catch_rate(detect_guard, eval_loader, attack=pgd_for_detect)
                     summary_rows.append({"model": entry_name, "defense": "detector", **catch_stats})
-                except Exception as e:
-                    print(f"  [FAIL] DetectGuardModel for {entry_name}: {e}")
-                    traceback.print_exc()
+
+                safe_call(add_detect_guard, "DetectGuardModel failed", context=entry_name, show_traceback=True, level="FAIL")
 
     df_defense = pd.DataFrame(summary_rows)
     if not df_defense.empty:
@@ -1488,328 +1756,53 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
 def _palette_for(values):
     return {v: ATTACK_PALETTE[v] for v in values if v in ATTACK_PALETTE}
 
-def plot_defense_comparison(df_results):
-    if df_results is None or df_results.empty:
-        return
-    defense_tags = ("_AT", "_Sanitized", "_Smoothed", "_Guardrail", "_DetectGuard")
-    df_def = df_results[df_results["model"].astype(str).str.contains("|".join(defense_tags))]
-    if df_def.empty:
-        return
-    cols = [
-        c for c in [
-            "clean_acc",
-            "PGD",
-            "AutoAttack",
-            "BPDA_Adaptive",
-            "EOT_PGD",
-            "Adaptive_Guardrail",
-            "Adaptive_DetectGuard",
-        ]
-        if c in df_def.columns and df_def[c].notna().any()
-    ]
-    if not cols:
-        return
-    df_long = df_def.melt(id_vars="model", value_vars=cols, var_name="Attack", value_name="Accuracy")
-
-    plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
-    sns.barplot(data=df_long, x="model", y="Accuracy", hue="Attack", palette=_palette_for(cols))
-    plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
-    plt.title("Defense Variants: Accuracy under Attack")
-    plt.ylim(0, PLOT_MAX_ACCURACY)
-    plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
-    plt.tight_layout()
-    plt.savefig(os.path.join(DATA_DIR, "defense_comparison.png"), dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_epsilon_sweep_curves(df_sweep):
-    if df_sweep is None or df_sweep.empty:
-        return
-    value_cols = [c for c in ["PGD_acc", "Random_Noise_acc", "BPDA_acc"] if c in df_sweep.columns]
-    if not value_cols:
-        return
-    df_long = df_sweep.melt(id_vars=["model", "epsilon"], value_vars=value_cols, var_name="Attack", value_name="Accuracy")
-    df_long = df_long.dropna(subset=["Accuracy"])
-    if df_long.empty:
-        return
-
-    models = df_long["model"].unique()
-    cols = min(SWEEP_PLOT_COLS_MAX, len(models))
-    rows = int(np.ceil(len(models) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(SWEEP_PLOT_WIDTH * cols, SWEEP_PLOT_HEIGHT * rows), squeeze=False)
-    for i, m in enumerate(models):
-        ax = axes[i // cols][i % cols]
-        local = df_long[df_long["model"] == m]
-        sns.lineplot(data=local, x="epsilon", y="Accuracy", hue="Attack", marker="o", palette=_palette_for(value_cols), ax=ax)
-        ax.set_title(m)
-        ax.set_ylim(0, PLOT_MAX_ACCURACY)
-        ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-    for j in range(len(models), rows * cols):
-        axes[j // cols][j % cols].axis("off")
-    fig.suptitle("Accuracy vs Perturbation Budget (Epsilon Sweep)")
-    fig.tight_layout()
-    fig.savefig(SWEEP_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_pgd_steps_ablation(model_names):
-    frames = [pd.read_csv(csv_path(n, "ablation")) for n in model_names if os.path.exists(csv_path(n, "ablation"))]
-    if not frames:
-        return
-    df_all = pd.concat(frames, ignore_index=True)
-
-    plt.figure(figsize=ABLATION_FIGSIZE)
-    sns.lineplot(data=df_all, x="steps", y="acc", hue="model", marker="o", palette="tab20")
-    plt.title("PGD Accuracy vs Number of Steps (Gradient Masking Check)")
-    plt.xlabel("PGD steps")
-    plt.ylabel("Accuracy")
-    plt.ylim(0, PLOT_MAX_ACCURACY)
-    plt.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-    plt.tight_layout()
-    plt.savefig(ABLATION_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_pgd_trajectory(model_names):
-    trajs = {}
-    for name in model_names:
-        p = json_path(name, "trajectory")
-        if os.path.exists(p):
-            with open(p) as f:
-                trajs[name] = json.load(f)
-    if not trajs:
-        return
-
-    model_palette = dict(zip(trajs.keys(), sns.color_palette("tab20", n_colors=len(trajs))))
-    fig, axes = plt.subplots(1, 2, figsize=TRAJECTORY_FIGSIZE)
-    for name, traj in trajs.items():
-        steps = range(1, len(traj["grad_norm_per_step"]) + 1)
-        axes[0].plot(steps, traj["grad_norm_per_step"], marker="o", label=name, color=model_palette[name])
-        axes[1].plot(steps, traj["movement_from_random_start_per_step"], marker="o", label=name, color=model_palette[name])
-
-    axes[0].set_title("Gradient Norm per PGD Step")
-    axes[0].set_xlabel("Step")
-    axes[0].set_ylabel("Grad Norm")
-    axes[0].set_yscale("log")
-    axes[0].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-    axes[0].legend(fontsize=PLOT_LEGEND_FONT_SIZE)
-
-    axes[1].set_title("Perturbation Movement per PGD Step")
-    axes[1].set_xlabel("Step")
-    axes[1].set_ylabel("Linf Movement from Random Start")
-    axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-    axes[1].legend(fontsize=PLOT_LEGEND_FONT_SIZE)
-
-    fig.tight_layout()
-    fig.savefig(TRAJECTORY_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_layerwise_grad_profile(model_names):
-    quant_names = [n for n in model_names if os.path.exists(csv_path(n, "layerwise"))]
-    if not quant_names:
-        return
-
-    cols = min(LAYERWISE_PLOT_COLS_MAX, len(quant_names))
-    rows = int(np.ceil(len(quant_names) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(LAYERWISE_PLOT_WIDTH * cols, LAYERWISE_PLOT_HEIGHT * rows), squeeze=False)
-    for i, name in enumerate(quant_names):
-        df = pd.read_csv(csv_path(name, "layerwise"))
-        ax = axes[i // cols][i % cols]
-        x = np.arange(len(df))
-        ax.plot(x, df["grad_norm_hard"], marker="o", label="hard-round", color=ATTACK_PALETTE["hard-round"])
-        ax.plot(x, df["grad_norm_ste"], marker="o", label="STE", color=ATTACK_PALETTE["STE"])
-        ax.set_yscale("log")
-        ax.set_xticks(x)
-        ax.set_xticklabels(df["layer"], rotation=LAYERWISE_XTICK_ROTATION, fontsize=LAYERWISE_XTICK_FONT_SIZE)
-        ax.set_title(name)
-        ax.set_ylabel("Grad Norm (log)")
-        ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
-        ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-    for j in range(len(quant_names), rows * cols):
-        axes[j // cols][j % cols].axis("off")
-    fig.suptitle("Layerwise Gradient Norms: Hard-Round vs STE")
-    fig.tight_layout()
-    fig.savefig(LAYERWISE_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_component_ablation(model_names):
-    frames = [pd.read_csv(csv_path(n, "component_ablation")) for n in model_names if os.path.exists(csv_path(n, "component_ablation"))]
-    if not frames:
-        return
-    df_all = pd.concat(frames, ignore_index=True)
-    df_long = df_all.melt(id_vars=["model", "config"], value_vars=["clean_acc", "PGD_acc"], var_name="Metric", value_name="Accuracy")
-
-    g = sns.catplot(
-        data=df_long,
-        x="config",
-        y="Accuracy",
-        hue="Metric",
-        col="model",
-        kind="bar",
-        col_wrap=COMPONENT_ABLATION_COL_WRAP,
-        height=COMPONENT_ABLATION_HEIGHT,
-        sharey=True,
-        palette=_palette_for(["clean_acc", "PGD_acc"]),
-    )
-    g.set_titles("{col_name}")
-    g.set(ylim=(0, PLOT_MAX_ACCURACY))
-    g.savefig(COMPONENT_ABLATION_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_chunk_quantization_attacks(model_names):
-    frames = [pd.read_csv(csv_path(n, "chunk_quant")) for n in model_names if os.path.exists(csv_path(n, "chunk_quant"))]
-    if not frames:
-        return
-    df_all = pd.concat(frames, ignore_index=True)
-    df_long = df_all.melt(id_vars=["model", "chunk_label", "first_layer", "last_layer"], value_vars=["clean_acc", "PGD_acc"], var_name="Metric", value_name="Accuracy")
-    df_long = df_long.dropna(subset=["Accuracy"])
-    if df_long.empty:
-        return
-
-    g = sns.catplot(
-        data=df_long,
-        x="chunk_label",
-        y="Accuracy",
-        hue="Metric",
-        col="model",
-        kind="bar",
-        col_wrap=CHUNK_QUANT_COL_WRAP,
-        height=CHUNK_QUANT_HEIGHT,
-        sharey=True,
-        palette=_palette_for(["clean_acc", "PGD_acc"]),
-    )
-    g.set_titles("{col_name}")
-    g.set_axis_labels("Quantized layer chunk", "Accuracy")
-    g.set(ylim=(0, PLOT_MAX_ACCURACY))
-    for ax in g.axes.flatten():
-        ax.grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
-    g.savefig(CHUNK_QUANT_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_gradient_masking_summary(df_results):
-    if df_results is None or df_results.empty or not {"model", "PGD", "AutoAttack"}.issubset(df_results.columns):
-        return
-    df = df_results.dropna(subset=["PGD", "AutoAttack"]).copy()
-    if df.empty:
-        return
-    df["PGD_minus_AutoAttack"] = df["PGD"] - df["AutoAttack"]
-
-    fig, axes = plt.subplots(1, 2, figsize=MASKING_SUMMARY_FIGSIZE)
-    sns.barplot(data=df, x="model", y="PGD_minus_AutoAttack", ax=axes[0], color=ATTACK_PALETTE["PGD"])
-    axes[0].axhline(0, color=BASELINE_COLOR, linewidth=MASKING_BASELINE_LINEWIDTH)
-    axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=SUMMARY_XTICK_ROTATION, ha="right")
-    axes[0].set_title("PGD - AutoAttack Accuracy Gap")
-    axes[0].grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
-
-    if "frac_zero_grad_hard" in df.columns:
-        df2 = df.dropna(subset=["frac_zero_grad_hard"])
-        if not df2.empty:
-            sns.scatterplot(data=df2, x="frac_zero_grad_hard", y="PGD_minus_AutoAttack", hue="model", s=MASKING_SCATTER_SIZE, ax=axes[1], palette="tab20")
-            axes[1].set_title("Masking Gap vs Fraction of Zero Gradients")
-            axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-        else:
-            axes[1].axis("off")
-    else:
-        axes[1].axis("off")
-
-    fig.tight_layout()
-    fig.savefig(MASKING_SUMMARY_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
-def plot_confidence_margin_diagnostic(model_names):
-    data = {}
-    for name in model_names:
-        p = json_path(name, "margin")
-        if os.path.exists(p):
-            with open(p) as f:
-                data[name] = json.load(f)
-    if not data:
-        return
-
-    cols = min(MARGIN_PLOT_COLS_MAX, len(data))
-    rows = int(np.ceil(len(data) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(MARGIN_PLOT_WIDTH * cols, MARGIN_PLOT_HEIGHT * rows), squeeze=False)
-    for i, (name, margins) in enumerate(data.items()):
-        ax = axes[i // cols][i % cols]
-        ax.hist(margins["clean_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="clean", density=True, color=ATTACK_PALETTE["clean"])
-        ax.hist(margins["adv_margins"], bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="PGD-adv", density=True, color=ATTACK_PALETTE["PGD-adv"])
-        ax.set_title(name)
-        ax.set_xlabel("Top1 - Top2 Softmax Margin")
-        ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
-        ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-    for j in range(len(data), rows * cols):
-        axes[j // cols][j % cols].axis("off")
-    fig.suptitle("Confidence Margin: Clean vs PGD-Adversarial")
-    fig.tight_layout()
-    fig.savefig(MARGIN_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-def plot_accuracy_summary(df_results):
-    if df_results is None or df_results.empty:
-        return
-
-    acc_cols = [
-        c for c in [
-            "clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
-            "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
-            "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
-            "Surrogate_Transfer", "Random_Noise", "BPDA_PGD",
-            "BPDA_Adaptive", "EOT_PGD", "Adaptive_Guardrail", "Adaptive_DetectGuard",
-            "NES", "Boundary_acc",
-        ]
-        if c in df_results.columns and df_results[c].notna().any()
-    ]
-
-    if not acc_cols:
-        return
-
-    df_plot = df_results.melt(
-        id_vars="model",
-        value_vars=acc_cols,
-        var_name="Metric",
-        value_name="Accuracy",
-    )
-
-    plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
-    sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Metric", palette=_palette_for(acc_cols))
-    plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
-    plt.title("Model Accuracy under Various Adversarial Attacks")
-    plt.ylim(0, PLOT_MAX_ACCURACY)
-    plt.grid(axis="y", linestyle="--", alpha=SUMMARY_GRID_ALPHA)
-    plt.tight_layout()
-    plt.savefig(PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-def plot_results_heatmap(df_results):
-    if df_results is None or df_results.empty:
-        return
-    candidate_cols = ["clean_acc", "FGSM", "PGD", "AutoAttack", "CW", "DeepFool", "JSMA",
-                      "Surrogate_Transfer", "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
-                      "Transfer_to_FP32", "MIM_Transfer_to_FP32", "UAP_Transfer_to_FP32",
-                      "Random_Noise", "BPDA_PGD", "BPDA_Adaptive", "EOT_PGD",
-                      "Adaptive_Guardrail", "Adaptive_DetectGuard", "NES", "Boundary_acc"]
-    cols = [c for c in candidate_cols if c in df_results.columns and df_results[c].notna().any()]
-    if not cols:
-        return
-    df_heat = df_results.set_index("model")[cols].astype(float)
-
-    plt.figure(figsize=(max(HEATMAP_MIN_WIDTH, len(cols)), max(HEATMAP_MIN_HEIGHT, len(df_heat) * HEATMAP_ROW_HEIGHT)))
-    sns.heatmap(df_heat, annot=True, fmt=".2f", cmap="RdYlGn", vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX, linewidths=HEATMAP_LINEWIDTHS)
-    plt.title("Full Results Heatmap: Models vs Attacks")
-    plt.tight_layout()
-    plt.savefig(HEATMAP_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
-    plt.show()
-
-
 def parallelize(model):
     if torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel):
         return nn.DataParallel(model)
     return model
+
+
+def run_chaotic_dither_sweep(fp32_model, loader, arch_key, bits=QAT_BITS):
+    rows = []
+    for amplitude in CHAOTIC_DITHER_AMPLITUDES:
+        model = convert_to_chaotic_quant(
+            fp32_model, bits=bits, quant_weight=True, quant_act=True,
+            dither_amplitude=amplitude,
+        ).to(device).eval()
+        clean = sanity_check_accuracy(model, loader)
+        attack = make_torchattack(
+            torchattacks.PGD, model, eps=DEFAULT_EPS, alpha=PGD_ALPHA,
+            steps=PGD_STEPS, random_start=PGD_RANDOM_START,
+        )
+        torch.manual_seed(SEEDS[0])
+        pgd = accuracy_under_attack(model, loader, attack)
+        rows.append({
+            "model": arch_key, "bits": bits, "dither_amplitude": amplitude,
+            "clean_acc": clean, "PGD_acc": pgd,
+        })
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return rows
+
+
+def add_general_scores(df_results):
+    """Compute comparable aggregate scores solely from already-produced metrics."""
+    robust_candidates = [
+        c for c in ("AutoAttack", "BPDA_PGD", "Transfer_from_FP32", "MIM_Transfer",
+                    "BPDA_Adaptive", "EOT_PGD", "Adaptive_Guardrail", "Adaptive_DetectGuard")
+        if c in df_results.columns
+    ]
+    if robust_candidates:
+        df_results["General_Robustness"] = df_results[robust_candidates].min(axis=1, skipna=True)
+    if {"clean_acc", "General_Robustness"}.issubset(df_results.columns):
+        denom = df_results["clean_acc"].replace(0, np.nan)
+        df_results["General_Robustness_Retention"] = df_results["General_Robustness"] / denom
+    if {"PGD", "General_Robustness"}.issubset(df_results.columns):
+        gap = (df_results["PGD"] - df_results["General_Robustness"]).clip(lower=0)
+        denom = df_results["clean_acc"].replace(0, np.nan) if "clean_acc" in df_results else 1.0
+        df_results["General_Masking_Score"] = (gap / denom).clip(lower=0, upper=1)
+    return df_results
 
 
 def main():
@@ -1871,58 +1864,69 @@ def main():
         except Exception as e:
             print(f"  [FAIL] compressed FP32 for {arch_key}: {e}")
 
-        try:
-            chaotic_int8_ptq = convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
-            model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (chaotic_int8_ptq, fp32)
-        except Exception as e:
-            print(f"  [FAIL] chaotic int8 PTQ for {arch_key}: {e}")
+        if RUN_CHAOTIC_COMPRESS:
+            try:
+                chaotic_int8_ptq = convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True)
+                model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (chaotic_int8_ptq, fp32)
+            except Exception as e:
+                print(f"  [FAIL] chaotic int8 PTQ for {arch_key}: {e}")
 
-        try:
-            chaotic_int4_ptq = convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True)
-            model_registry[f"{arch_key}_chaotic_int4_PTQ"] = (chaotic_int4_ptq, fp32)
-        except Exception as e:
-            print(f"  [FAIL] chaotic int4 PTQ for {arch_key}: {e}")
+            try:
+                chaotic_int4_ptq = convert_to_chaotic_quant(fp32, bits=4, quant_weight=True, quant_act=True)
+                model_registry[f"{arch_key}_chaotic_int4_PTQ"] = (chaotic_int4_ptq, fp32)
+            except Exception as e:
+                print(f"  [FAIL] chaotic int4 PTQ for {arch_key}: {e}")
 
-        try:
-            compressed_chaotic_int8 = with_image_compression(convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True))
-            model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (compressed_chaotic_int8, fp32)
-        except Exception as e:
-            print(f"  [FAIL] compressed chaotic int8 PTQ for {arch_key}: {e}")
+            try:
+                compressed_chaotic_int8 = with_image_compression(convert_to_chaotic_quant(fp32, bits=QAT_BITS, quant_weight=True, quant_act=True))
+                model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (compressed_chaotic_int8, fp32)
+            except Exception as e:
+                print(f"  [FAIL] compressed chaotic int8 PTQ for {arch_key}: {e}")
 
+            try:
+                chaotic_int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS, chaotic=True)
+                model_registry[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_int8_qat, fp32)
+            except Exception as e:
+                print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
+                traceback.print_exc()
+
+    if RUN_DEFENSE_SUITE:
         try:
-            chaotic_int8_qat = prepare_qat(fp32, bits=QAT_BITS, finetune_loader=finetune_loader, epochs=QAT_MAIN_EPOCHS, chaotic=True)
-            model_registry[f"{arch_key}_chaotic_int8_QAT"] = (chaotic_int8_qat, fp32)
+            model_registry, df_defense_summary = run_defense_suite(model_registry, finetune_loader, eval_loader)
+            if not df_defense_summary.empty:
+                print("\nDefense summary (guardrail/detector flag rates, certified accuracy):")
+                print(df_defense_summary.to_string(index=False))
         except Exception as e:
-            print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
+            print(f"  [FAIL] run_defense_suite failed: {e}")
             traceback.print_exc()
 
-    try:
-        model_registry, df_defense_summary = run_defense_suite(model_registry, finetune_loader, eval_loader)
-        if not df_defense_summary.empty:
-            print("\nDefense summary (guardrail/detector flag rates, certified accuracy):")
-            print(df_defense_summary.to_string(index=False))
-    except Exception as e:
-        print(f"  [FAIL] run_defense_suite failed: {e}")
-        traceback.print_exc()
+    if RUN_CHAOTIC_DITHER_SWEEP:
+        dither_rows = []
+        for arch_key in PRETRAINED_NAMES:
+            entry = model_registry.get(f"{arch_key}_FP32")
+            if entry is not None:
+                dither_rows.extend(run_chaotic_dither_sweep(entry[0], eval_loader, arch_key))
+        pd.DataFrame(dither_rows).to_csv(CHAOTIC_DITHER_SWEEP_CSV, index=False)
 
     chunk_model_names = []
-    for arch_key in PRETRAINED_NAMES:
-        entry = model_registry.get(f"{arch_key}_FP32")
-        if entry is None:
-            continue
-        chunk_model_names.append(arch_key)
-        out_path = csv_path(arch_key, "chunk_quant")
-        if os.path.exists(out_path):
-            print(f"Skipping chunk quantization for {arch_key} (already in {out_path})")
-            continue
-        print(f"\nChunk quantization sweep for {arch_key} ...")
-        try:
-            rows = run_chunk_quantization_attacks(entry[0], eval_loader, arch_key, bits=QAT_BITS, n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS)
-            pd.DataFrame(rows).to_csv(out_path, index=False)
-            print(f"Chunk quantization results saved to {out_path}")
-        except Exception as e:
-            print(f"  [FAIL] chunk quantization sweep failed for {arch_key}: {e}")
-            traceback.print_exc()
+    if RUN_CHUNK_QUANTIZATION:
+        for arch_key in PRETRAINED_NAMES:
+            entry = model_registry.get(f"{arch_key}_FP32")
+            if entry is None:
+                continue
+            chunk_model_names.append(arch_key)
+            out_path = csv_path(arch_key, "chunk_quant")
+            if os.path.exists(out_path):
+                print(f"Skipping chunk quantization for {arch_key} (already in {out_path})")
+                continue
+            print(f"\nChunk quantization sweep for {arch_key} ...")
+            try:
+                rows = run_chunk_quantization_attacks(entry[0], eval_loader, arch_key, bits=QAT_BITS, n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS)
+                pd.DataFrame(rows).to_csv(out_path, index=False)
+                print(f"Chunk quantization results saved to {out_path}")
+            except Exception as e:
+                print(f"  [FAIL] chunk quantization sweep failed for {arch_key}: {e}")
+                traceback.print_exc()
 
     print("\nRegistry built:", list(model_registry.keys()))
 
@@ -1931,28 +1935,54 @@ def main():
         model_registry[k] = (parallelize(m), parallelize(r) if r else None)
 
     if os.path.exists(RESULTS_CSV):
-        df_results = pd.read_csv(RESULTS_CSV)
-        done = set(df_results["model"].astype(str))
+        df_results = report_data.read_table(RESULTS_CSV)
+        done = set(
+            df_results.loc[df_results.get("clean_acc_n", pd.Series(index=df_results.index)).notna(), "model"].astype(str)
+        )
     else:
         df_results = pd.DataFrame(columns=["model"])
         done = set()
 
+    if os.path.exists(PERFORMANCE_CSV):
+        existing_run_metrics = pd.read_csv(PERFORMANCE_CSV)
+        run_metrics = (
+            existing_run_metrics.to_dict("records")
+            if "run_seconds" in existing_run_metrics.columns else []
+        )
+    else:
+        run_metrics = []
     for name, (model, ref) in list(model_registry.items()):
         if name in done:
             print(f"Skipping {name} (already in {RESULTS_CSV})")
             continue
 
         print(f"\nEvaluating {name} ...")
+        monitor = ResourceMonitor(model, name)
         try:
-            res = run_suite(model, eval_loader, name, fp32_ref=ref)
+            if RECORD_RUN_METRICS:
+                with monitor:
+                    res = run_suite(model, eval_loader, name, fp32_ref=ref)
+            else:
+                res = run_suite(model, eval_loader, name, fp32_ref=ref)
         except Exception as e:
             print(f"  [FAIL] run_suite failed for {name}: {e}")
             traceback.print_exc()
             res = {"model": name}
+        finally:
+            if RECORD_RUN_METRICS and monitor.metrics is not None:
+                run_metrics = [
+                    row for row in run_metrics
+                    if str(row.get("model")) != name
+                ]
+                run_metrics.append(monitor.metrics)
+                report_data.upsert_table(
+                    PERFORMANCE_CSV, pd.DataFrame([monitor.metrics]), ["model"]
+                )
+                print("Run metrics:")
+                print(pd.DataFrame([monitor.metrics]).to_string(index=False))
 
         new_row = pd.DataFrame([res])
-        df_results = pd.concat([df_results, new_row], ignore_index=True)
-        df_results.to_csv(RESULTS_CSV, index=False)
+        df_results = report_data.upsert_table(RESULTS_CSV, new_row, ["model"])
 
         print("Result:")
         print(new_row.to_string(index=False))
@@ -2011,89 +2041,44 @@ def main():
             - df_results["FP32_Worst_Robust_Acc"]
         )
 
+    df_results = report_data.add_paired_tests(
+        report_data.add_derived_metrics(df_results)
+    )
     df_results.to_csv(RESULTS_CSV, index=False)
 
-    try:
-        plot_accuracy_summary(df_results)
-    except Exception as e:
-        print(f"  [WARN] plot_accuracy_summary failed: {e}")
-
-    if os.path.exists(SWEEP_CSV):
+    if RUN_EPSILON_SWEEP and os.path.exists(SWEEP_CSV):
         df_sweep = pd.read_csv(SWEEP_CSV)
         sweep_done = set(zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6)))
     else:
         df_sweep = pd.DataFrame()
         sweep_done = set()
 
-    for name, (model, ref) in model_registry.items():
+    for name, (model, ref) in model_registry.items() if RUN_EPSILON_SWEEP else []:
         print(f"\nSweeping {name} ...")
         pending_eps = [eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done]
         if not pending_eps:
             print(f"  Skipping {name} (already done)")
             continue
-        try:
+        def save_epsilon_sweep():
+            nonlocal df_sweep
             rows = run_epsilon_sweep_for_model(model, eval_loader, name, pending_eps)
             if rows:
                 new_sweep = pd.DataFrame(rows)
-                df_sweep = pd.concat([df_sweep, new_sweep], ignore_index=True)
-                df_sweep.to_csv(SWEEP_CSV, index=False)
-        except Exception as e:
-            print(f"  [FAIL] epsilon sweep failed for {name}: {e}")
-            traceback.print_exc()
+                df_sweep = report_data.upsert_table(
+                    SWEEP_CSV, new_sweep, ["model", "epsilon"]
+                )
 
-    print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
+        safe_call(save_epsilon_sweep, "epsilon sweep failed", context=name, show_traceback=True)
 
-    model_names = list(model_registry.keys())
+    if RUN_EPSILON_SWEEP:
+        print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
 
-    try:
-        plot_epsilon_sweep_curves(df_sweep)
-    except Exception as e:
-        print(f"  [WARN] plot_epsilon_sweep_curves failed: {e}")
+    def build_reports():
+        tables = report_data.combine_all(report_data.DATA_DIR)
+        report_data.plot_all(tables, report_data.DATA_DIR)
+        report_data.print_report(tables)
 
-    try:
-        plot_pgd_steps_ablation(model_names)
-    except Exception as e:
-        print(f"  [WARN] plot_pgd_steps_ablation failed: {e}")
-
-    try:
-        plot_pgd_trajectory(model_names)
-    except Exception as e:
-        print(f"  [WARN] plot_pgd_trajectory failed: {e}")
-
-    try:
-        plot_layerwise_grad_profile(model_names)
-    except Exception as e:
-        print(f"  [WARN] plot_layerwise_grad_profile failed: {e}")
-
-    try:
-        plot_component_ablation(model_names)
-    except Exception as e:
-        print(f"  [WARN] plot_component_ablation failed: {e}")
-
-    try:
-        plot_chunk_quantization_attacks(chunk_model_names)
-    except Exception as e:
-        print(f"  [WARN] plot_chunk_quantization_attacks failed: {e}")
-
-    try:
-        plot_gradient_masking_summary(df_results)
-    except Exception as e:
-        print(f"  [WARN] plot_gradient_masking_summary failed: {e}")
-
-    try:
-        plot_confidence_margin_diagnostic(model_names)
-    except Exception as e:
-        print(f"  [WARN] plot_confidence_margin_diagnostic failed: {e}")
-
-    try:
-        plot_results_heatmap(df_results)
-    except Exception as e:
-        print(f"  [WARN] plot_results_heatmap failed: {e}")
-
-    try:
-        plot_defense_comparison(df_results)
-    except Exception as e:
-        print(f"  [WARN] plot_defense_comparison failed: {e}")
+    safe_call(build_reports, "report generation failed", show_traceback=True)
 
     print("All done.")
 
