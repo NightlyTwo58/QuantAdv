@@ -46,8 +46,9 @@ class ResourceMonitor:
             self.peak_rss_bytes = max(self.peak_rss_bytes, rss_bytes)
 
     def __enter__(self):
-        self.start_rss_bytes, self.start_user_seconds, self.start_system_seconds = \
+        self.start_rss_bytes, self.start_user_seconds, self.start_system_seconds = (
             self._process_tree_usage(self.process)
+        )
         self.peak_rss_bytes = self.start_rss_bytes
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -68,8 +69,9 @@ class ResourceMonitor:
         elapsed_seconds = time.perf_counter() - self.start_time
         self.stop_event.set()
         self.sampler.join()
-        end_rss_bytes, end_user_seconds, end_system_seconds = \
-            self._process_tree_usage(self.process)
+        end_rss_bytes, end_user_seconds, end_system_seconds = self._process_tree_usage(
+            self.process
+        )
         self.peak_rss_bytes = max(self.peak_rss_bytes, end_rss_bytes)
 
         params = list(self.model.parameters())
@@ -90,31 +92,49 @@ class ResourceMonitor:
             "status": "failed" if exc_type is not None else "completed",
             "run_seconds": elapsed_seconds,
             "cpu_user_seconds": max(0.0, end_user_seconds - self.start_user_seconds),
-            "cpu_system_seconds": max(0.0, end_system_seconds - self.start_system_seconds),
-            "average_cpu_cores_used": (
-                max(0.0, end_user_seconds + end_system_seconds
-                    - self.start_user_seconds - self.start_system_seconds) / elapsed_seconds
-                if elapsed_seconds else None
+            "cpu_system_seconds": max(
+                0.0, end_system_seconds - self.start_system_seconds
             ),
-            "rss_start_mib": self.start_rss_bytes / 2 ** 20,
-            "rss_end_mib": end_rss_bytes / 2 ** 20,
-            "rss_peak_mib": self.peak_rss_bytes / 2 ** 20,
-            "rss_peak_increase_mib": (self.peak_rss_bytes - self.start_rss_bytes) / 2 ** 20,
+            "average_cpu_cores_used": (
+                max(
+                    0.0,
+                    end_user_seconds
+                    + end_system_seconds
+                    - self.start_user_seconds
+                    - self.start_system_seconds,
+                )
+                / elapsed_seconds
+                if elapsed_seconds
+                else None
+            ),
+            "rss_start_mib": self.start_rss_bytes / 2**20,
+            "rss_end_mib": end_rss_bytes / 2**20,
+            "rss_peak_mib": self.peak_rss_bytes / 2**20,
+            "rss_peak_increase_mib": (self.peak_rss_bytes - self.start_rss_bytes)
+            / 2**20,
             "parameter_count": parameter_count,
-            "resident_model_mib": resident_bytes / 2 ** 20,
-            "nominal_packed_model_mib": packed_bytes / 2 ** 20,
+            "resident_model_mib": resident_bytes / 2**20,
+            "nominal_packed_model_mib": packed_bytes / 2**20,
             "nominal_weight_bits": nominal_bits,
             "cuda_allocated_start_mib": (
-                self.start_cuda_allocated / 2 ** 20 if self.start_cuda_allocated is not None else None
+                self.start_cuda_allocated / 2**20
+                if self.start_cuda_allocated is not None
+                else None
             ),
             "cuda_allocated_peak_mib": (
-                torch.cuda.max_memory_allocated() / 2 ** 20 if torch.cuda.is_available() else None
+                torch.cuda.max_memory_allocated() / 2**20
+                if torch.cuda.is_available()
+                else None
             ),
             "cuda_reserved_start_mib": (
-                self.start_cuda_reserved / 2 ** 20 if self.start_cuda_reserved is not None else None
+                self.start_cuda_reserved / 2**20
+                if self.start_cuda_reserved is not None
+                else None
             ),
             "cuda_reserved_peak_mib": (
-                torch.cuda.max_memory_reserved() / 2 ** 20 if torch.cuda.is_available() else None
+                torch.cuda.max_memory_reserved() / 2**20
+                if torch.cuda.is_available()
+                else None
             ),
         }
         return False

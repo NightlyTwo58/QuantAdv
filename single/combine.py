@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -43,14 +44,32 @@ RESULTS_CSV = Path(getattr(_config, "RESULTS_CSV", DATA_DIR / "accuracyresult.cs
 SWEEP_CSV = Path(getattr(_config, "SWEEP_CSV", DATA_DIR / "sweepresult.csv"))
 PLOT_PNG = Path(getattr(_config, "PLOT_PNG", DATA_DIR / "accuracyplot.png"))
 
-SWEEP_PLOT_PNG = Path(getattr(_config, "SWEEP_PLOT_PNG", DATA_DIR / "epsilon_sweep.png"))
-ABLATION_PLOT_PNG = Path(getattr(_config, "ABLATION_PLOT_PNG", DATA_DIR / "pgd_steps_ablation.png"))
-TRAJECTORY_PLOT_PNG = Path(getattr(_config, "TRAJECTORY_PLOT_PNG", DATA_DIR / "pgd_trajectory.png"))
-LAYERWISE_PLOT_PNG = Path(getattr(_config, "LAYERWISE_PLOT_PNG", DATA_DIR / "layerwise_grad_profile.png"))
-COMPONENT_ABLATION_PLOT_PNG = Path(getattr(_config, "COMPONENT_ABLATION_PLOT_PNG", DATA_DIR / "component_ablation.png"))
-MASKING_SUMMARY_PLOT_PNG = Path(getattr(_config, "MASKING_SUMMARY_PLOT_PNG", DATA_DIR / "gradient_masking_summary.png"))
-MARGIN_PLOT_PNG = Path(getattr(_config, "MARGIN_PLOT_PNG", DATA_DIR / "confidence_margin.png"))
-HEATMAP_PLOT_PNG = Path(getattr(_config, "HEATMAP_PLOT_PNG", DATA_DIR / "results_heatmap.png"))
+SWEEP_PLOT_PNG = Path(
+    getattr(_config, "SWEEP_PLOT_PNG", DATA_DIR / "epsilon_sweep.png")
+)
+ABLATION_PLOT_PNG = Path(
+    getattr(_config, "ABLATION_PLOT_PNG", DATA_DIR / "pgd_steps_ablation.png")
+)
+TRAJECTORY_PLOT_PNG = Path(
+    getattr(_config, "TRAJECTORY_PLOT_PNG", DATA_DIR / "pgd_trajectory.png")
+)
+LAYERWISE_PLOT_PNG = Path(
+    getattr(_config, "LAYERWISE_PLOT_PNG", DATA_DIR / "layerwise_grad_profile.png")
+)
+COMPONENT_ABLATION_PLOT_PNG = Path(
+    getattr(_config, "COMPONENT_ABLATION_PLOT_PNG", DATA_DIR / "component_ablation.png")
+)
+MASKING_SUMMARY_PLOT_PNG = Path(
+    getattr(
+        _config, "MASKING_SUMMARY_PLOT_PNG", DATA_DIR / "gradient_masking_summary.png"
+    )
+)
+MARGIN_PLOT_PNG = Path(
+    getattr(_config, "MARGIN_PLOT_PNG", DATA_DIR / "confidence_margin.png")
+)
+HEATMAP_PLOT_PNG = Path(
+    getattr(_config, "HEATMAP_PLOT_PNG", DATA_DIR / "results_heatmap.png")
+)
 
 ABLATION_COMBINED_CSV = DATA_DIR / "ablation_combined.csv"
 LAYERWISE_COMBINED_CSV = DATA_DIR / "layerwise_combined.csv"
@@ -105,9 +124,9 @@ HEATMAP_LINEWIDTHS = getattr(_config, "HEATMAP_LINEWIDTHS", 0.5)
 def _model_from_prefixed_path(path: Path, prefix: str, suffix: str) -> str:
     name = path.name
     if name.startswith(prefix):
-        name = name[len(prefix):]
+        name = name[len(prefix) :]
     if name.endswith(suffix):
-        name = name[:-len(suffix)]
+        name = name[: -len(suffix)]
     return name
 
 
@@ -130,8 +149,14 @@ def _read_csvs(paths: Iterable[Path], model_prefix: str | None = None) -> pd.Dat
 
     out = pd.concat(frames, ignore_index=True, sort=False)
     if "model" in out.columns:
-        out = out.drop_duplicates(subset=[c for c in ["model", "epsilon", "steps", "layer", "config"] if c in out.columns],
-                                  keep="last")
+        out = out.drop_duplicates(
+            subset=[
+                c
+                for c in ["model", "epsilon", "steps", "layer", "config"]
+                if c in out.columns
+            ],
+            keep="last",
+        )
     return out
 
 
@@ -178,7 +203,9 @@ def combine_sweeps(data_dir: Path, output: Path = SWEEP_CSV) -> pd.DataFrame:
     return _write(df, output)
 
 
-def combine_ablation(data_dir: Path, output: Path = ABLATION_COMBINED_CSV) -> pd.DataFrame:
+def combine_ablation(
+    data_dir: Path, output: Path = ABLATION_COMBINED_CSV
+) -> pd.DataFrame:
     files = [p for p in data_dir.glob("ablation_*.csv") if p.name != output.name]
     df = _read_csvs(files, model_prefix="ablation_")
     if not df.empty and {"model", "steps"}.issubset(df.columns):
@@ -186,19 +213,27 @@ def combine_ablation(data_dir: Path, output: Path = ABLATION_COMBINED_CSV) -> pd
     return _write(df, output)
 
 
-def combine_layerwise(data_dir: Path, output: Path = LAYERWISE_COMBINED_CSV) -> pd.DataFrame:
+def combine_layerwise(
+    data_dir: Path, output: Path = LAYERWISE_COMBINED_CSV
+) -> pd.DataFrame:
     files = [p for p in data_dir.glob("layerwise_*.csv") if p.name != output.name]
     df = _read_csvs(files, model_prefix="layerwise_")
     return _write(df, output)
 
 
-def combine_component_ablation(data_dir: Path, output: Path = COMPONENT_ABLATION_COMBINED_CSV) -> pd.DataFrame:
-    files = [p for p in data_dir.glob("component_ablation_*.csv") if p.name != output.name]
+def combine_component_ablation(
+    data_dir: Path, output: Path = COMPONENT_ABLATION_COMBINED_CSV
+) -> pd.DataFrame:
+    files = [
+        p for p in data_dir.glob("component_ablation_*.csv") if p.name != output.name
+    ]
     df = _read_csvs(files, model_prefix="component_ablation_")
     return _write(df, output)
 
 
-def combine_trajectories(data_dir: Path, output: Path = TRAJECTORY_COMBINED_CSV) -> pd.DataFrame:
+def combine_trajectories(
+    data_dir: Path, output: Path = TRAJECTORY_COMBINED_CSV
+) -> pd.DataFrame:
     rows = []
     for path in sorted(data_dir.glob("trajectory_*.json")):
         model = _model_from_prefixed_path(path, "trajectory_", ".json")
@@ -213,12 +248,16 @@ def combine_trajectories(data_dir: Path, output: Path = TRAJECTORY_COMBINED_CSV)
         move = traj.get("movement_from_random_start_per_step", []) or []
         n = max(len(grad), len(move))
         for i in range(n):
-            rows.append({
-                "model": model,
-                "step": i + 1,
-                "grad_norm_per_step": grad[i] if i < len(grad) else np.nan,
-                "movement_from_random_start_per_step": move[i] if i < len(move) else np.nan,
-            })
+            rows.append(
+                {
+                    "model": model,
+                    "step": i + 1,
+                    "grad_norm_per_step": grad[i] if i < len(grad) else np.nan,
+                    "movement_from_random_start_per_step": (
+                        move[i] if i < len(move) else np.nan
+                    ),
+                }
+            )
 
     return _write(pd.DataFrame(rows), output)
 
@@ -234,7 +273,10 @@ def combine_margins(data_dir: Path, output: Path = MARGIN_COMBINED_CSV) -> pd.Da
             print(f"[WARN] could not read {path}: {exc}")
             continue
 
-        for kind, values in (("clean", margins.get("clean_margins", [])), ("adv", margins.get("adv_margins", []))):
+        for kind, values in (
+            ("clean", margins.get("clean_margins", [])),
+            ("adv", margins.get("adv_margins", [])),
+        ):
             for i, value in enumerate(values):
                 rows.append({"model": model, "kind": kind, "index": i, "margin": value})
 
@@ -253,16 +295,34 @@ def plot_summary_results(df_results: pd.DataFrame, output: Path = PLOT_PNG) -> N
     if df_results is None or df_results.empty or "model" not in df_results.columns:
         return
 
-    acc_cols = [c for c in [
-        "clean_acc", "FGSM", "PGD", "CW", "DeepFool", "JSMA", "AutoAttack",
-        "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
-        "Surrogate_Transfer", "Random_Noise", "BPDA_PGD", "NES", "Boundary_acc",
-    ] if c in df_results.columns and df_results[c].notna().any()]
+    acc_cols = [
+        c
+        for c in [
+            "clean_acc",
+            "FGSM",
+            "PGD",
+            "CW",
+            "DeepFool",
+            "JSMA",
+            "AutoAttack",
+            "Transfer_from_FP32",
+            "MIM_Transfer",
+            "UAP_Transfer",
+            "Surrogate_Transfer",
+            "Random_Noise",
+            "BPDA_PGD",
+            "NES",
+            "Boundary_acc",
+        ]
+        if c in df_results.columns and df_results[c].notna().any()
+    ]
 
     if not acc_cols:
         return
 
-    df_plot = df_results.melt(id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy")
+    df_plot = df_results.melt(
+        id_vars="model", value_vars=acc_cols, var_name="Attack", value_name="Accuracy"
+    )
     df_plot = df_plot.dropna(subset=["Accuracy"])
     if df_plot.empty:
         return
@@ -279,14 +339,23 @@ def plot_summary_results(df_results: pd.DataFrame, output: Path = PLOT_PNG) -> N
     print(f"wrote {output}")
 
 
-def plot_epsilon_sweep_curves(df_sweep: pd.DataFrame, output: Path = SWEEP_PLOT_PNG) -> None:
+def plot_epsilon_sweep_curves(
+    df_sweep: pd.DataFrame, output: Path = SWEEP_PLOT_PNG
+) -> None:
     if df_sweep is None or df_sweep.empty:
         return
-    value_cols = [c for c in ["PGD_acc", "Random_Noise_acc", "BPDA_acc"] if c in df_sweep.columns]
+    value_cols = [
+        c for c in ["PGD_acc", "Random_Noise_acc", "BPDA_acc"] if c in df_sweep.columns
+    ]
     if not value_cols:
         return
 
-    df_long = df_sweep.melt(id_vars=["model", "epsilon"], value_vars=value_cols, var_name="Attack", value_name="Accuracy")
+    df_long = df_sweep.melt(
+        id_vars=["model", "epsilon"],
+        value_vars=value_cols,
+        var_name="Attack",
+        value_name="Accuracy",
+    )
     df_long = df_long.dropna(subset=["Accuracy"])
     if df_long.empty:
         return
@@ -294,11 +363,23 @@ def plot_epsilon_sweep_curves(df_sweep: pd.DataFrame, output: Path = SWEEP_PLOT_
     models = df_long["model"].dropna().astype(str).unique()
     cols = min(SWEEP_PLOT_COLS_MAX, len(models))
     rows = int(math.ceil(len(models) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(SWEEP_PLOT_WIDTH * cols, SWEEP_PLOT_HEIGHT * rows), squeeze=False)
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(SWEEP_PLOT_WIDTH * cols, SWEEP_PLOT_HEIGHT * rows),
+        squeeze=False,
+    )
 
     for i, model in enumerate(models):
         ax = axes[i // cols][i % cols]
-        sns.lineplot(data=df_long[df_long["model"] == model], x="epsilon", y="Accuracy", hue="Attack", marker="o", ax=ax)
+        sns.lineplot(
+            data=df_long[df_long["model"] == model],
+            x="epsilon",
+            y="Accuracy",
+            hue="Attack",
+            marker="o",
+            ax=ax,
+        )
         ax.set_title(model)
         ax.set_ylim(0, PLOT_MAX_ACCURACY)
         ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
@@ -313,8 +394,14 @@ def plot_epsilon_sweep_curves(df_sweep: pd.DataFrame, output: Path = SWEEP_PLOT_
     print(f"wrote {output}")
 
 
-def plot_pgd_steps_ablation(df_ablation: pd.DataFrame, output: Path = ABLATION_PLOT_PNG) -> None:
-    if df_ablation is None or df_ablation.empty or not {"steps", "acc", "model"}.issubset(df_ablation.columns):
+def plot_pgd_steps_ablation(
+    df_ablation: pd.DataFrame, output: Path = ABLATION_PLOT_PNG
+) -> None:
+    if (
+        df_ablation is None
+        or df_ablation.empty
+        or not {"steps", "acc", "model"}.issubset(df_ablation.columns)
+    ):
         return
 
     plt.figure(figsize=ABLATION_FIGSIZE)
@@ -330,16 +417,30 @@ def plot_pgd_steps_ablation(df_ablation: pd.DataFrame, output: Path = ABLATION_P
     print(f"wrote {output}")
 
 
-def plot_pgd_trajectory(df_traj: pd.DataFrame, output: Path = TRAJECTORY_PLOT_PNG) -> None:
-    required = {"model", "step", "grad_norm_per_step", "movement_from_random_start_per_step"}
+def plot_pgd_trajectory(
+    df_traj: pd.DataFrame, output: Path = TRAJECTORY_PLOT_PNG
+) -> None:
+    required = {
+        "model",
+        "step",
+        "grad_norm_per_step",
+        "movement_from_random_start_per_step",
+    }
     if df_traj is None or df_traj.empty or not required.issubset(df_traj.columns):
         return
 
     fig, axes = plt.subplots(1, 2, figsize=TRAJECTORY_FIGSIZE)
     for model, group in df_traj.groupby("model", sort=False):
         group = group.sort_values("step")
-        axes[0].plot(group["step"], group["grad_norm_per_step"], marker="o", label=model)
-        axes[1].plot(group["step"], group["movement_from_random_start_per_step"], marker="o", label=model)
+        axes[0].plot(
+            group["step"], group["grad_norm_per_step"], marker="o", label=model
+        )
+        axes[1].plot(
+            group["step"],
+            group["movement_from_random_start_per_step"],
+            marker="o",
+            label=model,
+        )
 
     axes[0].set_title("Gradient Norm per PGD Step")
     axes[0].set_xlabel("Step")
@@ -360,7 +461,9 @@ def plot_pgd_trajectory(df_traj: pd.DataFrame, output: Path = TRAJECTORY_PLOT_PN
     print(f"wrote {output}")
 
 
-def plot_layerwise_grad_profile(df_layer: pd.DataFrame, output: Path = LAYERWISE_PLOT_PNG) -> None:
+def plot_layerwise_grad_profile(
+    df_layer: pd.DataFrame, output: Path = LAYERWISE_PLOT_PNG
+) -> None:
     required = {"model", "layer", "grad_norm_hard", "grad_norm_ste"}
     if df_layer is None or df_layer.empty or not required.issubset(df_layer.columns):
         return
@@ -368,7 +471,12 @@ def plot_layerwise_grad_profile(df_layer: pd.DataFrame, output: Path = LAYERWISE
     models = df_layer["model"].dropna().astype(str).unique()
     cols = min(LAYERWISE_PLOT_COLS_MAX, len(models))
     rows = int(math.ceil(len(models) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(LAYERWISE_PLOT_WIDTH * cols, LAYERWISE_PLOT_HEIGHT * rows), squeeze=False)
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(LAYERWISE_PLOT_WIDTH * cols, LAYERWISE_PLOT_HEIGHT * rows),
+        squeeze=False,
+    )
 
     for i, model in enumerate(models):
         df = df_layer[df_layer["model"] == model].reset_index(drop=True)
@@ -378,7 +486,11 @@ def plot_layerwise_grad_profile(df_layer: pd.DataFrame, output: Path = LAYERWISE
         ax.plot(x, df["grad_norm_ste"], marker="o", label="STE")
         ax.set_yscale("log")
         ax.set_xticks(x)
-        ax.set_xticklabels(df["layer"], rotation=LAYERWISE_XTICK_ROTATION, fontsize=LAYERWISE_XTICK_FONT_SIZE)
+        ax.set_xticklabels(
+            df["layer"],
+            rotation=LAYERWISE_XTICK_ROTATION,
+            fontsize=LAYERWISE_XTICK_FONT_SIZE,
+        )
         ax.set_title(model)
         ax.set_ylabel("Grad Norm (log)")
         ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
@@ -394,9 +506,15 @@ def plot_layerwise_grad_profile(df_layer: pd.DataFrame, output: Path = LAYERWISE
     print(f"wrote {output}")
 
 
-def plot_component_ablation(df_component: pd.DataFrame, output: Path = COMPONENT_ABLATION_PLOT_PNG) -> None:
+def plot_component_ablation(
+    df_component: pd.DataFrame, output: Path = COMPONENT_ABLATION_PLOT_PNG
+) -> None:
     required = {"model", "config", "clean_acc", "PGD_acc"}
-    if df_component is None or df_component.empty or not required.issubset(df_component.columns):
+    if (
+        df_component is None
+        or df_component.empty
+        or not required.issubset(df_component.columns)
+    ):
         return
 
     df_long = df_component.melt(
@@ -427,8 +545,14 @@ def plot_component_ablation(df_component: pd.DataFrame, output: Path = COMPONENT
     print(f"wrote {output}")
 
 
-def plot_gradient_masking_summary(df_results: pd.DataFrame, output: Path = MASKING_SUMMARY_PLOT_PNG) -> None:
-    if df_results is None or df_results.empty or not {"model", "PGD", "AutoAttack"}.issubset(df_results.columns):
+def plot_gradient_masking_summary(
+    df_results: pd.DataFrame, output: Path = MASKING_SUMMARY_PLOT_PNG
+) -> None:
+    if (
+        df_results is None
+        or df_results.empty
+        or not {"model", "PGD", "AutoAttack"}.issubset(df_results.columns)
+    ):
         return
 
     df = df_results.dropna(subset=["PGD", "AutoAttack"]).copy()
@@ -440,13 +564,22 @@ def plot_gradient_masking_summary(df_results: pd.DataFrame, output: Path = MASKI
     fig, axes = plt.subplots(1, 2, figsize=MASKING_SUMMARY_FIGSIZE)
     sns.barplot(data=df, x="model", y="PGD_minus_AutoAttack", ax=axes[0])
     axes[0].axhline(0, color="black", linewidth=MASKING_BASELINE_LINEWIDTH)
-    axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=SUMMARY_XTICK_ROTATION, ha="right")
+    axes[0].set_xticklabels(
+        axes[0].get_xticklabels(), rotation=SUMMARY_XTICK_ROTATION, ha="right"
+    )
     axes[0].set_title("PGD - AutoAttack Accuracy Gap")
     axes[0].grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
 
     if "frac_zero_grad_hard" in df.columns and df["frac_zero_grad_hard"].notna().any():
         df2 = df.dropna(subset=["frac_zero_grad_hard"])
-        sns.scatterplot(data=df2, x="frac_zero_grad_hard", y="PGD_minus_AutoAttack", hue="model", s=MASKING_SCATTER_SIZE, ax=axes[1])
+        sns.scatterplot(
+            data=df2,
+            x="frac_zero_grad_hard",
+            y="PGD_minus_AutoAttack",
+            hue="model",
+            s=MASKING_SCATTER_SIZE,
+            ax=axes[1],
+        )
         axes[1].set_title("Masking Gap vs Fraction of Zero Gradients")
         axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
     else:
@@ -458,15 +591,26 @@ def plot_gradient_masking_summary(df_results: pd.DataFrame, output: Path = MASKI
     print(f"wrote {output}")
 
 
-def plot_confidence_margin_diagnostic(df_margins: pd.DataFrame, output: Path = MARGIN_PLOT_PNG) -> None:
+def plot_confidence_margin_diagnostic(
+    df_margins: pd.DataFrame, output: Path = MARGIN_PLOT_PNG
+) -> None:
     required = {"model", "kind", "margin"}
-    if df_margins is None or df_margins.empty or not required.issubset(df_margins.columns):
+    if (
+        df_margins is None
+        or df_margins.empty
+        or not required.issubset(df_margins.columns)
+    ):
         return
 
     models = df_margins["model"].dropna().astype(str).unique()
     cols = min(MARGIN_PLOT_COLS_MAX, len(models))
     rows = int(math.ceil(len(models) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(MARGIN_PLOT_WIDTH * cols, MARGIN_PLOT_HEIGHT * rows), squeeze=False)
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(MARGIN_PLOT_WIDTH * cols, MARGIN_PLOT_HEIGHT * rows),
+        squeeze=False,
+    )
 
     for i, model in enumerate(models):
         ax = axes[i // cols][i % cols]
@@ -474,9 +618,21 @@ def plot_confidence_margin_diagnostic(df_margins: pd.DataFrame, output: Path = M
         clean = group[group["kind"] == "clean"]["margin"].dropna()
         adv = group[group["kind"] == "adv"]["margin"].dropna()
         if not clean.empty:
-            ax.hist(clean, bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="clean", density=True)
+            ax.hist(
+                clean,
+                bins=MARGIN_HIST_BINS,
+                alpha=MARGIN_HIST_ALPHA,
+                label="clean",
+                density=True,
+            )
         if not adv.empty:
-            ax.hist(adv, bins=MARGIN_HIST_BINS, alpha=MARGIN_HIST_ALPHA, label="PGD-adv", density=True)
+            ax.hist(
+                adv,
+                bins=MARGIN_HIST_BINS,
+                alpha=MARGIN_HIST_ALPHA,
+                label="PGD-adv",
+                density=True,
+            )
         ax.set_title(model)
         ax.set_xlabel("Top1 - Top2 Softmax Margin")
         ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
@@ -492,22 +648,53 @@ def plot_confidence_margin_diagnostic(df_margins: pd.DataFrame, output: Path = M
     print(f"wrote {output}")
 
 
-def plot_results_heatmap(df_results: pd.DataFrame, output: Path = HEATMAP_PLOT_PNG) -> None:
+def plot_results_heatmap(
+    df_results: pd.DataFrame, output: Path = HEATMAP_PLOT_PNG
+) -> None:
     if df_results is None or df_results.empty or "model" not in df_results.columns:
         return
 
     candidate_cols = [
-        "clean_acc", "FGSM", "PGD", "AutoAttack", "CW", "DeepFool", "JSMA",
-        "Surrogate_Transfer", "Transfer_from_FP32", "MIM_Transfer", "UAP_Transfer",
-        "Random_Noise", "BPDA_PGD", "NES", "Boundary_acc",
+        "clean_acc",
+        "FGSM",
+        "PGD",
+        "AutoAttack",
+        "CW",
+        "DeepFool",
+        "JSMA",
+        "Surrogate_Transfer",
+        "Transfer_from_FP32",
+        "MIM_Transfer",
+        "UAP_Transfer",
+        "Random_Noise",
+        "BPDA_PGD",
+        "NES",
+        "Boundary_acc",
     ]
-    cols = [c for c in candidate_cols if c in df_results.columns and df_results[c].notna().any()]
+    cols = [
+        c
+        for c in candidate_cols
+        if c in df_results.columns and df_results[c].notna().any()
+    ]
     if not cols:
         return
 
     df_heat = df_results.set_index("model")[cols].astype(float)
-    plt.figure(figsize=(max(HEATMAP_MIN_WIDTH, len(cols)), max(HEATMAP_MIN_HEIGHT, len(df_heat) * HEATMAP_ROW_HEIGHT)))
-    sns.heatmap(df_heat, annot=True, fmt=".2f", cmap="RdYlGn", vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX, linewidths=HEATMAP_LINEWIDTHS)
+    plt.figure(
+        figsize=(
+            max(HEATMAP_MIN_WIDTH, len(cols)),
+            max(HEATMAP_MIN_HEIGHT, len(df_heat) * HEATMAP_ROW_HEIGHT),
+        )
+    )
+    sns.heatmap(
+        df_heat,
+        annot=True,
+        fmt=".2f",
+        cmap="RdYlGn",
+        vmin=HEATMAP_VMIN,
+        vmax=HEATMAP_VMAX,
+        linewidths=HEATMAP_LINEWIDTHS,
+    )
     plt.title("Full Results Heatmap: Models vs Attacks")
     plt.tight_layout()
     plt.savefig(output, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
@@ -555,7 +742,9 @@ def plot_all(dfs: dict[str, pd.DataFrame]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Merge incomplete QuantAdv outputs and regenerate reports.")
+    parser = argparse.ArgumentParser(
+        description="Merge incomplete QuantAdv outputs and regenerate reports."
+    )
     parser.add_argument("--data-dir", type=Path, default=shared_data.DATA_DIR)
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()

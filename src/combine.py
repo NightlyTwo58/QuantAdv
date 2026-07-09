@@ -19,6 +19,7 @@ Run this after the experiment runner finishes all subprocesses:
 Safe to re-run at any time since it only reads whatever per-model files
 currently exist and never mutates them.
 """
+
 import glob
 import json
 import os
@@ -71,7 +72,7 @@ def _load_and_concat(pattern, exclude_pattern=None):
 def _model_name_from_path(path, prefix, suffix):
     base = os.path.basename(path)
     if base.startswith(prefix) and base.endswith(suffix):
-        return base[len(prefix):-len(suffix)]
+        return base[len(prefix) : -len(suffix)]
     return base
 
 
@@ -96,12 +97,14 @@ def _load_trajectories(pattern):
         movements = traj.get("movement_from_random_start_per_step", [])
         n = max(len(grad_norms), len(movements))
         for i in range(n):
-            rows.append({
-                "model": model,
-                "step": i + 1,
-                "grad_norm": grad_norms[i] if i < len(grad_norms) else None,
-                "movement": movements[i] if i < len(movements) else None,
-            })
+            rows.append(
+                {
+                    "model": model,
+                    "step": i + 1,
+                    "grad_norm": grad_norms[i] if i < len(grad_norms) else None,
+                    "movement": movements[i] if i < len(movements) else None,
+                }
+            )
     if not rows:
         return pd.DataFrame(), paths
     return pd.DataFrame(rows), paths
@@ -125,7 +128,9 @@ def combine_results():
         print(f"No files matched {RESULTS_GLOB}; nothing to combine for results.")
     else:
         df_results.to_csv(RESULTS_COMBINED_CSV, index=False)
-        print(f"Combined {len(results_paths)} results file(s) -> {RESULTS_COMBINED_CSV}")
+        print(
+            f"Combined {len(results_paths)} results file(s) -> {RESULTS_COMBINED_CSV}"
+        )
         print(df_results)
 
     if df_sweep.empty:
@@ -138,19 +143,25 @@ def combine_results():
         print(f"No files matched {ABLATION_GLOB}; nothing to combine for ablation.")
     else:
         df_ablation.to_csv(ABLATION_COMBINED_CSV, index=False)
-        print(f"Combined {len(ablation_paths)} ablation file(s) -> {ABLATION_COMBINED_CSV}")
+        print(
+            f"Combined {len(ablation_paths)} ablation file(s) -> {ABLATION_COMBINED_CSV}"
+        )
 
     if df_layerwise.empty:
         print(f"No files matched {LAYERWISE_GLOB}; nothing to combine for layerwise.")
     else:
         df_layerwise.to_csv(LAYERWISE_COMBINED_CSV, index=False)
-        print(f"Combined {len(layerwise_paths)} layerwise file(s) -> {LAYERWISE_COMBINED_CSV}")
+        print(
+            f"Combined {len(layerwise_paths)} layerwise file(s) -> {LAYERWISE_COMBINED_CSV}"
+        )
 
     if df_trajectory.empty:
         print(f"No files matched {TRAJECTORY_GLOB}; nothing to combine for trajectory.")
     else:
         df_trajectory.to_csv(TRAJECTORY_COMBINED_CSV, index=False)
-        print(f"Combined {len(trajectory_paths)} trajectory file(s) -> {TRAJECTORY_COMBINED_CSV}")
+        print(
+            f"Combined {len(trajectory_paths)} trajectory file(s) -> {TRAJECTORY_COMBINED_CSV}"
+        )
 
     return df_results, df_sweep, df_ablation, df_layerwise, df_trajectory
 
@@ -202,7 +213,9 @@ def plot_sweep(df_sweep):
 
     # NEW: Random_Noise_acc alongside PGD_acc/BPDA_acc lets you see, at every
     # epsilon, whether PGD is actually beating pure random search.
-    value_cols = [c for c in ["PGD_acc", "BPDA_acc", "Random_Noise_acc"] if c in df_sweep.columns]
+    value_cols = [
+        c for c in ["PGD_acc", "BPDA_acc", "Random_Noise_acc"] if c in df_sweep.columns
+    ]
     if not value_cols:
         print("No sweep accuracy columns found; skipping sweep plot.")
         return
@@ -248,7 +261,9 @@ def plot_ablation(df_ablation):
     plt.figure(figsize=(12, 7))
     sns.lineplot(data=df_ablation, x="steps", y="acc", hue="model", marker="o")
     plt.xscale("symlog")
-    plt.title("PGD Accuracy vs. Attack Step Budget\n(flat line = optimization steps are not finding real adversarial directions)")
+    plt.title(
+        "PGD Accuracy vs. Attack Step Budget\n(flat line = optimization steps are not finding real adversarial directions)"
+    )
     plt.xlabel("PGD steps (0 = random start only, i.e. Random_Noise)")
     plt.ylabel("Accuracy")
     plt.ylim(0, 1.0)
@@ -272,7 +287,14 @@ def plot_trajectory(df_trajectory):
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-    sns.lineplot(data=df_trajectory, x="step", y="grad_norm", hue="model", ax=axes[0], legend=False)
+    sns.lineplot(
+        data=df_trajectory,
+        x="step",
+        y="grad_norm",
+        hue="model",
+        ax=axes[0],
+        legend=False,
+    )
     axes[0].set_yscale("symlog", linthresh=1e-6)
     axes[0].set_title("Input-gradient norm per PGD step")
     axes[0].set_xlabel("PGD step")
@@ -305,14 +327,20 @@ def plot_layerwise(df_layerwise):
     n = len(models)
     ncols = 4
     nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False
+    )
 
     for idx, model in enumerate(models):
         ax = axes[idx // ncols][idx % ncols]
         sub = df_layerwise[df_layerwise["model"] == model].reset_index(drop=True)
         layer_idx = range(len(sub))
-        ax.plot(layer_idx, sub["grad_norm_hard"], marker="o", label="hard", color="tab:red")
-        ax.plot(layer_idx, sub["grad_norm_ste"], marker="o", label="STE", color="tab:blue")
+        ax.plot(
+            layer_idx, sub["grad_norm_hard"], marker="o", label="hard", color="tab:red"
+        )
+        ax.plot(
+            layer_idx, sub["grad_norm_ste"], marker="o", label="STE", color="tab:blue"
+        )
         ax.set_title(model, fontsize=9)
         ax.set_xlabel("layer depth (quantized layers only)", fontsize=7)
         ax.set_ylabel("grad norm", fontsize=7)
@@ -346,15 +374,23 @@ def build_masking_scorecard(df_results):
     if df_results.empty:
         return pd.DataFrame()
 
-    needed = ["model", "PGD", "Transfer_from_FP32", "Random_Noise",
-              "frac_zero_grad_hard", "plateau_fraction"]
+    needed = [
+        "model",
+        "PGD",
+        "Transfer_from_FP32",
+        "Random_Noise",
+        "frac_zero_grad_hard",
+        "plateau_fraction",
+    ]
     available = [c for c in needed if c in df_results.columns]
     if "model" not in available or "PGD" not in available:
         print("Missing core columns for masking scorecard; skipping.")
         return pd.DataFrame()
 
     df = df_results[available].copy()
-    df[["arch", "variant"]] = df["model"].apply(lambda m: pd.Series(_parse_model_variant(m)))
+    df[["arch", "variant"]] = df["model"].apply(
+        lambda m: pd.Series(_parse_model_variant(m))
+    )
 
     if "Transfer_from_FP32" in df.columns:
         df["pgd_minus_transfer_gap"] = df["PGD"] - df["Transfer_from_FP32"]
@@ -370,14 +406,20 @@ def build_masking_scorecard(df_results):
     df.to_csv(SCORECARD_CSV, index=False)
     print(f"Wrote {SCORECARD_CSV}")
 
-    plot_cols = [c for c in ["pgd_minus_transfer_gap", "pgd_minus_random_gap"] if c in df.columns]
+    plot_cols = [
+        c for c in ["pgd_minus_transfer_gap", "pgd_minus_random_gap"] if c in df.columns
+    ]
     if plot_cols:
-        df_plot = df.melt(id_vars="model", value_vars=plot_cols, var_name="metric", value_name="value")
+        df_plot = df.melt(
+            id_vars="model", value_vars=plot_cols, var_name="metric", value_name="value"
+        )
         plt.figure(figsize=(14, 6))
         sns.barplot(data=df_plot, x="model", y="value", hue="metric")
         plt.axhline(0, color="k", lw=0.8)
         plt.xticks(rotation=45, ha="right")
-        plt.title("Masking scorecard: gaps that should be ~0 for genuinely robust models")
+        plt.title(
+            "Masking scorecard: gaps that should be ~0 for genuinely robust models"
+        )
         plt.tight_layout()
         plt.savefig(SCORECARD_PLOT_PNG, dpi=300, bbox_inches="tight")
         plt.close()

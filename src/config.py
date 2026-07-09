@@ -1,6 +1,7 @@
 """
 Central configuration and constants for the quantadv package.
 """
+
 import logging
 import os
 from pathlib import Path
@@ -14,7 +15,9 @@ DEVICE_TYPE = device.type
 USE_AMP = torch.cuda.is_available()
 
 CONFIG_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CONFIG_DIR.parent if CONFIG_DIR.name in {"archive", "src"} else CONFIG_DIR
+PROJECT_ROOT = (
+    CONFIG_DIR.parent if CONFIG_DIR.name in {"archive", "src"} else CONFIG_DIR
+)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 CIFAR10_DIR = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
@@ -185,7 +188,16 @@ STAIRCASE_N_POINTS = 40
 MARGIN_MAX_BATCHES = 3
 MARGIN_STEPS = 20
 
-SWEEP_EPSILONS = [1 / 255, 2 / 255, 3 / 255, 4 / 255, 6 / 255, 8 / 255, 12 / 255, 16 / 255]
+SWEEP_EPSILONS = [
+    1 / 255,
+    2 / 255,
+    3 / 255,
+    4 / 255,
+    6 / 255,
+    8 / 255,
+    12 / 255,
+    16 / 255,
+]
 
 PLOT_DPI = 300
 PLOT_BBOX_INCHES = "tight"

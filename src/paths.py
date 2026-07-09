@@ -1,4 +1,5 @@
 """Filesystem path helpers for QuantAdv artifacts."""
+
 import os
 
 from .config import DATA_DIR
@@ -61,6 +62,3 @@ ABLATION_PLOT_PNG = os.path.join(DATA_DIR, "ablation_plot.png")
 TRAJECTORY_PLOT_PNG = os.path.join(DATA_DIR, "trajectory_plot.png")
 LAYERWISE_PLOT_PNG = os.path.join(DATA_DIR, "layerwise_plot.png")
 SCORECARD_PLOT_PNG = os.path.join(DATA_DIR, "masking_scorecard_plot.png")
-
-
-

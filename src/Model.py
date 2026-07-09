@@ -3,6 +3,7 @@ Quantization wrapper around a plain PyTorch model, exposing torchao-based
 int8 PTQ (post-training quantization) and int8 QAT (quantization-aware
 training) variants through a single `Model` class.
 """
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ from torchao.quantization.qat import QATConfig
 from torchao.quantization.qat.linear import FakeQuantizedLinear
 import copy
 import time
+
 
 def _get_device():
     """Return the device to use for model operations."""
@@ -107,7 +109,7 @@ class Model:
             IntxWeightOnlyConfig(weight_dtype=torch.int8, granularity=PerGroup(32)),
         )
 
-        #- QAT models (in "untrained" state)-------------------------
+        # - QAT models (in "untrained" state)-------------------------
         # These start as plain deepcopies; they become "QAT" after prepare_qat().
         self.int8_QAT_untrained = copy.deepcopy(model)
         self._qat_initialized = {8: False}  # tracks whether prepare+convert has run
@@ -230,8 +232,10 @@ class Model:
             raise ValueError(f"bits must be 8, got {bits}")
 
         name = f"int{bits}_QAT"
-        print(f"[qat] Starting standard QAT training ({name}, bits={bits}, "
-              f"epochs={epochs}, lr={lr})...")
+        print(
+            f"[qat] Starting standard QAT training ({name}, bits={bits}, "
+            f"epochs={epochs}, lr={lr})..."
+        )
 
         qat_model = self.prepare_qat(bits)
         device = _get_device()
@@ -377,23 +381,33 @@ class Model:
             ptq_ref = getattr(self, f"{label_prefix}_PTQ", None)
             lines.append(f"  PTQ (activation+weight) built: {ptq_ref is not None}")
             if ptq_ref is not None:
-                lines.append(f"    quantized layers: {self._count_quant_layers(ptq_ref)}")
+                lines.append(
+                    f"    quantized layers: {self._count_quant_layers(ptq_ref)}"
+                )
 
             ptq_wo_ref = getattr(self, f"{label_prefix}_PTQ_weight_only", None)
             lines.append(f"  PTQ (weight-only) built: {ptq_wo_ref is not None}")
             if ptq_wo_ref is not None:
-                lines.append(f"    quantized layers: {self._count_quant_layers(ptq_wo_ref)}")
+                lines.append(
+                    f"    quantized layers: {self._count_quant_layers(ptq_wo_ref)}"
+                )
 
             qat_prepared = self._qat_initialized[bits]
             lines.append(f"  QAT prepared: {qat_prepared}")
             qat_untrained_ref = getattr(self, f"{label_prefix}_QAT_untrained", None)
             if qat_prepared and qat_untrained_ref is not None:
-                lines.append(f"    fake-quantized layers: {self._count_quant_layers(qat_untrained_ref)}")
+                lines.append(
+                    f"    fake-quantized layers: {self._count_quant_layers(qat_untrained_ref)}"
+                )
 
             qat_trained_ref = getattr(self, f"{label_prefix}_QAT", None)
-            lines.append(f"  QAT (clean, trained+converted) built: {qat_trained_ref is not None}")
+            lines.append(
+                f"  QAT (clean, trained+converted) built: {qat_trained_ref is not None}"
+            )
             if qat_trained_ref is not None:
-                lines.append(f"    quantized layers: {self._count_quant_layers(qat_trained_ref)}")
+                lines.append(
+                    f"    quantized layers: {self._count_quant_layers(qat_trained_ref)}"
+                )
 
             lines.append("")
 
