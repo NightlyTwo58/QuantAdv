@@ -343,3 +343,45 @@ def plot_defense_summary(df_defense=None):
     plt.tight_layout()
     plt.savefig(os.path.join(DATA_DIR, "defense_summary_plot.png"), dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
+
+
+def plot_results_heatmap_with_error(df_results):
+    """Like plot_results_heatmap_by_category, but annotates each cell with
+    its standard deviation (mean +/- std) wherever a `{col}_std` column
+    exists, addressing the lack of error margins noted in issue #17."""
+    if df_results is None or df_results.empty:
+        return
+    categories = {
+        "core_attacks": ["clean_acc", "FGSM", "PGD", "AutoAttack"],
+        "extended_whitebox": ["CW", "DeepFool", "JSMA"],
+        "transfer_attacks": ["Surrogate_Transfer", "Transfer_from_FP32", "MIM_Transfer",
+                              "UAP_Transfer", "Transfer_to_FP32", "MIM_Transfer_to_FP32",
+                              "UAP_Transfer_to_FP32"],
+        "masking_diagnostics": ["Random_Noise", "BPDA_PGD", "BPDA_Adaptive",
+                                 "EOT_PGD", "NES", "Boundary_acc"],
+        "defense": ["Adaptive_Guardrail", "Adaptive_DetectGuard"],
+    }
+    for title, candidate in categories.items():
+        cols = [c for c in candidate if c in df_results.columns and df_results[c].notna().any()]
+        if not cols:
+            continue
+        df_heat = df_results.set_index("model")[cols].astype(float)
+
+        annot = df_heat.copy().astype(object)
+        for col in cols:
+            std_col = f"{col}_std"
+            for idx in df_heat.index:
+                mean_val = df_heat.loc[idx, col]
+                if std_col in df_results.columns:
+                    std_val = df_results.set_index("model").loc[idx, std_col] if idx in df_results.set_index("model").index else None
+                    if pd.notna(std_val):
+                        annot.loc[idx, col] = f"{mean_val:.2f}\n\u00b1{std_val:.2f}"
+                        continue
+                annot.loc[idx, col] = f"{mean_val:.2f}"
+
+        plt.figure(figsize=(max(HEATMAP_MIN_WIDTH, len(cols) * 1.3), max(HEATMAP_MIN_HEIGHT, len(df_heat) * HEATMAP_ROW_HEIGHT * 1.3)))
+        sns.heatmap(df_heat, annot=annot, fmt="", cmap="RdYlGn", vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX, linewidths=HEATMAP_LINEWIDTHS)
+        plt.title(f"{title.replace(chr(95), chr(32)).title()}: Accuracy by Model (mean {chr(177)} std)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(DATA_DIR, f"heatmap_{title}_witherror.png"), dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
+        plt.show()
