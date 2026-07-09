@@ -264,3 +264,31 @@ def plot_results_heatmap(df_results):
     plt.tight_layout()
     plt.savefig(HEATMAP_PLOT_PNG, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.show()
+
+
+def plot_results_heatmap_by_category(df_results):
+    """Split the full results heatmap into smaller, readable category heatmaps
+    instead of one giant heatmap with 20+ columns."""
+    if df_results is None or df_results.empty:
+        return
+    categories = {
+        "core_attacks": ["clean_acc", "FGSM", "PGD", "AutoAttack"],
+        "extended_whitebox": ["CW", "DeepFool", "JSMA"],
+        "transfer_attacks": ["Surrogate_Transfer", "Transfer_from_FP32", "MIM_Transfer",
+                              "UAP_Transfer", "Transfer_to_FP32", "MIM_Transfer_to_FP32",
+                              "UAP_Transfer_to_FP32"],
+        "masking_diagnostics": ["Random_Noise", "BPDA_PGD", "BPDA_Adaptive",
+                                 "EOT_PGD", "NES", "Boundary_acc"],
+        "defense": ["Adaptive_Guardrail", "Adaptive_DetectGuard"],
+    }
+    for title, candidate in categories.items():
+        cols = [c for c in candidate if c in df_results.columns and df_results[c].notna().any()]
+        if not cols:
+            continue
+        df_heat = df_results.set_index("model")[cols].astype(float)
+        plt.figure(figsize=(max(HEATMAP_MIN_WIDTH, len(cols)), max(HEATMAP_MIN_HEIGHT, len(df_heat) * HEATMAP_ROW_HEIGHT)))
+        sns.heatmap(df_heat, annot=True, fmt=".2f", cmap="RdYlGn", vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX, linewidths=HEATMAP_LINEWIDTHS)
+        plt.title(f"{title.replace(chr(95), chr(32)).title()}: Accuracy by Model")
+        plt.tight_layout()
+        plt.savefig(os.path.join(DATA_DIR, f"heatmap_{title}.png"), dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
+        plt.show()
