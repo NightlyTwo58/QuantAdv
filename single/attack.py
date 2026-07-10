@@ -110,8 +110,7 @@ def accuracy_under_attack(
     model, loader, attack, target_model=None, max_images=None, return_vector=False
 ):
     def adv_fn(x, y):
-        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
-        return normalize_pixels(attack(x_pixel, y))
+        return attack(x, y)
 
     return accuracy_from_adv_fn(
         model,
@@ -150,9 +149,7 @@ def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vectors=Fal
 
         def attack_vector(attack):
             def adv_fn(x, y):
-                return normalize_pixels(
-                    attack(denormalize_inputs(x).clamp(0.0, 1.0), y)
-                )
+                return attack(x, y)
 
             return accuracy_from_adv_fn(model, loader, adv_fn, return_vector=True)
 
@@ -1076,8 +1073,7 @@ def confidence_margin_diagnostic(
         with torch.no_grad():
             top2 = F.softmax(model(x), dim=1).topk(2, dim=1).values
         clean_margins.extend((top2[:, 0] - top2[:, 1]).cpu().tolist())
-        x_pixel = denormalize_inputs(x).clamp(0.0, 1.0)
-        x_adv = normalize_pixels(pgd(x_pixel, y))
+        x_adv = pgd(x, y)
         with torch.no_grad():
             top2_adv = F.softmax(model(x_adv), dim=1).topk(2, dim=1).values
         adv_margins.extend((top2_adv[:, 0] - top2_adv[:, 1]).cpu().tolist())
