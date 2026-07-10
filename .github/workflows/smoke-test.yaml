@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Compile archive and src
+      - name: Compile archive and src_old
         run: |
           python -m compileall ./archive ./src
 
@@ -33,6 +33,6 @@ jobs:
 
       # - name: Smoke run run_experiment
       #   run: |
-      #     timeout 5s python ./src/run_experiment.py || code=$?
+      #     timeout 5s python ./src_old/run_experiment.py || code=$?
       #     if [ "${code:-0}" = "124" ]; then exit 0; fi
       #     exit "${code:-0}"

@@ -706,7 +706,7 @@ def plot_masking_diagnostics_gap(df_results):
     """Simplified version of the masking_diagnostics category: instead of
     showing Random_Noise (which is ~0.9 for almost every model and adds no
     information) next to BPDA_PGD, just show BPDA_PGD alone, sorted, with a
-    single color. This is the metric that actually varies and matters."""
+    src color. This is the metric that actually varies and matters."""
     if df_results is None or df_results.empty:
         return
     if "BPDA_PGD" not in df_results.columns:

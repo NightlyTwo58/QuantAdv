@@ -42,6 +42,6 @@ Results are in ./data
 
 
 <!-- <p align="center">
-  <img src="data/demo/accuracy_plot.png" alt="Attack Accuracy" width="400"/>
-  <img src="data/demo/accuracyperturb.png" alt="Elipson" width="400"/>
+  <img src_old="data/demo/accuracy_plot.png" alt="Attack Accuracy" width="400"/>
+  <img src_old="data/demo/accuracyperturb.png" alt="Elipson" width="400"/>
 </p> -->

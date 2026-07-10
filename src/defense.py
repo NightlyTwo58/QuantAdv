@@ -8,7 +8,7 @@ import torchvision.transforms as T
 import torchattacks
 from torch.amp import autocast, GradScaler
 
-from .config import *
+from config import *
 
 
 def _cfg(name, default):
@@ -136,8 +136,7 @@ def prepare_adversarial_training(base_model, loader, bits=None):
             x = x.to(dev, non_blocking=True)
             y = y.to(dev, non_blocking=True)
             model.eval()
-            x_adv_pixel = attack(denormalize_inputs(x).clamp(0.0, 1.0), y)
-            x_adv = normalize_pixels(x_adv_pixel).detach()
+            x_adv = attack(x, y).detach()
             model.train()
 
             opt.zero_grad(set_to_none=True)
@@ -266,8 +265,7 @@ def train_adversarial_detector(base_model, loader):
             x = x.to(dev, non_blocking=True)
             y = y.to(dev, non_blocking=True)
 
-            x_adv_pixel = attack(denormalize_inputs(x).clamp(0.0, 1.0), y)
-            x_adv = normalize_pixels(x_adv_pixel).detach()
+            x_adv = attack(x, y).detach()
 
             xb = torch.cat([x, x_adv], dim=0)
             yb = torch.cat(
@@ -351,8 +349,7 @@ def _run_flagging_rate(model, loader, attack=None, detector_attr=None):
             clean_flags += _flag_mask(model, x, detector_attr).sum().item()
 
         if attack is not None:
-            x_adv_pixel = attack(denormalize_inputs(x).clamp(0.0, 1.0), y)
-            x_adv = normalize_pixels(x_adv_pixel).detach()
+            x_adv = attack(x, y).detach()
             with torch.no_grad():
                 adv_flags += _flag_mask(model, x_adv, detector_attr).sum().item()
 

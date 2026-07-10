@@ -1,5 +1,5 @@
 """
-Central configuration and constants for the quantadv package.
+Central configuration and constants for QuantAdvOld.py.
 """
 
 import logging
@@ -15,15 +15,16 @@ DEVICE_TYPE = device.type
 USE_AMP = torch.cuda.is_available()
 
 CONFIG_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = (
-    CONFIG_DIR.parent if CONFIG_DIR.name in {"archive", "src"} else CONFIG_DIR
-)
+PROJECT_ROOT = CONFIG_DIR.parent if CONFIG_DIR.name in {"src", "src_old"} else CONFIG_DIR
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 CIFAR10_DIR = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
 PYTORCHCV_MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "pytorchcv")
 
 RESULTS_CSV = os.path.join(DATA_DIR, "accuracyresult.csv")
+PER_EXAMPLE_DIR = os.path.join(DATA_DIR, "per_example")
+PERFORMANCE_CSV = os.path.join(DATA_DIR, "performance_metrics.csv")
+CHAOTIC_DITHER_SWEEP_CSV = os.path.join(DATA_DIR, "chaotic_dither_sweep.csv")
 SWEEP_CSV = os.path.join(DATA_DIR, "sweepresult.csv")
 PLOT_PNG = os.path.join(DATA_DIR, "accuracyplot.png")
 SWEEP_PLOT_PNG = os.path.join(DATA_DIR, "sweepplot.png")
@@ -35,8 +36,20 @@ CHUNK_QUANT_PLOT_PNG = os.path.join(DATA_DIR, "chunkquantplot.png")
 MASKING_SUMMARY_PLOT_PNG = os.path.join(DATA_DIR, "maskingsummaryplot.png")
 MARGIN_PLOT_PNG = os.path.join(DATA_DIR, "marginplot.png")
 HEATMAP_PLOT_PNG = os.path.join(DATA_DIR, "heatmapplot.png")
+PERFORMANCE_PLOT_PNG = os.path.join(DATA_DIR, "performance_metrics.png")
+DITHER_PLOT_PNG = os.path.join(DATA_DIR, "chaotic_dither_sweep.png")
+DEFENSE_PLOT_PNG = os.path.join(DATA_DIR, "defense_comparison.png")
+ABLATION_COMBINED_CSV = os.path.join(DATA_DIR, "ablation_combined.csv")
+LAYERWISE_COMBINED_CSV = os.path.join(DATA_DIR, "layerwise_combined.csv")
+TRAJECTORY_COMBINED_CSV = os.path.join(DATA_DIR, "trajectory_combined.csv")
+COMPONENT_ABLATION_COMBINED_CSV = os.path.join(
+    DATA_DIR, "component_ablation_combined.csv"
+)
+MARGIN_COMBINED_CSV = os.path.join(DATA_DIR, "margin_combined.csv")
+CHUNK_COMBINED_CSV = os.path.join(DATA_DIR, "chunk_quant_combined.csv")
+DEFENSE_SUMMARY_CSV = os.path.join(DATA_DIR, "defense_summary.csv")
 
-SEEDS = [0, 1, 2]
+SEEDS = [0, 1, 2, 3, 4]
 
 PRETRAINED_NAMES = {
     "ResNet56": "resnet56_cifar10",
@@ -54,9 +67,9 @@ CLIP_MIN_DEV = CLIP_MIN.to(device)
 CLIP_MAX_DEV = CLIP_MAX.to(device)
 
 DEFAULT_BATCH_SIZE = 512
-DEFAULT_EVAL_N = 2000
-DEFAULT_FINETUNE_N = 4000
-DEFAULT_EVAL_BATCH_SIZE = 100
+DEFAULT_EVAL_N = 5000
+DEFAULT_FINETUNE_N = 10000
+DEFAULT_EVAL_BATCH_SIZE = 256
 MAX_DATA_WORKERS = 8
 PIN_MEMORY = True
 
@@ -75,6 +88,7 @@ CHAOTIC_QUANT_SEED = 0.731
 CHAOTIC_QUANT_R = 3.99
 CHAOTIC_QUANT_MU = 1.999
 CHAOTIC_QUANT_DITHER = 0.5
+CHAOTIC_DITHER_AMPLITUDES = (0.0, 0.125, 0.25, 0.5, 0.75, 1.0)
 CHAOTIC_QUANT_WARMUP = 17
 COMPRESS_IMAGE_SIZE = 24
 COMPRESS_IMAGE_BITS = 5
@@ -104,12 +118,12 @@ HEATMAP_LINEWIDTHS = 0.5
 
 DEFAULT_EPS = 8 / 255
 PGD_ALPHA = 2 / 255
-PGD_STEPS = 20
+PGD_STEPS = 15
 PGD_RANDOM_START = True
 
 QAT_BITS = 8
 QAT_EPOCHS_DEFAULT = 3
-QAT_MAIN_EPOCHS = 5
+QAT_MAIN_EPOCHS = 10
 QAT_LR = 1e-3
 QAT_MOMENTUM = 0.9
 QAT_WEIGHT_DECAY = 5e-4
@@ -119,7 +133,7 @@ PTQ_BITS = (8, 4)
 AUTOATTACK_NORM = "Linf"
 AUTOATTACK_VERSION = "standard"
 AUTOATTACK_SEED = 0
-AUTOATTACK_VERBOSE = False
+AUTOATTACK_VERBOSE = True
 
 CW_C = 1
 CW_KAPPA = 0
@@ -130,7 +144,7 @@ DEEPFOOL_STEPS = 50
 DEEPFOOL_OVERSHOOT = 0.02
 JSMA_THETA = 1.0
 JSMA_GAMMA = 0.1
-JSMA_MAX_IMAGES = 200
+JSMA_MAX_IMAGES = 20
 
 MIFGSM_DECAY = 1.0
 
@@ -141,8 +155,8 @@ UAP_OVERSHOOT = 0.02
 UAP_MAX_IMAGES = 1000
 
 BPDA_RESTARTS_DEFAULT = 1
-BPDA_RESTARTS_SUITE = 2
-BPDA_RESTARTS_SWEEP = 3
+BPDA_RESTARTS_SUITE = 5
+BPDA_RESTARTS_SWEEP = 2
 
 ADAPTIVE_EOT_SAMPLES = 4
 ADAPTIVE_GUARDRAIL_LAMBDA = 1.0
@@ -154,6 +168,27 @@ NES_SAMPLES_SUITE = 100
 NES_SIGMA = 1e-3
 NES_STEPS = 10
 NES_QUERY_CHUNK = 512
+
+# Paper-run allocation. Expensive, weakly informative analyses remain available
+# but are off by default so the core attacks can use more images/steps/restarts.
+RUN_CHAOTIC_COMPRESS = False
+RUN_EXTRA_WHITEBOX_ATTACKS = False
+RUN_UAP_ATTACKS = False
+RUN_SURROGATE_ATTACK = False
+RUN_REVERSE_TRANSFERS = False
+RUN_BOUNDARY_ATTACK = False
+RUN_NES_ATTACK = False
+RUN_DEFENSE_SUITE = False
+RUN_CHUNK_QUANTIZATION = False
+RUN_PGD_TRAJECTORY = False
+RUN_LAYERWISE_PROFILE = False
+RUN_CONFIDENCE_MARGIN = False
+RUN_COMPONENT_ABLATION = True
+RUN_EPSILON_SWEEP = True
+RUN_CHAOTIC_DITHER_SWEEP = False
+RECORD_RUN_METRICS = True
+
+CI_CONFIDENCE = 0.95
 
 SUBSTITUTE_NUM_CLASSES = 10
 SUBSTITUTE_ROUNDS = 6
@@ -189,6 +224,7 @@ MARGIN_MAX_BATCHES = 3
 MARGIN_STEPS = 20
 
 SWEEP_EPSILONS = [
+    0,
     1 / 255,
     2 / 255,
     3 / 255,
@@ -225,3 +261,43 @@ HEATMAP_MIN_WIDTH = 10
 HEATMAP_MIN_HEIGHT = 6
 HEATMAP_ROW_HEIGHT = 0.5
 SUMMARY_PLOT_FIGSIZE = (14, 6)
+
+ATTACK_PALETTE = {
+    "clean_acc": "#4D4D4D",
+    "FGSM": "#1F77B4",
+    "PGD": "#D62728",
+    "CW": "#9467BD",
+    "DeepFool": "#8C564B",
+    "JSMA": "#E377C2",
+    "AutoAttack": "#000000",
+    "Transfer_from_FP32": "#17BECF",
+    "MIM_Transfer": "#2CA02C",
+    "UAP_Transfer": "#BCBD22",
+    "Transfer_to_FP32": "#00A6D6",
+    "MIM_Transfer_to_FP32": "#228B22",
+    "UAP_Transfer_to_FP32": "#9ACD32",
+    "Surrogate_Transfer": "#FF7F0E",
+    "Random_Noise": "#7F7F7F",
+    "BPDA_PGD": "#B22222",
+    "BPDA_Adaptive": "#FF9896",
+    "EOT_PGD": "#C5B0D5",
+    "Adaptive_Guardrail": "#AEC7E8",
+    "Adaptive_DetectGuard": "#FDBF6F",
+    "NES": "#6A3D9A",
+    "Boundary_acc": "#A65628",
+    "PGD_acc": "#D62728",
+    "Random_Noise_acc": "#7F7F7F",
+    "BPDA_acc": "#B22222",
+    "clean": "#4D4D4D",
+    "PGD-adv": "#D62728",
+    "hard-round": "#D62728",
+    "STE": "#1F77B4",
+}
+
+HEATMAP_CMAP = "RdYlGn"
+BASELINE_COLOR = "black"
+REPORT_METRIC_PAGE_SIZE = 12
+REPORT_MAX_HEATMAP_ROWS = 60
+REPORT_MIN_FIGURE_WIDTH = 7.0
+REPORT_MAX_FIGURE_HEIGHT = 18.0
+REPORT_ROW_HEIGHT = 0.35

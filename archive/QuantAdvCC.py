@@ -23,7 +23,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CIFAR100_ROOT = os.environ.get("CIFAR100_ROOT", os.environ.get("CIFAR10_ROOT", "./"))
 SEEDS = [0, 1, 2]
 """
-Threaded single-model, single-quantization, single-attack analysis with eplison sweep.
+Threaded src-model, src-quantization, src-attack analysis with eplison sweep.
 """
 def results_csv_path(model_name):
     return os.path.join(DATA_DIR, f"results_{model_name}.csv")
@@ -567,7 +567,7 @@ def staircase_diagnostic(model, loader, radius=1/255, n_points=40):
 # NEW (item 2): weight-only vs activation-only vs both quantization ablation.
 # Cheap by design -- reuses the already-built quantized model, just flips
 # quant_weight/quant_act flags in place, and only computes clean_acc + a
-# single-seed 20-step PGD + frac_zero_grad_hard per config (not the full
+# src-seed 20-step PGD + frac_zero_grad_hard per config (not the full
 # AutoAttack/BPDA/trajectory suite). Restores the model to (True, True)
 # (its original state) before returning.
 def run_quant_component_ablation(model, loader, name, eps=8/255):
