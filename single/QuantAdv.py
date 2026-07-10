@@ -1612,9 +1612,53 @@ def main():
         )
     else:
         run_metrics = []
+    if RUN_EPSILON_SWEEP and os.path.exists(SWEEP_CSV):
+        df_sweep = pd.read_csv(SWEEP_CSV)
+        sweep_done = set(
+            zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6))
+        )
+    else:
+        df_sweep = pd.DataFrame()
+        sweep_done = set()
+
+    def run_pending_epsilon_sweep(name, model):
+        nonlocal df_sweep, sweep_done
+        if not RUN_EPSILON_SWEEP:
+            return
+        pending_eps = [
+            eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done
+        ]
+        if not pending_eps:
+            print(f"  Skipping epsilon sweep for {name} (already done)")
+            return
+
+        print(f"\nSweeping {name} ...")
+
+        def save_epsilon_sweep():
+            nonlocal df_sweep, sweep_done
+            rows = run_epsilon_sweep_for_model_wrapped(
+                model, eval_loader, name, pending_eps
+            )
+            if rows:
+                new_sweep = pd.DataFrame(rows)
+                df_sweep = report_data.upsert_table(
+                    SWEEP_CSV, new_sweep, ["model", "epsilon"]
+                )
+                sweep_done = set(
+                    zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6))
+                )
+
+        safe_call(
+            save_epsilon_sweep,
+            "epsilon sweep failed",
+            context=name,
+            show_traceback=True,
+        )
+
     for name, (model, ref) in list(model_registry.items()):
         if name in done:
             print(f"Skipping {name} (already in {RESULTS_CSV})")
+            run_pending_epsilon_sweep(name, model)
             continue
         print(f"\nEvaluating {name} ...")
         monitor = ResourceMonitor(model, name)
@@ -1643,6 +1687,7 @@ def main():
         df_results = report_data.upsert_table(RESULTS_CSV, new_row, ["model"])
         print("Result:")
         print(new_row.to_string(index=False))
+        run_pending_epsilon_sweep(name, model)
         print("-" * 100)
     print("\nFinal results:")
     print(df_results)
@@ -1688,40 +1733,6 @@ def main():
         report_data.add_derived_metrics(df_results)
     )
     df_results.to_csv(RESULTS_CSV, index=False)
-    if RUN_EPSILON_SWEEP and os.path.exists(SWEEP_CSV):
-        df_sweep = pd.read_csv(SWEEP_CSV)
-        sweep_done = set(
-            zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6))
-        )
-    else:
-        df_sweep = pd.DataFrame()
-        sweep_done = set()
-    for name, (model, ref) in model_registry.items() if RUN_EPSILON_SWEEP else []:
-        print(f"\nSweeping {name} ...")
-        pending_eps = [
-            eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done
-        ]
-        if not pending_eps:
-            print(f"  Skipping {name} (already done)")
-            continue
-
-        def save_epsilon_sweep():
-            nonlocal df_sweep
-            rows = run_epsilon_sweep_for_model_wrapped(
-                model, eval_loader, name, pending_eps
-            )
-            if rows:
-                new_sweep = pd.DataFrame(rows)
-                df_sweep = report_data.upsert_table(
-                    SWEEP_CSV, new_sweep, ["model", "epsilon"]
-                )
-
-        safe_call(
-            save_epsilon_sweep,
-            "epsilon sweep failed",
-            context=name,
-            show_traceback=True,
-        )
     if RUN_EPSILON_SWEEP:
         print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
 
