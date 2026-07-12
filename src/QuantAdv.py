@@ -912,7 +912,9 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     safe_update_vectors(
         results,
         vectors,
-        lambda: run_fgsm_pgd(model, loader, eps=eps, return_vectors=True),
+        lambda: run_fgsm_pgd(
+            model, loader, eps=eps, return_vectors=True, use_ste=False
+        ),
         "FGSM/PGD failed",
         context=name,
         defaults={"FGSM": None, "PGD": None},
@@ -921,14 +923,18 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         results,
         vectors,
         "AutoAttack",
-        lambda: run_autoattack(model, loader, eps=eps, return_vector=True),
+        lambda: run_autoattack(
+            model, loader, eps=eps, return_vector=True, use_ste=False
+        ),
         "AutoAttack failed",
         context=name,
     )
     if RUN_EXTRA_WHITEBOX_ATTACKS:
         safe_update(
             results,
-            lambda: run_extra_whitebox_attacks(model, loader, eps=eps),
+            lambda: run_extra_whitebox_attacks(
+                model, loader, eps=eps, use_ste=False
+            ),
             "CW/DeepFool/JSMA failed",
             context=name,
         )
@@ -954,7 +960,12 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             vectors,
             "Transfer_from_FP32",
             lambda: transfer_attack(
-                fp32_ref, model, loader, eps=eps, return_vector=True
+                fp32_ref,
+                model,
+                loader,
+                eps=eps,
+                return_vector=True,
+                use_ste=False,
             ),
             "transfer_attack failed",
             context=name,
@@ -964,7 +975,12 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             vectors,
             "MIM_Transfer",
             lambda: transfer_attack_mim(
-                fp32_ref, model, loader, eps=eps, return_vector=True
+                fp32_ref,
+                model,
+                loader,
+                eps=eps,
+                return_vector=True,
+                use_ste=False,
             ),
             "MIM transfer_attack failed",
             context=name,
@@ -981,14 +997,18 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             safe_set(
                 results,
                 "Transfer_to_FP32",
-                lambda: transfer_attack(model, fp32_ref, loader, eps=eps),
+                lambda: transfer_attack(
+                    model, fp32_ref, loader, eps=eps, use_ste=False
+                ),
                 "reverse transfer_attack failed",
                 context=name,
             )
             safe_set(
                 results,
                 "MIM_Transfer_to_FP32",
-                lambda: transfer_attack_mim(model, fp32_ref, loader, eps=eps),
+                lambda: transfer_attack_mim(
+                    model, fp32_ref, loader, eps=eps, use_ste=False
+                ),
                 "reverse MIM transfer_attack failed",
                 context=name,
             )
@@ -1025,13 +1045,6 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         defaults=adaptive_defaults,
     )
     if count_quant_layers(model) > 0:
-        # n_restarts=1 here (with the default 5-element SEEDS) gives 5 total
-        # restarts, matching run_fgsm_pgd's PGD exactly (one restart per
-        # seed, no inner restart loop). BPDA_RESTARTS_SUITE (5) would nest
-        # inside run_bpda's outer seed loop for ~25 effective restarts,
-        # making any PGD-vs-BPDA_PGD gap partly a bigger-attack-budget
-        # artifact rather than purely a gradient-regime effect — which is
-        # what Gradient_Masking_Gap downstream is supposed to isolate.
         safe_update_vectors(
             results,
             vectors,
