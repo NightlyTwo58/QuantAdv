@@ -1,3 +1,13 @@
+"""Defense wrappers and defense-training utilities for QuantAdv experiments.
+
+The main runner uses this module for input transformations, randomized
+smoothing, rejection-style guardrails, adversarial-example detectors, and
+optional adversarial training.  The lightweight quantized copy used for
+adversarial training intentionally mirrors the public attributes of the main
+QuantAdv fake-quantized layers so attacks can switch between hard rounding and
+straight-through gradients.
+"""
+
 import copy
 import math
 
@@ -12,53 +22,99 @@ from config import *
 
 
 def _cfg(name, default):
+    """Return a config value while keeping this module importable in isolation."""
     return globals().get(name, default)
 
 
 def _device():
+    """Return the configured torch device as a ``torch.device`` instance."""
     return device if isinstance(device, torch.device) else torch.device(device)
 
 
 def normalize_pixels(x):
+    """Normalize pixel-space CIFAR tensors with the experiment constants."""
     return (x - CIFAR_MEAN.to(x.device)) / CIFAR_STD.to(x.device)
 
 
 def denormalize_inputs(x):
+    """Map normalized CIFAR tensors back to pixel space."""
     return x * CIFAR_STD.to(x.device) + CIFAR_MEAN.to(x.device)
 
 
 def make_attack(attack_cls, model, *args, **kwargs):
+    """Construct a torchattacks object for already-normalized CIFAR inputs."""
     attack = attack_cls(model, *args, **kwargs)
     attack.set_normalization_used(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
     return attack
 
 
-def _quantize_tensor(t, bits):
+class _FakeQuantSTE(torch.autograd.Function):
+    """Round in the forward pass and use identity gradients in the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x):
+        """Round values during the forward pass of the STE quantizer."""
+        return torch.round(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Pass gradients through the STE quantizer unchanged."""
+        return grad_output
+
+
+def _quantize_tensor(t, bits, use_ste=False):
+    """Symmetric per-tensor fake quantization used by defense-side copies."""
     if bits is None:
         return t
     qmax = 2 ** (bits - 1) - 1
     scale = torch.clamp(
         t.detach().abs().max() / qmax, min=_cfg("QUANT_SCALE_MIN", 1e-8)
     )
-    q = torch.round(t / scale).clamp(-qmax - 1, qmax)
+    scaled = t / scale
+    q = (_FakeQuantSTE.apply(scaled) if use_ste else torch.round(scaled)).clamp(
+        -qmax - 1, qmax
+    )
     return q * scale
 
 
 class _QuantConv2d(nn.Conv2d):
+    """Conv2d with fake-quantized weights and/or activations."""
+
     def forward(self, x):
-        w = _quantize_tensor(self.weight, self.bits)
+        """Run convolution with optional fake-quantized weights and activations."""
+        w = (
+            _quantize_tensor(self.weight, self.bits, self.use_ste)
+            if self.quant_weight
+            else self.weight
+        )
         out = self._conv_forward(x, w, self.bias)
-        return _quantize_tensor(out, self.bits)
+        return (
+            _quantize_tensor(out, self.bits, self.use_ste)
+            if self.quant_act
+            else out
+        )
 
 
 class _QuantLinear(nn.Linear):
+    """Linear layer with fake-quantized weights and/or activations."""
+
     def forward(self, x):
-        w = _quantize_tensor(self.weight, self.bits)
+        """Run a linear projection with optional fake-quantized weights and activations."""
+        w = (
+            _quantize_tensor(self.weight, self.bits, self.use_ste)
+            if self.quant_weight
+            else self.weight
+        )
         out = F.linear(x, w, self.bias)
-        return _quantize_tensor(out, self.bits)
+        return (
+            _quantize_tensor(out, self.bits, self.use_ste)
+            if self.quant_act
+            else out
+        )
 
 
 def _to_quant_module(module, bits):
+    """Convert supported leaf layers to defense-side fake-quantized layers."""
     if isinstance(module, nn.Conv2d):
         new = _QuantConv2d(
             module.in_channels,
@@ -75,6 +131,9 @@ def _to_quant_module(module, bits):
         if module.bias is not None:
             new.bias = module.bias
         new.bits = bits
+        new.use_ste = _cfg("QUANT_DEFAULT_USE_STE", False)
+        new.quant_weight = _cfg("QUANT_DEFAULT_WEIGHT", True)
+        new.quant_act = _cfg("QUANT_DEFAULT_ACT", True)
         return new
 
     if isinstance(module, nn.Linear):
@@ -85,12 +144,16 @@ def _to_quant_module(module, bits):
         if module.bias is not None:
             new.bias = module.bias
         new.bits = bits
+        new.use_ste = _cfg("QUANT_DEFAULT_USE_STE", False)
+        new.quant_weight = _cfg("QUANT_DEFAULT_WEIGHT", True)
+        new.quant_act = _cfg("QUANT_DEFAULT_ACT", True)
         return new
 
     return None
 
 
 def _replace_quant_modules(module, bits):
+    """Recursively replace Conv2d/Linear children with quantized equivalents."""
     for name, child in list(module.named_children()):
         replacement = _to_quant_module(child, bits)
         if replacement is None:
@@ -100,12 +163,24 @@ def _replace_quant_modules(module, bits):
 
 
 def quantized_copy(model, bits):
+    """Return a model copy with Conv2d/Linear layers fake-quantized."""
     m = copy.deepcopy(model)
     _replace_quant_modules(m, bits)
     return m.to(_device())
 
 
+def _set_quant_ste(model, flag):
+    """Toggle straight-through gradients on defense-side quantized modules."""
+    toggled = 0
+    for module in model.modules():
+        if hasattr(module, "use_ste") and hasattr(module, "bits"):
+            module.use_ste = flag
+            toggled += 1
+    return toggled
+
+
 def prepare_adversarial_training(base_model, loader, bits=None):
+    """Fine-tune a copy of ``base_model`` on PGD adversarial examples."""
     dev = _device()
     model = (
         quantized_copy(base_model, bits)
@@ -135,28 +210,34 @@ def prepare_adversarial_training(base_model, loader, bits=None):
         for x, y in loader:
             x = x.to(dev, non_blocking=True)
             y = y.to(dev, non_blocking=True)
-            model.eval()
-            x_adv = attack(x, y).detach()
-            model.train()
+            try:
+                model.eval()
+                _set_quant_ste(model, True)
+                x_adv = attack(x, y).detach()
+                model.train()
 
-            opt.zero_grad(set_to_none=True)
-            with autocast(device_type=dev.type):
-                loss = F.cross_entropy(model(x_adv), y)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+                opt.zero_grad(set_to_none=True)
+                with autocast(device_type=dev.type):
+                    loss = F.cross_entropy(model(x_adv), y)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            finally:
+                _set_quant_ste(model, False)
 
     return model.eval()
 
 
 class SanitizedModel(nn.Module):
     def __init__(self, model):
+        """Wrap a classifier with deterministic input sanitization settings."""
         super().__init__()
         self.model = model
         self.resize = _cfg("DEFENSE_SANITIZE_SIZE", 28)
         self.bits = _cfg("DEFENSE_SANITIZE_BITS", 6)
 
     def forward(self, x):
+        """Sanitize inputs in pixel space before normalized model inference."""
         pixels = denormalize_inputs(x).clamp(0.0, 1.0)
         pixels = T.functional.gaussian_blur(pixels, kernel_size=3)
         pixels = F.interpolate(
@@ -178,12 +259,14 @@ class SanitizedModel(nn.Module):
 
 class SmoothedModel(nn.Module):
     def __init__(self, model):
+        """Wrap a classifier with randomized smoothing parameters."""
         super().__init__()
         self.model = model
         self.sigma = _cfg("DEFENSE_SMOOTH_SIGMA", 0.12)
         self.samples = _cfg("DEFENSE_SMOOTH_SAMPLES", 8)
 
     def forward(self, x):
+        """Average noisy predictions at evaluation time and sample once during training."""
         if not self.training:
             logits = 0.0
             for _ in range(self.samples):
@@ -200,12 +283,14 @@ class SmoothedModel(nn.Module):
 
 class GuardrailModel(nn.Module):
     def __init__(self, model):
+        """Wrap a classifier with confidence-threshold rejection settings."""
         super().__init__()
         self.model = model
         self.conf_threshold = _cfg("DEFENSE_GUARD_CONF_THRESHOLD", 0.55)
         self.reject_logit = _cfg("DEFENSE_REJECT_LOGIT", -1e4)
 
     def forward(self, x):
+        """Replace low-confidence predictions with the rejection logit."""
         logits = self.model(x)
         conf = F.softmax(logits, dim=1).max(dim=1).values
         reject = conf < self.conf_threshold
@@ -216,6 +301,7 @@ class GuardrailModel(nn.Module):
 
 class DetectorCNN(nn.Module):
     def __init__(self):
+        """Build the convolutional binary adversarial-example detector."""
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
@@ -232,10 +318,12 @@ class DetectorCNN(nn.Module):
         )
 
     def forward(self, x):
+        """Return clean-versus-adversarial detector logits for a batch."""
         return self.net(x)
 
 
 def train_adversarial_detector(base_model, loader):
+    """Train a binary detector to distinguish clean and adversarial inputs."""
     dev = _device()
     base_model = base_model.to(dev).eval()
     detector = DetectorCNN().to(dev).train()
@@ -285,6 +373,7 @@ def train_adversarial_detector(base_model, loader):
 
 class DetectGuardModel(nn.Module):
     def __init__(self, model, detector):
+        """Wrap a classifier with a learned detector-based rejection guard."""
         super().__init__()
         self.model = model
         self.detector = detector
@@ -292,6 +381,7 @@ class DetectGuardModel(nn.Module):
         self.reject_logit = _cfg("DEFENSE_REJECT_LOGIT", -1e4)
 
     def forward(self, x):
+        """Reject inputs that the detector classifies as adversarial."""
         logits = self.model(x)
         detector_prob = F.softmax(self.detector(x), dim=1)[:, 1]
         reject = detector_prob > self.threshold
@@ -301,6 +391,7 @@ class DetectGuardModel(nn.Module):
 
 
 def run_certified_accuracy(model, loader):
+    """Estimate smoothed-model accuracy and a radius proxy."""
     dev = _device()
     model.eval()
     correct = 0
@@ -327,14 +418,17 @@ def run_certified_accuracy(model, loader):
 
 
 def run_guardrail_flagging_rate(model, loader, attack=None):
+    """Measure how often a confidence guardrail flags clean and attacked inputs."""
     return _run_flagging_rate(model, loader, attack, detector_attr=None)
 
 
 def run_detector_catch_rate(model, loader, attack=None):
+    """Measure how often the learned detector catches adversarial inputs."""
     return _run_flagging_rate(model, loader, attack, detector_attr="detector")
 
 
 def _run_flagging_rate(model, loader, attack=None, detector_attr=None):
+    """Compute clean and adversarial flagging rates for a rejection model."""
     dev = _device()
     model.eval()
     clean_flags = 0
@@ -362,6 +456,7 @@ def _run_flagging_rate(model, loader, attack=None, detector_attr=None):
 
 
 def _flag_mask(model, x, detector_attr):
+    """Return the boolean mask of inputs rejected by a guard or detector."""
     if detector_attr is not None and hasattr(model, detector_attr):
         prob = F.softmax(model.detector(x), dim=1)[:, 1]
         return prob > model.threshold

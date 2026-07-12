@@ -1,5 +1,9 @@
-"""
-Central configuration and constants for QuantAdvOld.py.
+"""Central configuration for active QuantAdv experiments.
+
+Constants in this module define dataset paths, model names, perturbation
+budgets, quantization defaults, attack settings, optional experiment switches,
+and report output locations.  Runtime modules import these values directly, so
+changes here affect both the main runner and standalone analysis scripts.
 """
 
 import logging

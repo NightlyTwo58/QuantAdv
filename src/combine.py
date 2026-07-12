@@ -122,6 +122,7 @@ HEATMAP_LINEWIDTHS = getattr(_config, "HEATMAP_LINEWIDTHS", 0.5)
 
 
 def _model_from_prefixed_path(path: Path, prefix: str, suffix: str) -> str:
+    """Extract the model name encoded in a result filename."""
     name = path.name
     if name.startswith(prefix):
         name = name[len(prefix) :]
@@ -131,6 +132,7 @@ def _model_from_prefixed_path(path: Path, prefix: str, suffix: str) -> str:
 
 
 def _read_csvs(paths: Iterable[Path], model_prefix: str | None = None) -> pd.DataFrame:
+    """Read and concatenate matching CSV files with model metadata attached."""
     frames = []
     for path in sorted(paths):
         try:
@@ -161,6 +163,7 @@ def _read_csvs(paths: Iterable[Path], model_prefix: str | None = None) -> pd.Dat
 
 
 def _write(df: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """Create parent directories and write a dataframe to CSV."""
     if df is not None and not df.empty:
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(path, index=False)
@@ -169,6 +172,7 @@ def _write(df: pd.DataFrame, path: Path) -> pd.DataFrame:
 
 
 def _result_files(data_dir: Path) -> list[Path]:
+    """Collect result-file paths by experiment family."""
     blocked = {
         RESULTS_CSV.name,
         SWEEP_CSV.name,
@@ -190,12 +194,14 @@ def _result_files(data_dir: Path) -> list[Path]:
 
 
 def combine_scalar_results(data_dir: Path, output: Path = RESULTS_CSV) -> pd.DataFrame:
+    """Combine per-model scalar result CSV files into one table."""
     files = _result_files(data_dir)
     df = _read_csvs(files, model_prefix="results_")
     return _write(df, output)
 
 
 def combine_sweeps(data_dir: Path, output: Path = SWEEP_CSV) -> pd.DataFrame:
+    """Combine epsilon-sweep CSV files into one table."""
     files = [p for p in data_dir.glob("sweep_*.csv") if p.name != output.name]
     df = _read_csvs(files, model_prefix="sweep_")
     if not df.empty and {"model", "epsilon"}.issubset(df.columns):
@@ -206,6 +212,7 @@ def combine_sweeps(data_dir: Path, output: Path = SWEEP_CSV) -> pd.DataFrame:
 def combine_ablation(
     data_dir: Path, output: Path = ABLATION_COMBINED_CSV
 ) -> pd.DataFrame:
+    """Combine PGD step-ablation CSV files into one table."""
     files = [p for p in data_dir.glob("ablation_*.csv") if p.name != output.name]
     df = _read_csvs(files, model_prefix="ablation_")
     if not df.empty and {"model", "steps"}.issubset(df.columns):
@@ -216,6 +223,7 @@ def combine_ablation(
 def combine_layerwise(
     data_dir: Path, output: Path = LAYERWISE_COMBINED_CSV
 ) -> pd.DataFrame:
+    """Combine layerwise gradient-profile CSV files into one table."""
     files = [p for p in data_dir.glob("layerwise_*.csv") if p.name != output.name]
     df = _read_csvs(files, model_prefix="layerwise_")
     return _write(df, output)
@@ -224,6 +232,7 @@ def combine_layerwise(
 def combine_component_ablation(
     data_dir: Path, output: Path = COMPONENT_ABLATION_COMBINED_CSV
 ) -> pd.DataFrame:
+    """Combine quantization component-ablation CSV files into one table."""
     files = [
         p for p in data_dir.glob("component_ablation_*.csv") if p.name != output.name
     ]
@@ -234,6 +243,7 @@ def combine_component_ablation(
 def combine_trajectories(
     data_dir: Path, output: Path = TRAJECTORY_COMBINED_CSV
 ) -> pd.DataFrame:
+    """Combine PGD trajectory diagnostic CSV files into one table."""
     rows = []
     for path in sorted(data_dir.glob("trajectory_*.json")):
         model = _model_from_prefixed_path(path, "trajectory_", ".json")
@@ -263,6 +273,7 @@ def combine_trajectories(
 
 
 def combine_margins(data_dir: Path, output: Path = MARGIN_COMBINED_CSV) -> pd.DataFrame:
+    """Combine confidence-margin diagnostic CSV files into one table."""
     rows = []
     for path in sorted(data_dir.glob("margin_*.json")):
         model = _model_from_prefixed_path(path, "margin_", ".json")
@@ -284,6 +295,7 @@ def combine_margins(data_dir: Path, output: Path = MARGIN_COMBINED_CSV) -> pd.Da
 
 
 def _model_names(*dfs: pd.DataFrame) -> list[str]:
+    """Return the preferred display order for model names."""
     names = []
     for df in dfs:
         if df is not None and not df.empty and "model" in df.columns:
@@ -292,6 +304,7 @@ def _model_names(*dfs: pd.DataFrame) -> list[str]:
 
 
 def plot_summary_results(df_results: pd.DataFrame, output: Path = PLOT_PNG) -> None:
+    """Plot the headline accuracy and robustness summary metrics."""
     if df_results is None or df_results.empty or "model" not in df_results.columns:
         return
 
@@ -342,6 +355,7 @@ def plot_summary_results(df_results: pd.DataFrame, output: Path = PLOT_PNG) -> N
 def plot_epsilon_sweep_curves(
     df_sweep: pd.DataFrame, output: Path = SWEEP_PLOT_PNG
 ) -> None:
+    """Plot robustness metrics as a function of attack epsilon."""
     if df_sweep is None or df_sweep.empty:
         return
     value_cols = [
@@ -397,6 +411,7 @@ def plot_epsilon_sweep_curves(
 def plot_pgd_steps_ablation(
     df_ablation: pd.DataFrame, output: Path = ABLATION_PLOT_PNG
 ) -> None:
+    """Plot accuracy as PGD step count changes."""
     if (
         df_ablation is None
         or df_ablation.empty
@@ -420,6 +435,7 @@ def plot_pgd_steps_ablation(
 def plot_pgd_trajectory(
     df_traj: pd.DataFrame, output: Path = TRAJECTORY_PLOT_PNG
 ) -> None:
+    """Plot gradient norms and movement along PGD trajectories."""
     required = {
         "model",
         "step",
@@ -464,6 +480,7 @@ def plot_pgd_trajectory(
 def plot_layerwise_grad_profile(
     df_layer: pd.DataFrame, output: Path = LAYERWISE_PLOT_PNG
 ) -> None:
+    """Plot per-layer gradient magnitudes for diagnosed models."""
     required = {"model", "layer", "grad_norm_hard", "grad_norm_ste"}
     if df_layer is None or df_layer.empty or not required.issubset(df_layer.columns):
         return
@@ -509,6 +526,7 @@ def plot_layerwise_grad_profile(
 def plot_component_ablation(
     df_component: pd.DataFrame, output: Path = COMPONENT_ABLATION_PLOT_PNG
 ) -> None:
+    """Plot clean, hard-PGD, and BPDA component-ablation accuracies."""
     required = {"model", "config", "clean_acc", "PGD_acc"}
     if (
         df_component is None
@@ -517,9 +535,12 @@ def plot_component_ablation(
     ):
         return
 
+    value_vars = [
+        c for c in ["clean_acc", "PGD_acc", "BPDA_acc"] if c in df_component.columns
+    ]
     df_long = df_component.melt(
         id_vars=["model", "config"],
-        value_vars=["clean_acc", "PGD_acc"],
+        value_vars=value_vars,
         var_name="Metric",
         value_name="Accuracy",
     ).dropna(subset=["Accuracy"])
@@ -548,6 +569,7 @@ def plot_component_ablation(
 def plot_gradient_masking_summary(
     df_results: pd.DataFrame, output: Path = MASKING_SUMMARY_PLOT_PNG
 ) -> None:
+    """Plot metrics that summarize potential gradient masking."""
     if (
         df_results is None
         or df_results.empty
@@ -594,6 +616,7 @@ def plot_gradient_masking_summary(
 def plot_confidence_margin_diagnostic(
     df_margins: pd.DataFrame, output: Path = MARGIN_PLOT_PNG
 ) -> None:
+    """Plot clean and adversarial confidence-margin distributions."""
     required = {"model", "kind", "margin"}
     if (
         df_margins is None
@@ -651,6 +674,7 @@ def plot_confidence_margin_diagnostic(
 def plot_results_heatmap(
     df_results: pd.DataFrame, output: Path = HEATMAP_PLOT_PNG
 ) -> None:
+    """Plot scalar metrics as a model-by-metric heatmap."""
     if df_results is None or df_results.empty or "model" not in df_results.columns:
         return
 
@@ -703,6 +727,7 @@ def plot_results_heatmap(
 
 
 def combine_all(data_dir: Path) -> dict[str, pd.DataFrame]:
+    """Combine all available experiment result families."""
     data_dir.mkdir(parents=True, exist_ok=True)
 
     df_results = combine_scalar_results(data_dir, RESULTS_CSV)
@@ -730,6 +755,7 @@ def combine_all(data_dir: Path) -> dict[str, pd.DataFrame]:
 
 
 def plot_all(dfs: dict[str, pd.DataFrame]) -> None:
+    """Generate all summary plots from combined result tables."""
     plot_summary_results(dfs["results"], PLOT_PNG)
     plot_epsilon_sweep_curves(dfs["sweep"], SWEEP_PLOT_PNG)
     plot_pgd_steps_ablation(dfs["ablation"], ABLATION_PLOT_PNG)
@@ -742,6 +768,7 @@ def plot_all(dfs: dict[str, pd.DataFrame]) -> None:
 
 
 def main() -> None:
+    """Run the command-line entry point for this module."""
     parser = argparse.ArgumentParser(
         description="Merge incomplete QuantAdv outputs and regenerate reports."
     )
