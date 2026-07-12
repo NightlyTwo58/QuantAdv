@@ -147,16 +147,14 @@ class FakeQuantSTE(torch.autograd.Function):
         return grad_output
 
 
-def quantize_tensor(t, bits, use_ste):
-    if bits is None:
-        return t
-    qmax = 2 ** (bits - 1) - 1
-    scale = torch.clamp(t.detach().abs().max() / qmax, min=QUANT_SCALE_MIN)
-    t_scaled = t / scale
-    t_round = FakeQuantSTE.apply(t_scaled) if use_ste else torch.round(t_scaled)
-    t_round = torch.clamp(t_round, -qmax - 1, qmax)
-    return t_round * scale
-
+def quantize_tensor(t: torch.Tensor, bits: int, alpha: int):
+    """
+    Quantizes a tensor t to a given number of bits through
+    scale quantization. See https://arxiv.org/pdf/2004.09602
+    """
+    max: int = 2 ** (bits - 1) - 1
+    scale: float = max / alpha
+    return torch.clamp(torch.round(scale * t), min=-max, max=max)
 
 def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP):
     n = t.numel()
