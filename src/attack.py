@@ -127,7 +127,7 @@ def accuracy_from_adv_fn(
                 break
             remaining = max_images - n_seen
             x, y = x[:remaining], y[:remaining]
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
         x_adv = adv_fn(x, y) if adv_fn is not None else x
         with torch.no_grad():
             if use_autocast:
@@ -369,7 +369,7 @@ def build_uap(
         for x, y in loader:
             if n_seen >= max_images:
                 break
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
             x_pert = torch.max(torch.min(x + v, clip_max), clip_min)
             with torch.no_grad():
                 pred_orig = model(x).argmax(dim=1)
@@ -449,7 +449,7 @@ def bpda_pgd_attack(
 def _run_bpda_once(model, loader, eps, n_restarts, return_vector=False):
     correct_masks = []
     for x, y in loader:
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
         worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
         for _ in range(n_restarts):
             x_adv = bpda_pgd_attack(model, x, y, eps=eps)
@@ -912,7 +912,7 @@ def run_boundary_attack(
     for x, y in loader:
         if total_seen >= max_images:
             break
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
         with torch.no_grad():
             pred = model(x).argmax(dim=1)
         for i in range(x.size(0)):
@@ -999,7 +999,7 @@ def random_noise_attack(
     correct, total, vectors = 0, 0, []
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
             worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
             for _ in range(n_restarts):
                 noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
@@ -1084,7 +1084,7 @@ def pgd_trajectory_diagnostics(
         for bi, (x, y) in enumerate(loader):
             if bi >= max_batches:
                 break
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
             noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
             x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
             x_adv = x_start.clone()
@@ -1155,7 +1155,7 @@ def confidence_margin_diagnostic(
         for bi, (x, y) in enumerate(loader):
             if bi >= max_batches:
                 break
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
             with torch.no_grad():
                 top2 = F.softmax(model(x), dim=1).topk(2, dim=1).values
             clean_margins.extend((top2[:, 0] - top2[:, 1]).cpu().tolist())

@@ -714,7 +714,9 @@ def add_derived_metrics(df: pd.DataFrame) -> pd.DataFrame:
     architecture = (
         df["model"]
         .astype(str)
-        .str.replace(r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT).*", "", regex=True)
+        .str.replace(
+            r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT|int4_QAT).*", "", regex=True
+        )
     )
     df["Architecture"] = architecture
     if "Worst_Robust_Acc" in df:

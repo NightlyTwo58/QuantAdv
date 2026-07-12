@@ -19,6 +19,7 @@ import threading
 import psutil
 from torch.amp import autocast, GradScaler
 
+from torchao.quantization.qat import IntxFakeQuantizeConfig, IntxFakeQuantizer
 from pytorchcv.model_provider import get_model as ptcv_get_model
 
 import torchattacks
@@ -68,7 +69,7 @@ def check_environment():
     """Validate runtime packages and local CIFAR-10 data before a full run."""
     missing = [
         pkg
-        for pkg in ("torchattacks", "autoattack", "pytorchcv")
+        for pkg in ("torchattacks", "autoattack", "pytorchcv", "torchao")
         if importlib.util.find_spec(pkg) is None
     ]
     if missing:
@@ -149,30 +150,47 @@ def sanity_check_accuracy(model, loader):
     return accuracy_from_adv_fn(model, loader, use_autocast=True)
 
 
-class FakeQuantSTE(torch.autograd.Function):
-    """Round in forward and pass identity gradients backward."""
+def _torchao_int_dtype(bits):
+    """Return TorchAO's integer dtype corresponding to the requested bit width."""
+    if bits == 8:
+        return torch.int8
+    dtype = getattr(torch, f"int{bits}", None)
+    if dtype is None:
+        raise RuntimeError(
+            f"This PyTorch build does not expose torch.int{bits}; upgrade PyTorch/TorchAO "
+            f"to use {bits}-bit TorchAO fake quantization."
+        )
+    return dtype
 
-    @staticmethod
-    def forward(ctx, x):
-        """Round values during the forward pass of the STE quantizer."""
-        return torch.round(x)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Pass gradients through the STE quantizer unchanged."""
-        return grad_output
+def _make_torchao_fake_quantizer(bits, *, role):
+    """Build TorchAO fake quantization for a weight or activation tensor.
+    """
+    if role == "activation":
+        config = IntxFakeQuantizeConfig(
+            dtype=_torchao_int_dtype(bits),
+            granularity="per_token",
+            is_symmetric=False,
+            is_dynamic=True,
+            eps=QUANT_SCALE_MIN,
+        )
+    elif role == "weight":
+        config = IntxFakeQuantizeConfig(
+            dtype=_torchao_int_dtype(bits),
+            granularity="per_channel",
+            is_symmetric=True,
+            is_dynamic=True,
+            eps=QUANT_SCALE_MIN,
+        )
+    else:
+        raise ValueError(f"Unknown fake-quantizer role: {role!r}")
+    return IntxFakeQuantizer(config)
 
 
-def quantize_tensor(t, bits, use_ste):
-    """Apply signed per-tensor fake quantization to ``t``."""
-    if bits is None:
-        return t
-    qmax = 2 ** (bits - 1) - 1
-    scale = torch.clamp(t.detach().abs().max() / qmax, min=QUANT_SCALE_MIN)
-    t_scaled = t / scale
-    t_round = FakeQuantSTE.apply(t_scaled) if use_ste else torch.round(t_scaled)
-    t_round = torch.clamp(t_round, -qmax - 1, qmax)
-    return t_round * scale
+def _hard_or_ste(fake_quantizer, tensor, use_ste):
+    """Use TorchAO numerics while selecting STE or true hard-round gradients."""
+    quantized = fake_quantizer(tensor)
+    return quantized if use_ste else quantized.detach()
 
 
 def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP):
@@ -196,82 +214,103 @@ def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP
 
 
 def chaotic_quantize_tensor(
-    t, bits, use_ste, quantize=True, dither_amplitude=CHAOTIC_QUANT_DITHER
+    t,
+    bits,
+    use_ste,
+    fake_quantizer,
+    quantize=True,
+    dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
-    """Fake-quantize with deterministic chaotic subtractive dithering."""
+    """Apply subtractive chaotic dither around a TorchAO fake quantizer."""
     if bits is None or not quantize:
         return t
-    qmax = 2 ** (bits - 1) - 1
-    scale = torch.clamp(t.detach().abs().max() / qmax, min=QUANT_SCALE_MIN)
     chaos = chaotic_sequence_like(t)
-    dither = (chaos - 0.5) * dither_amplitude
-    t_scaled = t / scale + dither
-    t_round = FakeQuantSTE.apply(t_scaled) if use_ste else torch.round(t_scaled)
-    t_round = torch.clamp(t_round, -qmax - 1, qmax)
-    return (t_round - dither) * scale
+    # Dither is expressed in units of the tensor's dynamic range. TorchAO
+    # selects the actual scale/zero-point according to the configured scheme.
+    amplitude = t.detach().abs().amax().clamp_min(QUANT_SCALE_MIN)
+    dither = (chaos - 0.5) * dither_amplitude * amplitude
+    quantized = fake_quantizer(t + dither) - dither
+    return quantized if use_ste else quantized.detach()
 
 
 class _QuantizedLayerMixin:
-    """Shared fake-quantization controls for custom Conv2d/Linear layers."""
+    """Shared TorchAO fake-quantization controls for Conv2d/Linear wrappers."""
 
     chaotic = False
 
-    def _quant_params(self):
-        """Return this layer's effective quantization bit widths."""
-        bits = getattr(self, "bits", None)
-        use_ste = getattr(self, "use_ste", QUANT_DEFAULT_USE_STE)
-        quant_weight = getattr(self, "quant_weight", QUANT_DEFAULT_WEIGHT)
-        quant_act = getattr(self, "quant_act", QUANT_DEFAULT_ACT)
-        return bits, use_ste, quant_weight, quant_act
+    def _init_quantizers(self, bits):
+        self.bits = bits
+        self.weight_fake_quantizer = _make_torchao_fake_quantizer(bits, role="weight")
+        self.activation_fake_quantizer = _make_torchao_fake_quantizer(bits, role="activation")
 
-    def _quantize(self, t, bits, use_ste, enabled=True):
-        """Fake-quantize a tensor when the corresponding quantization path is enabled."""
+    def _quant_params(self):
+        return (
+            getattr(self, "bits", None),
+            getattr(self, "use_ste", QUANT_DEFAULT_USE_STE),
+            getattr(self, "quant_weight", QUANT_DEFAULT_WEIGHT),
+            getattr(self, "quant_act", QUANT_DEFAULT_ACT),
+        )
+
+    def _quantize_weight(self, tensor, enabled):
+        if not enabled:
+            return tensor
+        original_shape = tensor.shape
+        flattened = tensor.reshape(tensor.shape[0], -1)
         if self.chaotic:
-            return chaotic_quantize_tensor(
-                t,
-                bits,
-                use_ste,
-                enabled,
+            quantized = chaotic_quantize_tensor(
+                flattened,
+                self.bits,
+                self.use_ste,
+                self.weight_fake_quantizer,
+                True,
                 getattr(self, "dither_amplitude", CHAOTIC_QUANT_DITHER),
             )
-        return quantize_tensor(t, bits, use_ste) if enabled else t
+        else:
+            quantized = _hard_or_ste(
+                self.weight_fake_quantizer, flattened, self.use_ste
+            )
+        return quantized.reshape(original_shape)
+
+    def _quantize_activation(self, tensor, enabled):
+        if not enabled:
+            return tensor
+        if self.chaotic:
+            return chaotic_quantize_tensor(
+                tensor,
+                self.bits,
+                self.use_ste,
+                self.activation_fake_quantizer,
+                True,
+                getattr(self, "dither_amplitude", CHAOTIC_QUANT_DITHER),
+            )
+        return _hard_or_ste(self.activation_fake_quantizer, tensor, self.use_ste)
 
 
 class QuantConv2d(_QuantizedLayerMixin, nn.Conv2d):
-    """Conv2d that can fake-quantize weights and output activations."""
+    """Conv2d using TorchAO fake quantization for weights and output activations."""
 
     def forward(self, x):
-        """Run convolution with this layer's quantization settings applied."""
-        bits, use_ste, quant_weight, quant_act = self._quant_params()
-        w = self._quantize(self.weight, bits, use_ste, quant_weight)
-        out = self._conv_forward(x, w, self.bias)
-        if quant_act:
-            out = self._quantize(out, bits, use_ste, quant_act)
-        return out
+        _, _, quant_weight, quant_act = self._quant_params()
+        weight = self._quantize_weight(self.weight, quant_weight)
+        out = self._conv_forward(x, weight, self.bias)
+        return self._quantize_activation(out, quant_act)
 
 
 class ChaoticQuantConv2d(QuantConv2d):
-    """Quantized Conv2d variant that uses chaotic dither before rounding."""
-
     chaotic = True
 
 
 class QuantLinear(_QuantizedLayerMixin, nn.Linear):
-    """Linear layer that can fake-quantize weights and output activations."""
+    """Linear using TorchAO fake quantization for weights and output activations."""
 
     def forward(self, x):
-        """Run a linear projection with this layer's quantization settings applied."""
-        bits, use_ste, quant_weight, quant_act = self._quant_params()
-        w = self._quantize(self.weight, bits, use_ste, quant_weight)
-        out = F.linear(x, w, self.bias)
-        if quant_act:
-            out = self._quantize(out, bits, use_ste, quant_act)
-        return out
+        _, _, quant_weight, quant_act = self._quant_params()
+        weight = self._quantize_weight(self.weight, quant_weight)
+        out = F.linear(x, weight, self.bias)
+        return self._quantize_activation(out, quant_act)
 
 
 class ChaoticQuantLinear(QuantLinear):
-    """Quantized Linear variant that uses chaotic dither before rounding."""
-
     chaotic = True
 
 
@@ -283,7 +322,7 @@ def _to_quant_module(
     chaotic=False,
     dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
-    """Convert a supported leaf module to the matching fake-quantized module."""
+    """Convert Conv2d/Linear to TorchAO-backed fake-quantized wrappers."""
     if isinstance(mod, nn.Conv2d):
         cls = ChaoticQuantConv2d if chaotic else QuantConv2d
         new = cls(
@@ -296,33 +335,30 @@ def _to_quant_module(
             mod.groups,
             mod.bias is not None,
             mod.padding_mode,
+            device=mod.weight.device,
+            dtype=mod.weight.dtype,
         )
-        new.weight = mod.weight
-        if mod.bias is not None:
-            new.bias = mod.bias
-        new.bits, new.use_ste, new.quant_weight, new.quant_act = (
-            bits,
-            QUANT_DEFAULT_USE_STE,
-            quant_weight,
-            quant_act,
-        )
-        new.dither_amplitude = dither_amplitude
-        return new
-    if isinstance(mod, nn.Linear):
+    elif isinstance(mod, nn.Linear):
         cls = ChaoticQuantLinear if chaotic else QuantLinear
-        new = cls(mod.in_features, mod.out_features, bias=mod.bias is not None)
-        new.weight = mod.weight
-        if mod.bias is not None:
-            new.bias = mod.bias
-        new.bits, new.use_ste, new.quant_weight, new.quant_act = (
-            bits,
-            QUANT_DEFAULT_USE_STE,
-            quant_weight,
-            quant_act,
+        new = cls(
+            mod.in_features,
+            mod.out_features,
+            bias=mod.bias is not None,
+            device=mod.weight.device,
+            dtype=mod.weight.dtype,
         )
-        new.dither_amplitude = dither_amplitude
-        return new
-    return None
+    else:
+        return None
+
+    new.weight = mod.weight
+    if mod.bias is not None:
+        new.bias = mod.bias
+    new._init_quantizers(bits)
+    new.use_ste = QUANT_DEFAULT_USE_STE
+    new.quant_weight = quant_weight
+    new.quant_act = quant_act
+    new.dither_amplitude = dither_amplitude
+    return new
 
 
 def _replace_recursive(
@@ -333,9 +369,8 @@ def _replace_recursive(
     chaotic=False,
     dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
-    """Recursively replace supported children with fake-quantized layers."""
     for name, child in list(module.named_children()):
-        nc = _to_quant_module(
+        replacement = _to_quant_module(
             child,
             bits,
             quant_weight,
@@ -343,8 +378,8 @@ def _replace_recursive(
             chaotic=chaotic,
             dither_amplitude=dither_amplitude,
         )
-        if nc is not None:
-            setattr(module, name, nc)
+        if replacement is not None:
+            setattr(module, name, replacement)
         else:
             _replace_recursive(
                 child,
@@ -364,7 +399,7 @@ def convert_to_quant(
     chaotic=False,
     dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
-    """Return a deep-copied model with Conv2d/Linear layers fake-quantized."""
+    """Return a deep-copied model backed by TorchAO fake quantizers."""
     m = copy.deepcopy(model)
     _replace_recursive(
         m,
@@ -384,7 +419,6 @@ def convert_to_chaotic_quant(
     quant_act=True,
     dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
-    """Return a fake-quantized copy that uses chaotic dither in quantized layers."""
     return convert_to_quant(
         model,
         bits,
@@ -396,17 +430,15 @@ def convert_to_chaotic_quant(
 
 
 def quantizable_layer_names(model):
-    """List FP32 Conv2d/Linear module names that are eligible for conversion."""
     quant_types = (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
     return [
-        n
-        for n, m in model.named_modules()
-        if isinstance(m, (nn.Conv2d, nn.Linear)) and not isinstance(m, quant_types)
+        name
+        for name, mod in model.named_modules()
+        if isinstance(mod, (nn.Conv2d, nn.Linear)) and not isinstance(mod, quant_types)
     ]
 
 
 def set_child_module(root, module_name, new_module):
-    """Replace a dotted child module path inside ``root``."""
     parts = module_name.split(".")
     parent = root
     for part in parts[:-1]:
@@ -417,7 +449,6 @@ def set_child_module(root, module_name, new_module):
 def convert_layer_chunk_to_quant(
     model, layer_names, bits, quant_weight=True, quant_act=True, chaotic=False
 ):
-    """Quantize only the named layer subset for localization experiments."""
     m = copy.deepcopy(model)
     targets = set(layer_names)
     for name, mod in list(m.named_modules()):
@@ -430,7 +461,6 @@ def convert_layer_chunk_to_quant(
 
 
 def quant_layer_chunks(layer_names, n_chunks):
-    """Split quantizable layer names into non-empty ordered chunks."""
     if not layer_names:
         return []
     n_chunks = max(1, min(n_chunks, len(layer_names)))
@@ -442,20 +472,15 @@ def quant_layer_chunks(layer_names, n_chunks):
 
 
 def count_quant_layers(model):
-    """Count custom fake-quantized Conv2d/Linear layers in ``model``."""
     return sum(
-        1
-        for m in model.modules()
-        if isinstance(
-            m, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
-        )
+        isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear))
+        for mod in model.modules()
     )
 
 
 def verify_quantization_layers(
     arch_key, fp32_model, quant_model, label, fp32_layer_names=None
 ):
-    """Fail fast when a converted model did not replace most eligible layers."""
     fp32_layer_names = (
         quantizable_layer_names(fp32_model)
         if fp32_layer_names is None
@@ -465,20 +490,18 @@ def verify_quantization_layers(
         raise RuntimeError(f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers.")
     quant_count = count_quant_layers(quant_model)
     threshold = int(np.ceil(0.8 * len(fp32_layer_names)))
-    print(f"  {label} quantized layers: {quant_count}")
+    print(f"  {label} quantized layers: {quant_count}", flush=True)
     if quant_count < threshold:
         raise RuntimeError(
-            f"{arch_key} {label} replaced {quant_count}/{len(fp32_layer_names)} quantizable layers; expected at least {threshold}."
+            f"{arch_key} {label} replaced {quant_count}/{len(fp32_layer_names)} "
+            f"quantizable layers; expected at least {threshold}."
         )
     return quant_count
 
 
 def set_quant_components(model, quant_weight, quant_act):
-    """Toggle weight and activation fake quantization on converted layers."""
     for mod in model.modules():
-        if isinstance(
-            mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
-        ):
+        if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
             mod.quant_weight = quant_weight
             mod.quant_act = quant_act
 
@@ -491,7 +514,7 @@ def prepare_qat(
     lr=QAT_LR,
     chaotic=False,
 ):
-    """Fine-tune a fake-quantized copy with STE-enabled quantization-aware training."""
+    """Fine-tune a TorchAO fake-quantized copy with STE enabled."""
     m = (
         convert_to_chaotic_quant(fp32_model, bits, quant_weight=True, quant_act=True)
         if chaotic
@@ -507,21 +530,29 @@ def prepare_qat(
         momentum=QAT_MOMENTUM,
         weight_decay=QAT_WEIGHT_DECAY,
     )
-    scaler = GradScaler(device=device.type)
+    scaler = GradScaler(device=device.type, enabled=device.type == "cuda")
     for epoch in range(epochs):
         running = 0.0
-        for x, y in finetune_loader:
-            x = x.to(device)
-            y = y.to(device)
+        for batch_idx, (x, y) in enumerate(finetune_loader):
+            x = x.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+            y = y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
             opt.zero_grad(set_to_none=True)
-            with autocast(device_type=device.type):
+            with autocast(device_type=device.type, enabled=device.type == "cuda"):
                 loss = F.cross_entropy(m(x), y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             running += loss.item()
+            if batch_idx == 0 or (batch_idx + 1) % QAT_LOG_EVERY_BATCHES == 0:
+                print(
+                    f"  QAT epoch {epoch + 1}/{epochs} batch "
+                    f"{batch_idx + 1}/{len(finetune_loader)} loss {loss.item():.4f}",
+                    flush=True,
+                )
         print(
-            f"  QAT epoch {epoch+1}/{epochs} avg loss {running/len(finetune_loader):.4f}"
+            f"  QAT epoch {epoch + 1}/{epochs} avg loss "
+            f"{running / len(finetune_loader):.4f}",
+            flush=True,
         )
     set_ste_mode(m, False)
     return m.eval()
@@ -780,7 +811,7 @@ def run_chunk_quantization_attacks(
     fp32_model,
     loader,
     name,
-    bits=QAT_BITS,
+    bits=8,
     n_chunks=CHUNK_QUANT_NUM_CHUNKS,
     eps=DEFAULT_EPS,
 ):
@@ -1222,7 +1253,8 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
     )
     for arch_key in arch_keys:
         fp32_entry = model_registry.get(f"{arch_key}_FP32")
-        qat_entry = model_registry.get(f"{arch_key}_int8_QAT")
+        int8_qat_entry = model_registry.get(f"{arch_key}_int8_QAT")
+        int4_qat_entry = model_registry.get(f"{arch_key}_int4_QAT")
         if fp32_entry is None:
             continue
         fp32_model = fp32_entry[0]
@@ -1245,7 +1277,7 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
         def add_int8_at():
             """Add the adversarially trained INT8 defense to the registry when available."""
             int8_at = dfn.prepare_adversarial_training(
-                fp32_model, finetune_loader, bits=QAT_BITS
+                fp32_model, finetune_loader, bits=8
             )
             model_registry[f"{arch_key}_int8_QAT_AT"] = (int8_at, fp32_model)
 
@@ -1257,8 +1289,10 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
             level="FAIL",
         )
         wrap_targets = [("FP32", fp32_model)]
-        if qat_entry is not None:
-            wrap_targets.append(("int8_QAT", qat_entry[0]))
+        if int8_qat_entry is not None:
+            wrap_targets.append(("int8_QAT", int8_qat_entry[0]))
+        if int4_qat_entry is not None:
+            wrap_targets.append(("int4_QAT", int4_qat_entry[0]))
         detector = safe_call(
             lambda: dfn.train_adversarial_detector(fp32_model, finetune_loader),
             "adversarial detector training failed",
@@ -1376,7 +1410,7 @@ def parallelize(model):
     return model
 
 
-def run_chaotic_dither_sweep(fp32_model, loader, arch_key, bits=QAT_BITS):
+def run_chaotic_dither_sweep(fp32_model, loader, arch_key, bits=8):
     """Evaluate chaotic quantization over dither-amplitude settings."""
     rows = []
     for amplitude in CHAOTIC_DITHER_AMPLITUDES:
@@ -1480,7 +1514,7 @@ def main():
             continue
         try:
             int8_ptq = convert_to_quant(
-                fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+                fp32, bits=8, quant_weight=True, quant_act=True
             )
             verify_quantization_layers(
                 arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names
@@ -1503,7 +1537,7 @@ def main():
         try:
             int8_qat = prepare_qat(
                 fp32,
-                bits=QAT_BITS,
+                bits=8,
                 finetune_loader=finetune_loader,
                 epochs=QAT_MAIN_EPOCHS,
             )
@@ -1513,6 +1547,21 @@ def main():
             model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
+            traceback.print_exc()
+            raise
+        try:
+            int4_qat = prepare_qat(
+                fp32,
+                bits=4,
+                finetune_loader=finetune_loader,
+                epochs=QAT_MAIN_EPOCHS,
+            )
+            verify_quantization_layers(
+                arch_key, fp32, int4_qat, "int4 QAT", fp32_layer_names
+            )
+            model_registry[f"{arch_key}_int4_QAT"] = (int4_qat, fp32)
+        except Exception as e:
+            print(f"  [FAIL] int4 QAT for {arch_key}: {e}")
             traceback.print_exc()
             raise
         if QUANTIZATION_DEBUG_ONLY:
@@ -1531,7 +1580,7 @@ def main():
         if RUN_CHAOTIC_COMPRESS:
             try:
                 chaotic_int8_ptq = convert_to_chaotic_quant(
-                    fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+                    fp32, bits=8, quant_weight=True, quant_act=True
                 )
                 model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (
                     chaotic_int8_ptq,
@@ -1552,7 +1601,7 @@ def main():
             try:
                 compressed_chaotic_int8 = with_image_compression(
                     convert_to_chaotic_quant(
-                        fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+                        fp32, bits=8, quant_weight=True, quant_act=True
                     )
                 )
                 model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (
@@ -1564,7 +1613,7 @@ def main():
             try:
                 chaotic_int8_qat = prepare_qat(
                     fp32,
-                    bits=QAT_BITS,
+                    bits=8,
                     finetune_loader=finetune_loader,
                     epochs=QAT_MAIN_EPOCHS,
                     chaotic=True,
@@ -1617,7 +1666,7 @@ def main():
                     entry[0],
                     eval_loader,
                     arch_key,
-                    bits=QAT_BITS,
+                    bits=8,
                     n_chunks=CHUNK_QUANT_NUM_CHUNKS,
                     eps=DEFAULT_EPS,
                 )
@@ -1761,7 +1810,7 @@ def main():
         .set_index("Architecture")["Worst_Robust_Acc"]
     )
     df_results["Architecture"] = df_results["model"].str.replace(
-        r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT).*", "", regex=True
+        r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT|int4_QAT).*", "", regex=True
     )
     df_results["FP32_Worst_Robust_Acc"] = df_results["Architecture"].map(fp32_baseline)
     if {
