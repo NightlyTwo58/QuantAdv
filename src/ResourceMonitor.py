@@ -11,6 +11,7 @@ class ResourceMonitor:
     """Record resource use around an existing run without executing extra model work."""
 
     def __init__(self, model, name, sample_interval_seconds=0.1):
+        """Initialize process-resource tracking for a model run."""
         self.model = model
         self.name = name
         self.sample_interval_seconds = sample_interval_seconds
@@ -41,11 +42,13 @@ class ResourceMonitor:
         return rss_bytes, user_seconds, system_seconds
 
     def _sample_memory(self):
+        """Sample current process-tree memory usage into the monitor state."""
         while not self.stop_event.wait(self.sample_interval_seconds):
             rss_bytes, _, _ = self._process_tree_usage(self.process)
             self.peak_rss_bytes = max(self.peak_rss_bytes, rss_bytes)
 
     def __enter__(self):
+        """Start resource monitoring and return this context manager."""
         self.start_rss_bytes, self.start_user_seconds, self.start_system_seconds = (
             self._process_tree_usage(self.process)
         )
@@ -64,6 +67,7 @@ class ResourceMonitor:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback_value):
+        """Stop monitoring and finalize peak memory and elapsed-time metrics."""
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         elapsed_seconds = time.perf_counter() - self.start_time

@@ -11,6 +11,8 @@ All adversarial-attack logic
 """
 
 import warnings
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,10 +26,13 @@ from config import *
 
 
 def unwrap_model(model):
+    """Return the underlying module when ``model`` is wrapped in DataParallel."""
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
 def set_ste_mode(model, flag):
+    """Toggle straight-through gradients on fake-quantized modules.
+    """
     toggled = 0
     for mod in model.modules():
         if hasattr(mod, "use_ste") and hasattr(mod, "bits"):
@@ -36,15 +41,61 @@ def set_ste_mode(model, flag):
     return toggled
 
 
+def get_ste_mode(model):
+    """Return the current ``use_ste`` state of a model's quantized modules.
+
+    Returns ``None`` if the model has no quantized modules, ``True``/``False``
+    if all quantized modules agree, or the string ``"mixed"`` if they don't
+    (which should never happen in normal use, and indicates something set
+    ``use_ste`` on a subset of layers directly rather than through
+    ``set_ste_mode``/``ste_mode``).
+    """
+    values = {
+        mod.use_ste
+        for mod in model.modules()
+        if hasattr(mod, "use_ste") and hasattr(mod, "bits")
+    }
+    if not values:
+        return None
+    if len(values) > 1:
+        return "mixed"
+    return next(iter(values))
+
+
+@contextmanager
+def ste_mode(model, flag):
+    """Run a block with an explicit, restored ``use_ste`` state.
+
+    Every attack or diagnostic that cares whether gradients are computed
+    through the true (masking) rounding op or through the straight-through
+    bypass should wrap its gradient computation in this, e.g.::
+        with ste_mode(model, False):   # real hard-round gradient
+        with ste_mode(model, True):    # STE / BPDA-style bypass
+    """
+    previous = get_ste_mode(model)
+    set_ste_mode(model, flag)
+    try:
+        yield
+    finally:
+        # Restore exactly what was there before (True/False), or leave
+        # everything at False if the model had no quantized layers / no
+        # prior state to speak of.
+        set_ste_mode(model, previous if isinstance(previous, bool) else False)
+
+
 def normalize_pixels(x):
+    """Normalize pixel-space CIFAR tensors with the experiment constants."""
     return (x - CIFAR_MEAN.to(x.device)) / CIFAR_STD.to(x.device)
 
 
 def denormalize_inputs(x):
+    """Map normalized CIFAR tensors back to pixel space."""
     return x * CIFAR_STD.to(x.device) + CIFAR_MEAN.to(x.device)
 
 
 class PixelSpaceModel(nn.Module):
+    """Adapter exposing a normalized-input model as a pixel-space model."""
+
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -56,6 +107,7 @@ class PixelSpaceModel(nn.Module):
 
 
 def make_torchattack(attack_cls, model, *args, **kwargs):
+    """Create a torchattacks instance configured for normalized CIFAR inputs."""
     attack = attack_cls(model, *args, **kwargs)
     attack.set_normalization_used(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
     return attack
@@ -70,6 +122,7 @@ def accuracy_from_adv_fn(
     use_autocast=False,
     return_vector=False,
 ):
+    """Measure accuracy after an optional adversarial-example function."""
 
     target = target_model if target_model is not None else model
     correct, total, n_seen = 0, 0, 0
@@ -108,6 +161,7 @@ def accuracy_from_adv_fn(
 def accuracy_under_attack(
     model, loader, attack, target_model=None, max_images=None, return_vector=False
 ):
+    """Measure accuracy under a torchattacks-compatible attack object."""
     def adv_fn(x, y):
         return attack(x, y)
 
@@ -122,11 +176,13 @@ def accuracy_under_attack(
 
 
 def evaluate_normalized_attack(model, loader, attack_fn):
+    """Evaluate an attack function that consumes and returns normalized tensors."""
     model.eval()
     return accuracy_from_adv_fn(model, loader, attack_fn)
 
 
 def seed_averaged_metrics(name, seeds, fn):
+    """Run a metric for multiple seeds and return mean/std summaries."""
     accs = []
     for seed in seeds:
         torch.manual_seed(seed)
@@ -140,9 +196,15 @@ def seed_averaged_metrics(name, seeds, fn):
 
 
 def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vectors=False):
+    """Run FGSM and multi-restart PGD, aggregating PGD by worst-case correctness.
+
+    Uses STE (straight-through) gradients explicitly: this is the
+    "attacker who knows to bypass fake-quantization rounding" number, not
+    the naive hard-round number. See ``pgd_steps_ablation`` /
+    ``run_epsilon_sweep_for_model`` for the explicit hard-round counterpart.
+    """
     model.eval()
-    set_ste_mode(model, True)
-    try:
+    with ste_mode(model, True):
         fgsm = make_torchattack(torchattacks.FGSM, model, eps=eps)
         out = {}
 
@@ -178,14 +240,12 @@ def run_fgsm_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vectors=Fal
         if return_vectors:
             out["_vectors"] = {"FGSM": fgsm_vector, "PGD": pgd_vector}
         return out
-    finally:
-        set_ste_mode(model, False)
 
 
 def run_autoattack(model, loader, eps=DEFAULT_EPS, return_vector=False):
+    """Run AutoAttack in pixel space while reporting normalized-model accuracy."""
     model.eval()
-    set_ste_mode(model, True)
-    try:
+    with ste_mode(model, True):
         pixel_model = PixelSpaceModel(model).to(device).eval()
         adversary = AutoAttack(
             pixel_model,
@@ -204,16 +264,13 @@ def run_autoattack(model, loader, eps=DEFAULT_EPS, return_vector=False):
             )
 
         return accuracy_from_adv_fn(model, loader, adv_fn, return_vector=return_vector)
-    finally:
-        set_ste_mode(model, False)
 
 
 def run_extra_whitebox_attacks(
     model, loader, eps=DEFAULT_EPS, jsma_max_images=JSMA_MAX_IMAGES
 ):
     model.eval()
-    set_ste_mode(model, True)
-    try:
+    with ste_mode(model, True):
         out = {}
         cw = make_torchattack(
             torchattacks.CW, model, c=CW_C, kappa=CW_KAPPA, steps=CW_STEPS, lr=CW_LR
@@ -233,15 +290,13 @@ def run_extra_whitebox_attacks(
             model, loader, jsma, max_images=jsma_max_images
         )
         return out
-    finally:
-        set_ste_mode(model, False)
 
 
 def transfer_attack(
     source_model, target_model, loader, eps=DEFAULT_EPS, return_vector=False
 ):
-    set_ste_mode(source_model, True)
-    try:
+    """Generate PGD examples on ``source_model`` and evaluate ``target_model``."""
+    with ste_mode(source_model, True):
         pgd = make_torchattack(
             torchattacks.PGD,
             source_model,
@@ -257,8 +312,6 @@ def transfer_attack(
             target_model=target_model,
             return_vector=return_vector,
         )
-    finally:
-        set_ste_mode(source_model, False)
 
 
 def transfer_attack_mim(
@@ -346,6 +399,7 @@ def transfer_uap_attack(
 
 
 def projected_pgd_attack(x, y, eps, alpha, steps, grad_fn):
+    """PGD over normalized tensors with an externally supplied gradient function."""
     clip_min = CLIP_MIN.to(device)
     clip_max = CLIP_MAX.to(device)
     eps_normalized = eps / CIFAR_STD.to(x.device)
@@ -364,23 +418,20 @@ def projected_pgd_attack(x, y, eps, alpha, steps, grad_fn):
 def bpda_pgd_attack(
     model, x, y, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS, backward_model=None
 ):
-    set_ste_mode(model, True)
+    """Run PGD with STE/BPDA gradients through non-differentiable defenses."""
     backward_model = backward_model if backward_model is not None else model
-    if backward_model is not model:
-        set_ste_mode(backward_model, True)
-    try:
 
-        def grad_fn(x_adv, labels):
-            x_adv.requires_grad_(True)
-            loss = F.cross_entropy(backward_model(x_adv), labels)
-            grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
-            return grad
+    def grad_fn(x_adv, labels):
+        x_adv.requires_grad_(True)
+        loss = F.cross_entropy(backward_model(x_adv), labels)
+        grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+        return grad
 
-        return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
-    finally:
-        set_ste_mode(model, False)
+    with ste_mode(model, True):
         if backward_model is not model:
-            set_ste_mode(backward_model, False)
+            with ste_mode(backward_model, True):
+                return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
+        return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
 
 
 def _run_bpda_once(model, loader, eps, n_restarts, return_vector=False):
@@ -411,6 +462,18 @@ def run_bpda(
     seeds=SEEDS,
     return_vector=False,
 ):
+    """Evaluate BPDA-PGD with seed-level worst-case correctness aggregation.
+
+    IMPORTANT for masking-gap comparisons: the true attack budget here is
+    ``len(seeds) * n_restarts`` random restarts (an outer seed loop wrapping
+    an inner ``n_restarts`` loop in ``_run_bpda_once``), not just
+    ``len(seeds)``. ``run_fgsm_pgd``'s ``PGD`` metric, by contrast, uses
+    exactly ``len(seeds)`` restarts (one per seed, no inner loop). If you
+    call this with ``n_restarts > 1`` and then compare the result to
+    ``PGD`` as a "masking gap", part of any gap you see is simply a bigger
+    attack budget for BPDA, not evidence of masking. Pass ``n_restarts=1``
+    to keep the comparison budget-matched to ``PGD``.
+    """
     vectors, accuracies = [], []
     for seed in seeds:
         torch.manual_seed(seed)
@@ -433,18 +496,14 @@ def run_bpda(
 def adaptive_pgd_attack(
     model, x, y, loss_fn, eps=DEFAULT_EPS, alpha=PGD_ALPHA, steps=PGD_STEPS
 ):
-    set_ste_mode(model, True)
-    try:
+    def grad_fn(x_adv, labels):
+        x_adv.requires_grad_(True)
+        loss = loss_fn(x_adv, labels)
+        grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
+        return grad
 
-        def grad_fn(x_adv, labels):
-            x_adv.requires_grad_(True)
-            loss = loss_fn(x_adv, labels)
-            grad = torch.autograd.grad(loss, x_adv, allow_unused=True)[0]
-            return grad
-
+    with ste_mode(model, True):
         return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
-    finally:
-        set_ste_mode(model, False)
 
 
 def run_sanitized_bpda(model, loader, eps=DEFAULT_EPS):
@@ -969,23 +1028,39 @@ def run_random_noise_seeded(
     return out
 
 
-def pgd_steps_ablation(model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_STEPS):
+def pgd_steps_ablation(
+    model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_STEPS, use_ste=False
+):
+    """Accuracy vs. PGD step count, at an explicit, chosen gradient regime.
+
+    ``use_ste=False`` (the default) is the "naive attacker against the real
+    fake-quantized model" regime: if accuracy stays flat as ``steps``
+    increases, that's gradient masking, not robustness — a real attack gets
+    *more* effective with more steps unless the gradient carries no signal.
+    Pass ``use_ste=True`` to see the same sweep with the masking bypassed,
+    for a direct side-by-side comparison.
+
+    Previously this inherited whatever ``use_ste`` state a prior, unrelated
+    attack elsewhere in the run happened to leave the model in, rather than
+    choosing one explicitly.
+    """
     model.eval()
     out = {}
-    for steps in step_list:
-        if steps == 0:
-            acc = random_noise_attack(model, loader, eps=eps, seed=0)
-        else:
-            pgd = make_torchattack(
-                torchattacks.PGD,
-                model,
-                eps=eps,
-                alpha=PGD_ALPHA,
-                steps=steps,
-                random_start=PGD_RANDOM_START,
-            )
-            acc = accuracy_under_attack(model, loader, pgd)
-        out[steps] = acc
+    with ste_mode(model, use_ste):
+        for steps in step_list:
+            if steps == 0:
+                acc = random_noise_attack(model, loader, eps=eps, seed=0)
+            else:
+                pgd = make_torchattack(
+                    torchattacks.PGD,
+                    model,
+                    eps=eps,
+                    alpha=PGD_ALPHA,
+                    steps=steps,
+                    random_start=PGD_RANDOM_START,
+                )
+                acc = accuracy_under_attack(model, loader, pgd)
+            out[steps] = acc
     return out
 
 
@@ -996,7 +1071,18 @@ def pgd_trajectory_diagnostics(
     alpha=PGD_ALPHA,
     steps=PGD_STEPS,
     max_batches=TRAJECTORY_MAX_BATCHES,
+    use_ste=False,
 ):
+    """Per-step gradient norm and movement along a PGD trajectory.
+
+    Computes gradients manually via ``torch.autograd.grad`` rather than
+    through a torchattacks object, so it never went through
+    ``set_ste_mode`` at all previously — it just used whatever ``use_ste``
+    happened to be set to by the last thing that ran before it. Now
+    explicit; defaults to ``False`` (hard round) since a near-zero
+    ``grad_norm_per_step`` here is exactly the masking signature this
+    diagnostic exists to catch.
+    """
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     eps_normalized = eps / CIFAR_STD.to(device)
@@ -1004,25 +1090,28 @@ def pgd_trajectory_diagnostics(
     step_grad_norms = [0.0] * steps
     step_movement = [0.0] * steps
     n_batches = 0
-    for bi, (x, y) in enumerate(loader):
-        if bi >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
-        x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
-        x_adv = x_start.clone()
-        for s in range(steps):
-            x_adv.requires_grad_(True)
-            loss = F.cross_entropy(model(x_adv), y)
-            grad = torch.autograd.grad(loss, x_adv)[0]
-            step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
-            x_adv = x_adv.detach() + alpha_normalized * grad.sign()
-            x_adv = torch.min(torch.max(x_adv, x - eps_normalized), x + eps_normalized)
-            x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
-            step_movement[s] += (
-                (x_adv - x_start).flatten(1).abs().max(dim=1).values.mean().item()
-            )
-        n_batches += 1
+    with ste_mode(model, use_ste):
+        for bi, (x, y) in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x, y = x.to(device), y.to(device)
+            noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
+            x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
+            x_adv = x_start.clone()
+            for s in range(steps):
+                x_adv.requires_grad_(True)
+                loss = F.cross_entropy(model(x_adv), y)
+                grad = torch.autograd.grad(loss, x_adv)[0]
+                step_grad_norms[s] += grad.flatten(1).norm(dim=1).mean().item()
+                x_adv = x_adv.detach() + alpha_normalized * grad.sign()
+                x_adv = torch.min(
+                    torch.max(x_adv, x - eps_normalized), x + eps_normalized
+                )
+                x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
+                step_movement[s] += (
+                    (x_adv - x_start).flatten(1).abs().max(dim=1).values.mean().item()
+                )
+            n_batches += 1
     return {
         "grad_norm_per_step": [g / n_batches for g in step_grad_norms],
         "movement_from_random_start_per_step": [m / n_batches for m in step_movement],
@@ -1053,29 +1142,42 @@ def staircase_diagnostic(
 
 
 def confidence_margin_diagnostic(
-    model, loader, eps=DEFAULT_EPS, steps=MARGIN_STEPS, max_batches=MARGIN_MAX_BATCHES
+    model,
+    loader,
+    eps=DEFAULT_EPS,
+    steps=MARGIN_STEPS,
+    max_batches=MARGIN_MAX_BATCHES,
+    use_ste=False,
 ):
+    """Compare top-2 softmax margins clean vs. under PGD, at an explicit regime.
+
+    Previously never called ``set_ste_mode`` itself, so it ran under
+    whatever state was leftover from earlier in the run. Defaults to
+    ``False`` (hard round) to match that historical behavior, but now makes
+    the choice explicit rather than accidental.
+    """
     model.eval()
-    pgd = make_torchattack(
-        torchattacks.PGD,
-        model,
-        eps=eps,
-        alpha=PGD_ALPHA,
-        steps=steps,
-        random_start=PGD_RANDOM_START,
-    )
-    clean_margins, adv_margins = [], []
-    for bi, (x, y) in enumerate(loader):
-        if bi >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        with torch.no_grad():
-            top2 = F.softmax(model(x), dim=1).topk(2, dim=1).values
-        clean_margins.extend((top2[:, 0] - top2[:, 1]).cpu().tolist())
-        x_adv = pgd(x, y)
-        with torch.no_grad():
-            top2_adv = F.softmax(model(x_adv), dim=1).topk(2, dim=1).values
-        adv_margins.extend((top2_adv[:, 0] - top2_adv[:, 1]).cpu().tolist())
+    with ste_mode(model, use_ste):
+        pgd = make_torchattack(
+            torchattacks.PGD,
+            model,
+            eps=eps,
+            alpha=PGD_ALPHA,
+            steps=steps,
+            random_start=PGD_RANDOM_START,
+        )
+        clean_margins, adv_margins = [], []
+        for bi, (x, y) in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x, y = x.to(device), y.to(device)
+            with torch.no_grad():
+                top2 = F.softmax(model(x), dim=1).topk(2, dim=1).values
+            clean_margins.extend((top2[:, 0] - top2[:, 1]).cpu().tolist())
+            x_adv = pgd(x, y)
+            with torch.no_grad():
+                top2_adv = F.softmax(model(x_adv), dim=1).topk(2, dim=1).values
+            adv_margins.extend((top2_adv[:, 0] - top2_adv[:, 1]).cpu().tolist())
     return {"clean_margins": clean_margins, "adv_margins": adv_margins}
 
 
@@ -1086,6 +1188,21 @@ def run_epsilon_sweep_for_model(
     `count_quant_layers_fn` and `safe_set` are injected by the caller so this
     module does not need to import the quantization/report-plumbing code.
     Falls back to local, dependency-free implementations if not provided.
+
+    ``PGD_acc`` is explicitly computed under hard rounding (``use_ste=False``)
+    — this used to be *ambient*: whatever ``use_ste`` was left at by
+    ``run_suite``'s earlier attacks by the time the sweep ran, with no
+    guarantee it was False. For quantized models this is the number that,
+    if it tracks ``Random_Noise_acc`` instead of dropping as epsilon grows,
+    is showing you gradient masking, not robustness.
+
+    ``PGD_ste_acc`` is the same sweep with the masking bypassed (single
+    restart, matching ``PGD_acc``'s budget), so you can read the masking
+    gap directly off this table without cross-referencing ``BPDA_acc``.
+    ``BPDA_acc`` is kept for compatibility and now uses a restart budget
+    (``n_restarts=1``) matched to ``PGD_acc``/``PGD_ste_acc`` rather than
+    the previous mismatched default, so any gap you see is attributable to
+    the gradient regime and not to a bigger attack budget.
     """
     if safe_set is None:
 
@@ -1103,19 +1220,34 @@ def run_epsilon_sweep_for_model(
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
 
-        def run_pgd_sweep():
-            pgd = make_torchattack(
-                torchattacks.PGD,
-                model,
-                eps=eps,
-                alpha=PGD_ALPHA,
-                steps=PGD_STEPS,
-                random_start=PGD_RANDOM_START,
-            )
-            return accuracy_under_attack(model, loader, pgd)
+        def run_pgd_sweep(use_ste):
+            with ste_mode(model, use_ste):
+                pgd = make_torchattack(
+                    torchattacks.PGD,
+                    model,
+                    eps=eps,
+                    alpha=PGD_ALPHA,
+                    steps=PGD_STEPS,
+                    random_start=PGD_RANDOM_START,
+                )
+                return accuracy_under_attack(model, loader, pgd)
 
         context = f"{name} eps={eps:.4f}"
-        safe_set(row, "PGD_acc", run_pgd_sweep, "PGD sweep failed", context=context)
+        safe_set(
+            row,
+            "PGD_acc",
+            lambda: run_pgd_sweep(False),
+            "PGD (hard-round) sweep failed",
+            context=context,
+        )
+        if is_quant:
+            safe_set(
+                row,
+                "PGD_ste_acc",
+                lambda: run_pgd_sweep(True),
+                "PGD (STE) sweep failed",
+                context=context,
+            )
         safe_set(
             row,
             "Random_Noise_acc",
@@ -1127,9 +1259,7 @@ def run_epsilon_sweep_for_model(
             safe_set(
                 row,
                 "BPDA_acc",
-                lambda: _run_bpda_once(
-                    model, loader, eps=eps, n_restarts=BPDA_RESTARTS_SWEEP
-                ),
+                lambda: _run_bpda_once(model, loader, eps=eps, n_restarts=1),
                 "BPDA sweep failed",
                 context=context,
             )
