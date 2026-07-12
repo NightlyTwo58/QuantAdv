@@ -192,12 +192,17 @@ def _hard_or_ste(fake_quantizer, tensor, use_ste):
     quantized = fake_quantizer(tensor)
     return quantized if use_ste else quantized.detach()
 
-def quantize_tensor(t: torch.Tensor, bits: int, alpha: int):
+def quantize_tensor(t: torch.Tensor, bits: int, alpha: int | None = None):
     """
     Quantizes a tensor t to a given number of bits through
     scale quantization. See https://arxiv.org/pdf/2004.09602
     """
     max: int = 2 ** (bits - 1) - 1
+
+    # Rescale to 0-1 range by default if no alpha is specified.
+    if alpha is None:
+        alpha = max
+
     scale: float = max / alpha
     return torch.clamp(torch.round(scale * t), min=-max, max=max)
 
