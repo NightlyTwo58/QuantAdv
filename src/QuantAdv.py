@@ -14,12 +14,12 @@ import json
 import traceback
 import sys
 import warnings
-import math
 import time
 import threading
 import psutil
 from torch.amp import autocast, GradScaler
 
+from torchao.quantization.qat import IntxFakeQuantizeConfig, IntxFakeQuantizer
 from pytorchcv.model_provider import get_model as ptcv_get_model
 
 import torchattacks
@@ -27,6 +27,7 @@ from autoattack import AutoAttack
 
 import defense as dfn
 import data as report_data
+import stats as qstats
 
 import sys
 from pathlib import Path
@@ -39,27 +40,36 @@ from config import *
 from ResourceMonitor import ResourceMonitor
 from attack import *
 
-"""
-Actively developed analysis of metrics of attacks per model and eplison
+"""QuantAdv experiment runner for quantization and adversarial robustness.
+
+This module builds FP32, post-training quantized, quantization-aware trained,
+and optional defended CIFAR-10 models, then evaluates them with white-box,
+transfer, adaptive, black-box, and diagnostic attacks.  Quantized layers are
+fake-quantized float modules: they simulate integer rounding during forward
+passes while optionally using straight-through gradients for attacks and QAT.
 """
 
 
 def csv_path(model_name, type):
+    """Return the per-model CSV path for an experiment artifact family."""
     return os.path.join(DATA_DIR, f"{type}_{model_name}.csv")
 
 
 def json_path(model_name, type):
+    """Return the per-model JSON path for an experiment artifact family."""
     return os.path.join(DATA_DIR, f"{type}_{model_name}.json")
 
 
 def defense_summary_csv_path():
+    """Return the aggregate defense-summary CSV path."""
     return os.path.join(DATA_DIR, "defense_summary.csv")
 
 
 def check_environment():
+    """Validate runtime packages and local CIFAR-10 data before a full run."""
     missing = [
         pkg
-        for pkg in ("torchattacks", "autoattack", "pytorchcv")
+        for pkg in ("torchattacks", "autoattack", "pytorchcv", "torchao")
         if importlib.util.find_spec(pkg) is None
     ]
     if missing:
@@ -75,6 +85,7 @@ def check_environment():
 def get_dataloaders(
     batch_size=DEFAULT_BATCH_SIZE, eval_n=DEFAULT_EVAL_N, finetune_n=DEFAULT_FINETUNE_N
 ):
+    """Build CIFAR-10 fine-tuning and evaluation loaders from fixed subsets."""
     transform_train = T.Compose(
         [
             T.RandomCrop(CIFAR_IMAGE_SIZE, padding=CIFAR_RANDOM_CROP_PADDING),
@@ -121,6 +132,7 @@ def get_dataloaders(
 
 
 def load_pretrained(arch_key):
+    """Load a supported pretrained CIFAR-10 architecture onto the active device."""
     if arch_key != "ResNet56":
         raise ValueError(f"Unsupported architecture {arch_key!r}; expected 'ResNet56'.")
     if ptcv_get_model is None:
@@ -133,18 +145,22 @@ def load_pretrained(arch_key):
 
 
 def sanity_check_accuracy(model, loader):
+    """Compute clean accuracy with the same evaluation path as attack metrics."""
     model.eval()
     return accuracy_from_adv_fn(model, loader, use_autocast=True)
 
 
-class FakeQuantSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return torch.round(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
+def _torchao_int_dtype(bits):
+    """Return TorchAO's integer dtype corresponding to the requested bit width."""
+    if bits == 8:
+        return torch.int8
+    dtype = getattr(torch, f"int{bits}", None)
+    if dtype is None:
+        raise RuntimeError(
+            f"This PyTorch build does not expose torch.int{bits}; upgrade PyTorch/TorchAO "
+            f"to use {bits}-bit TorchAO fake quantization."
+        )
+    return dtype
 
 
 def quantize_tensor(t: torch.Tensor, bits: int, alpha: int):
@@ -155,8 +171,38 @@ def quantize_tensor(t: torch.Tensor, bits: int, alpha: int):
     max: int = 2 ** (bits - 1) - 1
     scale: float = max / alpha
     return torch.clamp(torch.round(scale * t), min=-max, max=max)
+def _make_torchao_fake_quantizer(bits, *, role):
+    """Build TorchAO fake quantization for a weight or activation tensor.
+    """
+    if role == "activation":
+        config = IntxFakeQuantizeConfig(
+            dtype=_torchao_int_dtype(bits),
+            granularity="per_token",
+            is_symmetric=False,
+            is_dynamic=True,
+            eps=QUANT_SCALE_MIN,
+        )
+    elif role == "weight":
+        config = IntxFakeQuantizeConfig(
+            dtype=_torchao_int_dtype(bits),
+            granularity="per_channel",
+            is_symmetric=True,
+            is_dynamic=True,
+            eps=QUANT_SCALE_MIN,
+        )
+    else:
+        raise ValueError(f"Unknown fake-quantizer role: {role!r}")
+    return IntxFakeQuantizer(config)
+
+
+def _hard_or_ste(fake_quantizer, tensor, use_ste):
+    """Use TorchAO numerics while selecting STE or true hard-round gradients."""
+    quantized = fake_quantizer(tensor)
+    return quantized if use_ste else quantized.detach()
+
 
 def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP):
+    """Create a deterministic chaotic sequence with the same shape as ``t``."""
     n = t.numel()
     if n == 0:
         return torch.empty_like(t)
@@ -176,50 +222,86 @@ def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP
 
 
 def chaotic_quantize_tensor(
-    t, bits, use_ste, quantize=True, dither_amplitude=CHAOTIC_QUANT_DITHER
+    t,
+    bits,
+    use_ste,
+    fake_quantizer,
+    quantize=True,
+    dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
+    """Apply subtractive chaotic dither around a TorchAO fake quantizer."""
     if bits is None or not quantize:
         return t
-    qmax = 2 ** (bits - 1) - 1
-    scale = torch.clamp(t.detach().abs().max() / qmax, min=QUANT_SCALE_MIN)
     chaos = chaotic_sequence_like(t)
-    dither = (chaos - 0.5) * dither_amplitude
-    t_scaled = t / scale + dither
-    t_round = FakeQuantSTE.apply(t_scaled) if use_ste else torch.round(t_scaled)
-    t_round = torch.clamp(t_round, -qmax - 1, qmax)
-    return (t_round - dither) * scale
+    # Dither is expressed in units of the tensor's dynamic range. TorchAO
+    # selects the actual scale/zero-point according to the configured scheme.
+    amplitude = t.detach().abs().amax().clamp_min(QUANT_SCALE_MIN)
+    dither = (chaos - 0.5) * dither_amplitude * amplitude
+    quantized = fake_quantizer(t + dither) - dither
+    return quantized if use_ste else quantized.detach()
 
 
 class _QuantizedLayerMixin:
+    """Shared TorchAO fake-quantization controls for Conv2d/Linear wrappers."""
+
     chaotic = False
 
-    def _quant_params(self):
-        bits = getattr(self, "bits", None)
-        use_ste = getattr(self, "use_ste", QUANT_DEFAULT_USE_STE)
-        quant_weight = getattr(self, "quant_weight", QUANT_DEFAULT_WEIGHT)
-        quant_act = getattr(self, "quant_act", QUANT_DEFAULT_ACT)
-        return bits, use_ste, quant_weight, quant_act
+    def _init_quantizers(self, bits):
+        self.bits = bits
+        self.weight_fake_quantizer = _make_torchao_fake_quantizer(bits, role="weight")
+        self.activation_fake_quantizer = _make_torchao_fake_quantizer(bits, role="activation")
 
-    def _quantize(self, t, bits, use_ste, enabled=True):
+    def _quant_params(self):
+        return (
+            getattr(self, "bits", None),
+            getattr(self, "use_ste", QUANT_DEFAULT_USE_STE),
+            getattr(self, "quant_weight", QUANT_DEFAULT_WEIGHT),
+            getattr(self, "quant_act", QUANT_DEFAULT_ACT),
+        )
+
+    def _quantize_weight(self, tensor, enabled):
+        if not enabled:
+            return tensor
+        original_shape = tensor.shape
+        flattened = tensor.reshape(tensor.shape[0], -1)
         if self.chaotic:
-            return chaotic_quantize_tensor(
-                t,
-                bits,
-                use_ste,
-                enabled,
+            quantized = chaotic_quantize_tensor(
+                flattened,
+                self.bits,
+                self.use_ste,
+                self.weight_fake_quantizer,
+                True,
                 getattr(self, "dither_amplitude", CHAOTIC_QUANT_DITHER),
             )
-        return quantize_tensor(t, bits, use_ste) if enabled else t
+        else:
+            quantized = _hard_or_ste(
+                self.weight_fake_quantizer, flattened, self.use_ste
+            )
+        return quantized.reshape(original_shape)
+
+    def _quantize_activation(self, tensor, enabled):
+        if not enabled:
+            return tensor
+        if self.chaotic:
+            return chaotic_quantize_tensor(
+                tensor,
+                self.bits,
+                self.use_ste,
+                self.activation_fake_quantizer,
+                True,
+                getattr(self, "dither_amplitude", CHAOTIC_QUANT_DITHER),
+            )
+        return _hard_or_ste(self.activation_fake_quantizer, tensor, self.use_ste)
 
 
 class QuantConv2d(_QuantizedLayerMixin, nn.Conv2d):
+    """Conv2d using TorchAO fake quantization for weights and output activations."""
+
     def forward(self, x):
-        bits, use_ste, quant_weight, quant_act = self._quant_params()
-        w = self._quantize(self.weight, bits, use_ste, quant_weight)
-        out = self._conv_forward(x, w, self.bias)
-        if quant_act:
-            out = self._quantize(out, bits, use_ste, quant_act)
-        return out
+        _, _, quant_weight, quant_act = self._quant_params()
+        weight = self._quantize_weight(self.weight, quant_weight)
+        out = self._conv_forward(x, weight, self.bias)
+        return self._quantize_activation(out, quant_act)
 
 
 class ChaoticQuantConv2d(QuantConv2d):
@@ -227,13 +309,13 @@ class ChaoticQuantConv2d(QuantConv2d):
 
 
 class QuantLinear(_QuantizedLayerMixin, nn.Linear):
+    """Linear using TorchAO fake quantization for weights and output activations."""
+
     def forward(self, x):
-        bits, use_ste, quant_weight, quant_act = self._quant_params()
-        w = self._quantize(self.weight, bits, use_ste, quant_weight)
-        out = F.linear(x, w, self.bias)
-        if quant_act:
-            out = self._quantize(out, bits, use_ste, quant_act)
-        return out
+        _, _, quant_weight, quant_act = self._quant_params()
+        weight = self._quantize_weight(self.weight, quant_weight)
+        out = F.linear(x, weight, self.bias)
+        return self._quantize_activation(out, quant_act)
 
 
 class ChaoticQuantLinear(QuantLinear):
@@ -248,6 +330,7 @@ def _to_quant_module(
     chaotic=False,
     dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
+    """Convert Conv2d/Linear to TorchAO-backed fake-quantized wrappers."""
     if isinstance(mod, nn.Conv2d):
         cls = ChaoticQuantConv2d if chaotic else QuantConv2d
         new = cls(
@@ -260,33 +343,30 @@ def _to_quant_module(
             mod.groups,
             mod.bias is not None,
             mod.padding_mode,
+            device=mod.weight.device,
+            dtype=mod.weight.dtype,
         )
-        new.weight = mod.weight
-        if mod.bias is not None:
-            new.bias = mod.bias
-        new.bits, new.use_ste, new.quant_weight, new.quant_act = (
-            bits,
-            QUANT_DEFAULT_USE_STE,
-            quant_weight,
-            quant_act,
-        )
-        new.dither_amplitude = dither_amplitude
-        return new
-    if isinstance(mod, nn.Linear):
+    elif isinstance(mod, nn.Linear):
         cls = ChaoticQuantLinear if chaotic else QuantLinear
-        new = cls(mod.in_features, mod.out_features, bias=mod.bias is not None)
-        new.weight = mod.weight
-        if mod.bias is not None:
-            new.bias = mod.bias
-        new.bits, new.use_ste, new.quant_weight, new.quant_act = (
-            bits,
-            QUANT_DEFAULT_USE_STE,
-            quant_weight,
-            quant_act,
+        new = cls(
+            mod.in_features,
+            mod.out_features,
+            bias=mod.bias is not None,
+            device=mod.weight.device,
+            dtype=mod.weight.dtype,
         )
-        new.dither_amplitude = dither_amplitude
-        return new
-    return None
+    else:
+        return None
+
+    new.weight = mod.weight
+    if mod.bias is not None:
+        new.bias = mod.bias
+    new._init_quantizers(bits)
+    new.use_ste = QUANT_DEFAULT_USE_STE
+    new.quant_weight = quant_weight
+    new.quant_act = quant_act
+    new.dither_amplitude = dither_amplitude
+    return new
 
 
 def _replace_recursive(
@@ -298,7 +378,7 @@ def _replace_recursive(
     dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
     for name, child in list(module.named_children()):
-        nc = _to_quant_module(
+        replacement = _to_quant_module(
             child,
             bits,
             quant_weight,
@@ -306,8 +386,8 @@ def _replace_recursive(
             chaotic=chaotic,
             dither_amplitude=dither_amplitude,
         )
-        if nc is not None:
-            setattr(module, name, nc)
+        if replacement is not None:
+            setattr(module, name, replacement)
         else:
             _replace_recursive(
                 child,
@@ -327,6 +407,7 @@ def convert_to_quant(
     chaotic=False,
     dither_amplitude=CHAOTIC_QUANT_DITHER,
 ):
+    """Return a deep-copied model backed by TorchAO fake quantizers."""
     m = copy.deepcopy(model)
     _replace_recursive(
         m,
@@ -359,9 +440,9 @@ def convert_to_chaotic_quant(
 def quantizable_layer_names(model):
     quant_types = (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
     return [
-        n
-        for n, m in model.named_modules()
-        if isinstance(m, (nn.Conv2d, nn.Linear)) and not isinstance(m, quant_types)
+        name
+        for name, mod in model.named_modules()
+        if isinstance(mod, (nn.Conv2d, nn.Linear)) and not isinstance(mod, quant_types)
     ]
 
 
@@ -400,11 +481,8 @@ def quant_layer_chunks(layer_names, n_chunks):
 
 def count_quant_layers(model):
     return sum(
-        1
-        for m in model.modules()
-        if isinstance(
-            m, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
-        )
+        isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear))
+        for mod in model.modules()
     )
 
 
@@ -420,19 +498,18 @@ def verify_quantization_layers(
         raise RuntimeError(f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers.")
     quant_count = count_quant_layers(quant_model)
     threshold = int(np.ceil(0.8 * len(fp32_layer_names)))
-    print(f"  {label} quantized layers: {quant_count}")
+    print(f"  {label} quantized layers: {quant_count}", flush=True)
     if quant_count < threshold:
         raise RuntimeError(
-            f"{arch_key} {label} replaced {quant_count}/{len(fp32_layer_names)} quantizable layers; expected at least {threshold}."
+            f"{arch_key} {label} replaced {quant_count}/{len(fp32_layer_names)} "
+            f"quantizable layers; expected at least {threshold}."
         )
     return quant_count
 
 
 def set_quant_components(model, quant_weight, quant_act):
     for mod in model.modules():
-        if isinstance(
-            mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
-        ):
+        if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
             mod.quant_weight = quant_weight
             mod.quant_act = quant_act
 
@@ -445,6 +522,7 @@ def prepare_qat(
     lr=QAT_LR,
     chaotic=False,
 ):
+    """Fine-tune a TorchAO fake-quantized copy with STE enabled."""
     m = (
         convert_to_chaotic_quant(fp32_model, bits, quant_weight=True, quant_act=True)
         if chaotic
@@ -460,38 +538,52 @@ def prepare_qat(
         momentum=QAT_MOMENTUM,
         weight_decay=QAT_WEIGHT_DECAY,
     )
-    scaler = GradScaler(device=device.type)
+    scaler = GradScaler(device=device.type, enabled=device.type == "cuda")
     for epoch in range(epochs):
         running = 0.0
-        for x, y in finetune_loader:
-            x = x.to(device)
-            y = y.to(device)
+        for batch_idx, (x, y) in enumerate(finetune_loader):
+            x = x.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+            y = y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
             opt.zero_grad(set_to_none=True)
-            with autocast(device_type=device.type):
+            with autocast(device_type=device.type, enabled=device.type == "cuda"):
                 loss = F.cross_entropy(m(x), y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             running += loss.item()
+            if batch_idx == 0 or (batch_idx + 1) % QAT_LOG_EVERY_BATCHES == 0:
+                print(
+                    f"  QAT epoch {epoch + 1}/{epochs} batch "
+                    f"{batch_idx + 1}/{len(finetune_loader)} loss {loss.item():.4f}",
+                    flush=True,
+                )
         print(
-            f"  QAT epoch {epoch+1}/{epochs} avg loss {running/len(finetune_loader):.4f}"
+            f"  QAT epoch {epoch + 1}/{epochs} avg loss "
+            f"{running / len(finetune_loader):.4f}",
+            flush=True,
         )
     set_ste_mode(m, False)
     return m.eval()
 
 
 class ImageCompressionSTE(torch.autograd.Function):
+    """Quantize pixel values with identity gradients for compression defenses."""
+
     @staticmethod
     def forward(ctx, x, bits):
+        """Apply image compression in the forward pass for input preprocessing."""
         levels = float(2**bits - 1)
         return torch.round(x * levels).div(levels)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Pass gradients through image compression unchanged."""
         return grad_output, None
 
 
 class CompressedInputModel(nn.Module):
+    """Wrap a classifier with resize and pixel-bit-depth input compression."""
+
     def __init__(
         self,
         model,
@@ -499,6 +591,7 @@ class CompressedInputModel(nn.Module):
         bits=COMPRESS_IMAGE_BITS,
         mode=COMPRESS_IMAGE_MODE,
     ):
+        """Wrap a model with differentiable image-compression preprocessing."""
         super().__init__()
         self.model = model
         self.size = size
@@ -506,6 +599,7 @@ class CompressedInputModel(nn.Module):
         self.mode = mode
 
     def forward(self, x):
+        """Compress inputs before forwarding them to the wrapped model."""
         pixels = denormalize_inputs(x).clamp(0.0, 1.0)
         if self.size and self.size < pixels.shape[-1]:
             kwargs = {"mode": self.mode}
@@ -523,6 +617,7 @@ class CompressedInputModel(nn.Module):
 def with_image_compression(
     model, size=COMPRESS_IMAGE_SIZE, bits=COMPRESS_IMAGE_BITS, mode=COMPRESS_IMAGE_MODE
 ):
+    """Return an eval-mode copy of ``model`` behind input compression."""
     return (
         CompressedInputModel(copy.deepcopy(model), size=size, bits=bits, mode=mode)
         .to(device)
@@ -530,135 +625,18 @@ def with_image_compression(
     )
 
 
-def wilson_interval(correct, total, confidence=CI_CONFIDENCE):
-    """Dependency-free Wilson score interval for a binomial proportion."""
-    if total <= 0:
-        return None, None
-    # 1.95996 is the two-sided 95% normal quantile; keep the configured
-    # confidence explicit and use statistics.NormalDist for other levels.
-    from statistics import NormalDist
-
-    z = NormalDist().inv_cdf(0.5 + confidence / 2)
-    p = correct / total
-    denom = 1 + z * z / total
-    centre = (p + z * z / (2 * total)) / denom
-    radius = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denom
-    return max(0.0, centre - radius), min(1.0, centre + radius)
-
-
-def clopper_pearson_interval(correct, total, confidence=CI_CONFIDENCE):
-    """Exact binomial interval when scipy is present; Wilson is a safe fallback."""
-    if total <= 0:
-        return None, None
-    try:
-        from scipy.stats import beta
-
-        alpha = 1 - confidence
-        low = (
-            0.0
-            if correct == 0
-            else float(beta.ppf(alpha / 2, correct, total - correct + 1))
-        )
-        high = (
-            1.0
-            if correct == total
-            else float(beta.ppf(1 - alpha / 2, correct + 1, total - correct))
-        )
-        return low, high
-    except ImportError:
-        return wilson_interval(correct, total, confidence)
-
-
-def add_binomial_statistics(results, metric, correct_vector):
-    vector = np.asarray(correct_vector, dtype=bool)
-    n = int(vector.size)
-    k = int(vector.sum())
-    wlo, whi = wilson_interval(k, n)
-    clo, chi = clopper_pearson_interval(k, n)
-    results.update(
-        {
-            f"{metric}_n": n,
-            f"{metric}_correct": k,
-            f"{metric}_wilson_low": wlo,
-            f"{metric}_wilson_high": whi,
-            f"{metric}_wilson_pm": (whi - wlo) / 2 if wlo is not None else None,
-            f"{metric}_cp_low": clo,
-            f"{metric}_cp_high": chi,
-            f"{metric}_cp_pm": (chi - clo) / 2 if clo is not None else None,
-        }
-    )
-
-
-def mcnemar_exact(vector_a, vector_b):
-    """Two-sided exact McNemar test over paired correctness outcomes."""
-    a = np.asarray(vector_a, dtype=bool)
-    b = np.asarray(vector_b, dtype=bool)
-    if a.shape != b.shape:
-        raise ValueError(
-            f"McNemar vectors must have equal shape, got {a.shape} and {b.shape}"
-        )
-    a_only = int(np.sum(a & ~b))
-    b_only = int(np.sum(~a & b))
-    discordant = a_only + b_only
-    if discordant == 0:
-        p_value = 1.0
-    else:
-        tail = sum(math.comb(discordant, i) for i in range(min(a_only, b_only) + 1)) / (
-            2**discordant
-        )
-        p_value = min(1.0, 2.0 * tail)
-    return {
-        "a_only": a_only,
-        "b_only": b_only,
-        "discordant": discordant,
-        "p_value": p_value,
-    }
-
-
-def save_correctness_vectors(model_name, vectors):
-    os.makedirs(PER_EXAMPLE_DIR, exist_ok=True)
-    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in model_name)
-    path = os.path.join(PER_EXAMPLE_DIR, f"{safe_name}.npz")
-    np.savez_compressed(
-        path, **{key: np.asarray(value, dtype=bool) for key, value in vectors.items()}
-    )
-    return path
-
-
 def add_paired_fp32_mcnemar_tests(df_results):
     """Post-hoc paired tests between each variant and its architecture's FP32 model."""
-    if "correctness_vectors_path" not in df_results:
-        return df_results
-    for idx, row in df_results.iterrows():
-        model_name = str(row["model"])
-        architecture = model_name.split("_", 1)[0]
-        baseline_rows = df_results[
-            df_results["model"].astype(str) == f"{architecture}_FP32"
-        ]
-        if baseline_rows.empty or not isinstance(
-            row.get("correctness_vectors_path"), str
-        ):
-            continue
-        baseline_path = baseline_rows.iloc[0].get("correctness_vectors_path")
-        if not isinstance(baseline_path, str) or not os.path.exists(baseline_path):
-            continue
-        if not os.path.exists(row["correctness_vectors_path"]):
-            continue
-        with np.load(baseline_path) as baseline, np.load(
-            row["correctness_vectors_path"]
-        ) as variant:
-            for metric in sorted(set(baseline.files) & set(variant.files)):
-                test = mcnemar_exact(baseline[metric], variant[metric])
-                prefix = f"McNemar_vs_FP32_{metric}"
-                for key, value in test.items():
-                    df_results.loc[idx, f"{prefix}_{key}"] = value
-    return df_results
+    return qstats.add_paired_mcnemar_tests(
+        df_results, baseline_name=qstats.fp32_baseline_name
+    )
 
 
 def gradient_diagnostics(
     model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX_BATCHES
 ):
-    set_ste_mode(model, False)
+    """Ground-truth masking check: compare hard-round vs. STE input gradients.
+    """
     frac_zero_hard, norm_hard = [], []
     frac_zero_ste, norm_ste = [], []
     cos_sims = []
@@ -666,19 +644,18 @@ def gradient_diagnostics(
         if bi >= max_batches:
             break
         x, y = x.to(device), y.to(device)
-        set_ste_mode(model, False)
-        x_in = x.clone().requires_grad_(True)
-        loss = F.cross_entropy(model(x_in), y)
-        g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+        with ste_mode(model, False):
+            x_in = x.clone().requires_grad_(True)
+            loss = F.cross_entropy(model(x_in), y)
+            g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
         frac_zero_hard.append(
             (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
         )
         norm_hard.append(g_hard.norm().item())
-        set_ste_mode(model, True)
-        x_in2 = x.clone().requires_grad_(True)
-        loss2 = F.cross_entropy(model(x_in2), y)
-        g_ste = torch.autograd.grad(loss2, x_in2)[0].flatten()
-        set_ste_mode(model, False)
+        with ste_mode(model, True):
+            x_in2 = x.clone().requires_grad_(True)
+            loss2 = F.cross_entropy(model(x_in2), y)
+            g_ste = torch.autograd.grad(loss2, x_in2)[0].flatten()
         frac_zero_ste.append((g_ste.abs() < GRAD_ZERO_THRESHOLD).float().mean().item())
         norm_ste.append(g_ste.norm().item())
         if fp32_ref is not None:
@@ -701,6 +678,7 @@ def gradient_diagnostics(
 
 
 def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BATCHES):
+    """Collect per-layer gradient statistics for a model and loader."""
     quant_layers = [
         (n, m)
         for n, m in model.named_modules()
@@ -710,7 +688,9 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
     handles = []
 
     def make_hook(name):
+        """Create a backward hook that records gradient statistics for one layer."""
         def hook(module, grad_input, grad_output):
+            """Record gradient statistics emitted by a backward hook."""
             gi = grad_input[0]
             if gi is not None:
                 norms[name].append(gi.flatten(1).norm(dim=1).mean().item())
@@ -720,20 +700,19 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
     try:
         for n, m in quant_layers:
             handles.append(m.register_full_backward_hook(make_hook(n)))
-        set_ste_mode(model, use_ste)
         model.eval()
-        for bi, (x, y) in enumerate(loader):
-            if bi >= max_batches:
-                break
-            x, y = x.to(device), y.to(device)
-            x = x.clone().requires_grad_(True)
-            loss = F.cross_entropy(model(x), y)
-            model.zero_grad(set_to_none=True)
-            loss.backward()
+        with ste_mode(model, use_ste):
+            for bi, (x, y) in enumerate(loader):
+                if bi >= max_batches:
+                    break
+                x, y = x.to(device), y.to(device)
+                x = x.clone().requires_grad_(True)
+                loss = F.cross_entropy(model(x), y)
+                model.zero_grad(set_to_none=True)
+                loss.backward()
     finally:
         for h in handles:
             h.remove()
-        set_ste_mode(model, False)
     ordered_names = [n for n, _ in quant_layers]
     return {
         n: (float(np.mean(norms[n])) if len(norms[n]) else None) for n in ordered_names
@@ -741,6 +720,22 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
 
 
 def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
+    """Evaluate which quantized components are responsible for observed effects.
+
+    The rows distinguish three interpretations of "testing quantized":
+    weight-only quantization, activation-only quantization, and both together.
+    For each interpretation the experiment reports ordinary hard-round PGD and
+    a budget-matched STE/BPDA PGD.  A large hard-PGD vs STE-PGD gap is evidence
+    of gradient masking, not evidence that quantization itself improves
+    robustness.
+
+    Weight quantization alone cannot produce this gap: rounding a weight
+    doesn't touch the gradient path back to the input (the conv/linear op is
+    still linear in ``x`` for whatever rounded weight value it has), so
+    ``weight_only`` should show ``frac_zero_grad_hard`` near the background
+    rate and a small hard-vs-STE gap. Only ``act_only``/``both`` quantize a
+    tensor that ``x`` actually flows through, so only those can mask.
+    """
     configs = [
         ("weight_only", True, False),
         ("act_only", False, True),
@@ -750,22 +745,45 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     for label, qw, qa in configs:
         set_quant_components(model, qw, qa)
         clean_acc = sanity_check_accuracy(model, loader)
-        torch.manual_seed(0)
-        pgd = make_torchattack(
-            torchattacks.PGD,
+
+        with ste_mode(model, False):
+            torch.manual_seed(0)
+            pgd_hard = make_torchattack(
+                torchattacks.PGD,
+                model,
+                eps=eps,
+                alpha=PGD_ALPHA,
+                steps=PGD_STEPS,
+                random_start=PGD_RANDOM_START,
+            )
+            pgd_hard_acc = accuracy_under_attack(model, loader, pgd_hard)
+
+            x, y = next(iter(loader))
+            x, y = x.to(device), y.to(device)
+            x_in = x.clone().requires_grad_(True)
+            loss = F.cross_entropy(model(x_in), y)
+            g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+            frac_zero = (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
+
+        with ste_mode(model, True):
+            torch.manual_seed(0)
+            pgd_ste = make_torchattack(
+                torchattacks.PGD,
+                model,
+                eps=eps,
+                alpha=PGD_ALPHA,
+                steps=PGD_STEPS,
+                random_start=PGD_RANDOM_START,
+            )
+            pgd_ste_acc = accuracy_under_attack(model, loader, pgd_ste)
+
+        bpda = run_bpda(
             model,
+            loader,
             eps=eps,
-            alpha=PGD_ALPHA,
-            steps=PGD_STEPS,
-            random_start=PGD_RANDOM_START,
+            n_restarts=1,
+            seeds=SEEDS[:1],
         )
-        pgd_acc = accuracy_under_attack(model, loader, pgd)
-        x, y = next(iter(loader))
-        x, y = x.to(device), y.to(device)
-        x_in = x.clone().requires_grad_(True)
-        loss = F.cross_entropy(model(x_in), y)
-        g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
-        frac_zero = (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
         rows.append(
             {
                 "model": name,
@@ -773,7 +791,22 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
                 "quant_weight": qw,
                 "quant_act": qa,
                 "clean_acc": clean_acc,
-                "PGD_acc": pgd_acc,
+                "PGD_acc": pgd_hard_acc,
+                "PGD_hard_acc": pgd_hard_acc,
+                "PGD_ste_acc": pgd_ste_acc,
+                "BPDA_acc": bpda["BPDA_PGD"],
+                "BPDA_mean": bpda["BPDA_PGD_mean"],
+                "BPDA_std": bpda["BPDA_PGD_std"],
+                "PGD_minus_STE": (
+                    pgd_hard_acc - pgd_ste_acc
+                    if pgd_hard_acc is not None and pgd_ste_acc is not None
+                    else None
+                ),
+                "PGD_minus_BPDA": (
+                    pgd_hard_acc - bpda["BPDA_PGD"]
+                    if pgd_hard_acc is not None and bpda["BPDA_PGD"] is not None
+                    else None
+                ),
                 "frac_zero_grad_hard": frac_zero,
             }
         )
@@ -786,10 +819,11 @@ def run_chunk_quantization_attacks(
     fp32_model,
     loader,
     name,
-    bits=QAT_BITS,
+    bits=8,
     n_chunks=CHUNK_QUANT_NUM_CHUNKS,
     eps=DEFAULT_EPS,
 ):
+    """Evaluate attacks as contiguous chunks of layers are quantized."""
     layer_names = quantizable_layer_names(fp32_model)
     chunks = quant_layer_chunks(layer_names, n_chunks)
     rows = []
@@ -850,11 +884,13 @@ def safe_call(
 
 
 def safe_set(target, key, fn, warning, *, context=None, default=None):
+    """Run a metric function and store its value with warning-based fallback."""
     target[key] = safe_call(fn, warning, context=context, default=default)
     return target[key]
 
 
 def safe_update(target, fn, warning, *, context=None, defaults=None):
+    """Merge a metric dictionary into a target dictionary with warning fallback."""
     update = safe_call(fn, warning, context=context, default=None)
     if update is not None:
         target.update(update)
@@ -870,6 +906,7 @@ def safe_update(target, fn, warning, *, context=None, defaults=None):
 
 
 def safe_set_vector(results, vectors, metric, fn, warning, *, context=None):
+    """Run a vector-producing metric and store values plus correctness vectors."""
     pair = safe_call(fn, warning, context=context, default=None)
     if pair is None:
         results[metric] = None
@@ -879,6 +916,7 @@ def safe_set_vector(results, vectors, metric, fn, warning, *, context=None):
 
 
 def safe_update_vectors(results, vectors, fn, warning, *, context=None, defaults=None):
+    """Merge metric and vector outputs into their destination dictionaries."""
     update = safe_call(fn, warning, context=context, default=None)
     if update is None:
         if defaults:
@@ -890,11 +928,13 @@ def safe_update_vectors(results, vectors, fn, warning, *, context=None, defaults
 
 
 def save_json(path, data, *, indent=None):
+    """Serialize a Python object as pretty-printed JSON."""
     with open(path, "w") as handle:
         json.dump(data, handle, indent=indent)
 
 
 def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
+    """Run the full attack and diagnostic suite for one model."""
     model.eval()
     results = {"model": name}
     vectors = {}
@@ -911,7 +951,9 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     safe_update_vectors(
         results,
         vectors,
-        lambda: run_fgsm_pgd(model, loader, eps=eps, return_vectors=True),
+        lambda: run_fgsm_pgd(
+            model, loader, eps=eps, return_vectors=True, use_ste=False
+        ),
         "FGSM/PGD failed",
         context=name,
         defaults={"FGSM": None, "PGD": None},
@@ -920,14 +962,18 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         results,
         vectors,
         "AutoAttack",
-        lambda: run_autoattack(model, loader, eps=eps, return_vector=True),
+        lambda: run_autoattack(
+            model, loader, eps=eps, return_vector=True, use_ste=False
+        ),
         "AutoAttack failed",
         context=name,
     )
     if RUN_EXTRA_WHITEBOX_ATTACKS:
         safe_update(
             results,
-            lambda: run_extra_whitebox_attacks(model, loader, eps=eps),
+            lambda: run_extra_whitebox_attacks(
+                model, loader, eps=eps, use_ste=False
+            ),
             "CW/DeepFool/JSMA failed",
             context=name,
         )
@@ -953,7 +999,12 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             vectors,
             "Transfer_from_FP32",
             lambda: transfer_attack(
-                fp32_ref, model, loader, eps=eps, return_vector=True
+                fp32_ref,
+                model,
+                loader,
+                eps=eps,
+                return_vector=True,
+                use_ste=False,
             ),
             "transfer_attack failed",
             context=name,
@@ -963,7 +1014,12 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             vectors,
             "MIM_Transfer",
             lambda: transfer_attack_mim(
-                fp32_ref, model, loader, eps=eps, return_vector=True
+                fp32_ref,
+                model,
+                loader,
+                eps=eps,
+                return_vector=True,
+                use_ste=False,
             ),
             "MIM transfer_attack failed",
             context=name,
@@ -980,14 +1036,18 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             safe_set(
                 results,
                 "Transfer_to_FP32",
-                lambda: transfer_attack(model, fp32_ref, loader, eps=eps),
+                lambda: transfer_attack(
+                    model, fp32_ref, loader, eps=eps, use_ste=False
+                ),
                 "reverse transfer_attack failed",
                 context=name,
             )
             safe_set(
                 results,
                 "MIM_Transfer_to_FP32",
-                lambda: transfer_attack_mim(model, fp32_ref, loader, eps=eps),
+                lambda: transfer_attack_mim(
+                    model, fp32_ref, loader, eps=eps, use_ste=False
+                ),
                 "reverse MIM transfer_attack failed",
                 context=name,
             )
@@ -1031,7 +1091,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
                 model,
                 loader,
                 eps=eps,
-                n_restarts=BPDA_RESTARTS_SUITE,
+                n_restarts=1,
                 return_vector=True,
             ),
             "BPDA failed",
@@ -1097,6 +1157,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             )
 
         def save_pgd_ablation():
+            """Persist PGD step-ablation diagnostics for the current model."""
             ablation = pgd_steps_ablation(model, loader, eps=eps)
             pd.DataFrame(
                 [{"model": name, "steps": k, "acc": v} for k, v in ablation.items()]
@@ -1106,6 +1167,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         if RUN_PGD_TRAJECTORY:
 
             def save_trajectory():
+                """Persist PGD trajectory diagnostics for the current model."""
                 traj = pgd_trajectory_diagnostics(
                     model, loader, eps=eps, max_batches=TRAJECTORY_MAX_BATCHES
                 )
@@ -1117,6 +1179,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         if RUN_LAYERWISE_PROFILE:
 
             def save_layerwise_profile():
+                """Persist layerwise gradient diagnostics for the current model."""
                 prof_hard = layerwise_grad_profile(model, loader, use_ste=False)
                 prof_ste = layerwise_grad_profile(model, loader, use_ste=True)
                 rows = [
@@ -1137,6 +1200,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         if RUN_COMPONENT_ABLATION:
 
             def save_component_ablation():
+                """Persist quantization component-ablation diagnostics for the current model."""
                 rows = run_quant_component_ablation(model, loader, name, eps=eps)
                 pd.DataFrame(rows).to_csv(
                     csv_path(name, "component_ablation"), index=False
@@ -1150,6 +1214,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         if RUN_CONFIDENCE_MARGIN:
 
             def save_confidence_margins():
+                """Persist confidence-margin diagnostics for the current model."""
                 margins = confidence_margin_diagnostic(
                     model, loader, eps=eps, max_batches=MARGIN_MAX_BATCHES
                 )
@@ -1161,18 +1226,23 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
                 context=name,
             )
     for metric, vector in vectors.items():
-        add_binomial_statistics(results, metric, vector)
+        qstats.add_binomial_statistics(
+            results, metric, vector, confidence=CI_CONFIDENCE
+        )
     if "PGD" in vectors and "BPDA_PGD" in vectors:
-        test = mcnemar_exact(vectors["PGD"], vectors["BPDA_PGD"])
+        test = qstats.mcnemar_exact(vectors["PGD"], vectors["BPDA_PGD"])
         results.update(
             {f"McNemar_PGD_vs_BPDA_{key}": value for key, value in test.items()}
         )
     if vectors:
-        results["correctness_vectors_path"] = save_correctness_vectors(name, vectors)
+        results["correctness_vectors_path"] = qstats.save_correctness_vectors(
+            name, vectors, PER_EXAMPLE_DIR
+        )
     return results
 
 
 def run_epsilon_sweep_for_model_wrapped(model, loader, name, epsilons):
+    """Run and annotate an epsilon sweep for one named model."""
     return run_epsilon_sweep_for_model(
         model,
         loader,
@@ -1184,18 +1254,21 @@ def run_epsilon_sweep_for_model_wrapped(model, loader, name, epsilons):
 
 
 def run_defense_suite(model_registry, finetune_loader, eval_loader):
+    """Build defended models and evaluate them under adaptive attacks."""
     summary_rows = []
     arch_keys = sorted(
         {name.split("_FP32")[0] for name in model_registry if name.endswith("_FP32")}
     )
     for arch_key in arch_keys:
         fp32_entry = model_registry.get(f"{arch_key}_FP32")
-        qat_entry = model_registry.get(f"{arch_key}_int8_QAT")
+        int8_qat_entry = model_registry.get(f"{arch_key}_int8_QAT")
+        int4_qat_entry = model_registry.get(f"{arch_key}_int4_QAT")
         if fp32_entry is None:
             continue
         fp32_model = fp32_entry[0]
 
         def add_fp32_at():
+            """Add the adversarially trained FP32 defense to the registry when available."""
             fp32_at = dfn.prepare_adversarial_training(
                 fp32_model, finetune_loader, bits=None
             )
@@ -1210,8 +1283,9 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
         )
 
         def add_int8_at():
+            """Add the adversarially trained INT8 defense to the registry when available."""
             int8_at = dfn.prepare_adversarial_training(
-                fp32_model, finetune_loader, bits=QAT_BITS
+                fp32_model, finetune_loader, bits=8
             )
             model_registry[f"{arch_key}_int8_QAT_AT"] = (int8_at, fp32_model)
 
@@ -1223,8 +1297,10 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
             level="FAIL",
         )
         wrap_targets = [("FP32", fp32_model)]
-        if qat_entry is not None:
-            wrap_targets.append(("int8_QAT", qat_entry[0]))
+        if int8_qat_entry is not None:
+            wrap_targets.append(("int8_QAT", int8_qat_entry[0]))
+        if int4_qat_entry is not None:
+            wrap_targets.append(("int4_QAT", int4_qat_entry[0]))
         detector = safe_call(
             lambda: dfn.train_adversarial_detector(fp32_model, finetune_loader),
             "adversarial detector training failed",
@@ -1236,6 +1312,7 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
             entry_name = f"{arch_key}_{tag}"
 
             def add_sanitized():
+                """Add the input-sanitization defense to the registry."""
                 sanitized = dfn.SanitizedModel(base_model).to(device).eval()
                 model_registry[f"{entry_name}_Sanitized"] = (sanitized, fp32_model)
 
@@ -1244,6 +1321,7 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
             )
 
             def add_smoothed():
+                """Add the randomized-smoothing defense to the registry."""
                 smoothed = dfn.SmoothedModel(base_model).to(device).eval()
                 model_registry[f"{entry_name}_Smoothed"] = (smoothed, fp32_model)
                 cert_stats = dfn.run_certified_accuracy(smoothed, eval_loader)
@@ -1264,6 +1342,7 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
             )
 
             def add_guardrail():
+                """Add the confidence guardrail defense to the registry."""
                 guardrail = dfn.GuardrailModel(base_model).to(device).eval()
                 model_registry[f"{entry_name}_Guardrail"] = (guardrail, fp32_model)
                 pgd_for_flagging = make_torchattack(
@@ -1291,6 +1370,7 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
             if detector is not None:
 
                 def add_detect_guard():
+                    """Add the detector-based guardrail defense to the registry."""
                     detect_guard = (
                         dfn.DetectGuardModel(base_model, detector).to(device).eval()
                     )
@@ -1327,16 +1407,19 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
 
 
 def _palette_for(values):
+    """Choose a plotting palette sized to the provided values."""
     return {v: ATTACK_PALETTE[v] for v in values if v in ATTACK_PALETTE}
 
 
 def parallelize(model):
+    """Wrap a model in DataParallel when multiple CUDA devices are available."""
     if torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel):
         return nn.DataParallel(model)
     return model
 
 
-def run_chaotic_dither_sweep(fp32_model, loader, arch_key, bits=QAT_BITS):
+def run_chaotic_dither_sweep(fp32_model, loader, arch_key, bits=8):
+    """Evaluate chaotic quantization over dither-amplitude settings."""
     rows = []
     for amplitude in CHAOTIC_DITHER_AMPLITUDES:
         model = (
@@ -1413,6 +1496,7 @@ def add_general_scores(df_results):
 
 
 def main():
+    """Run the command-line entry point for this module."""
     check_environment()
     finetune_loader, eval_loader = get_dataloaders()
     model_registry = {}
@@ -1438,7 +1522,7 @@ def main():
             continue
         try:
             int8_ptq = convert_to_quant(
-                fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+                fp32, bits=8, quant_weight=True, quant_act=True
             )
             verify_quantization_layers(
                 arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names
@@ -1461,7 +1545,7 @@ def main():
         try:
             int8_qat = prepare_qat(
                 fp32,
-                bits=QAT_BITS,
+                bits=8,
                 finetune_loader=finetune_loader,
                 epochs=QAT_MAIN_EPOCHS,
             )
@@ -1471,6 +1555,21 @@ def main():
             model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
+            traceback.print_exc()
+            raise
+        try:
+            int4_qat = prepare_qat(
+                fp32,
+                bits=4,
+                finetune_loader=finetune_loader,
+                epochs=QAT_MAIN_EPOCHS,
+            )
+            verify_quantization_layers(
+                arch_key, fp32, int4_qat, "int4 QAT", fp32_layer_names
+            )
+            model_registry[f"{arch_key}_int4_QAT"] = (int4_qat, fp32)
+        except Exception as e:
+            print(f"  [FAIL] int4 QAT for {arch_key}: {e}")
             traceback.print_exc()
             raise
         if QUANTIZATION_DEBUG_ONLY:
@@ -1489,7 +1588,7 @@ def main():
         if RUN_CHAOTIC_COMPRESS:
             try:
                 chaotic_int8_ptq = convert_to_chaotic_quant(
-                    fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+                    fp32, bits=8, quant_weight=True, quant_act=True
                 )
                 model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (
                     chaotic_int8_ptq,
@@ -1510,7 +1609,7 @@ def main():
             try:
                 compressed_chaotic_int8 = with_image_compression(
                     convert_to_chaotic_quant(
-                        fp32, bits=QAT_BITS, quant_weight=True, quant_act=True
+                        fp32, bits=8, quant_weight=True, quant_act=True
                     )
                 )
                 model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (
@@ -1522,7 +1621,7 @@ def main():
             try:
                 chaotic_int8_qat = prepare_qat(
                     fp32,
-                    bits=QAT_BITS,
+                    bits=8,
                     finetune_loader=finetune_loader,
                     epochs=QAT_MAIN_EPOCHS,
                     chaotic=True,
@@ -1575,7 +1674,7 @@ def main():
                     entry[0],
                     eval_loader,
                     arch_key,
-                    bits=QAT_BITS,
+                    bits=8,
                     n_chunks=CHUNK_QUANT_NUM_CHUNKS,
                     eps=DEFAULT_EPS,
                 )
@@ -1620,6 +1719,7 @@ def main():
         sweep_done = set()
 
     def run_pending_epsilon_sweep(name, model):
+        """Run an epsilon sweep for a model that still needs one."""
         nonlocal df_sweep, sweep_done
         if not RUN_EPSILON_SWEEP:
             return
@@ -1633,6 +1733,7 @@ def main():
         print(f"\nSweeping {name} ...")
 
         def save_epsilon_sweep():
+            """Persist epsilon-sweep diagnostics for pending models."""
             nonlocal df_sweep, sweep_done
             rows = run_epsilon_sweep_for_model_wrapped(
                 model, eval_loader, name, pending_eps
@@ -1717,7 +1818,7 @@ def main():
         .set_index("Architecture")["Worst_Robust_Acc"]
     )
     df_results["Architecture"] = df_results["model"].str.replace(
-        r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT).*", "", regex=True
+        r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT|int4_QAT).*", "", regex=True
     )
     df_results["FP32_Worst_Robust_Acc"] = df_results["Architecture"].map(fp32_baseline)
     if {
@@ -1735,6 +1836,7 @@ def main():
         print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
 
     def build_reports():
+        """Combine result files and generate final report artifacts."""
         tables = report_data.combine_all(report_data.DATA_DIR)
         report_data.plot_all(tables, report_data.DATA_DIR)
         report_data.print_report(tables)

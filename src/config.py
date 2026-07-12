@@ -1,5 +1,9 @@
-"""
-Central configuration and constants for QuantAdvOld.py.
+"""Central configuration for active QuantAdv experiments.
+
+Constants in this module define dataset paths, model names, perturbation
+budgets, quantization defaults, attack settings, optional experiment switches,
+and report output locations.  Runtime modules import these values directly, so
+changes here affect both the main runner and standalone analysis scripts.
 """
 
 import logging
@@ -72,6 +76,7 @@ DEFAULT_FINETUNE_N = 10000
 DEFAULT_EVAL_BATCH_SIZE = 256
 MAX_DATA_WORKERS = 8
 PIN_MEMORY = True
+NON_BLOCKING_TRANSFER = PIN_MEMORY and device.type == "cuda"
 
 CIFAR_IMAGE_SIZE = 32
 CIFAR_RANDOM_CROP_PADDING = 4
@@ -111,7 +116,6 @@ LAYERWISE_XTICK_ROTATION = 90
 LAYERWISE_XTICK_FONT_SIZE = 6
 SUMMARY_XTICK_ROTATION = 45
 MASKING_BASELINE_LINEWIDTH = 0.8
-MASKING_SCATTER_SIZE = 80
 HEATMAP_VMIN = 0
 HEATMAP_VMAX = 1
 HEATMAP_LINEWIDTHS = 0.5
@@ -121,12 +125,12 @@ PGD_ALPHA = 2 / 255
 PGD_STEPS = 10
 PGD_RANDOM_START = True
 
-QAT_BITS = 8
 QAT_EPOCHS_DEFAULT = 3
 QAT_MAIN_EPOCHS = 10
 QAT_LR = 1e-3
 QAT_MOMENTUM = 0.9
 QAT_WEIGHT_DECAY = 5e-4
+QAT_LOG_EVERY_BATCHES = 5
 
 PTQ_BITS = (8, 4)
 
