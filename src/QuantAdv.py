@@ -163,14 +163,6 @@ def _torchao_int_dtype(bits):
     return dtype
 
 
-def quantize_tensor(t: torch.Tensor, bits: int, alpha: int):
-    """
-    Quantizes a tensor t to a given number of bits through
-    scale quantization. See https://arxiv.org/pdf/2004.09602
-    """
-    max: int = 2 ** (bits - 1) - 1
-    scale: float = max / alpha
-    return torch.clamp(torch.round(scale * t), min=-max, max=max)
 def _make_torchao_fake_quantizer(bits, *, role):
     """Build TorchAO fake quantization for a weight or activation tensor.
     """
@@ -200,6 +192,14 @@ def _hard_or_ste(fake_quantizer, tensor, use_ste):
     quantized = fake_quantizer(tensor)
     return quantized if use_ste else quantized.detach()
 
+def quantize_tensor(t: torch.Tensor, bits: int, alpha: int):
+    """
+    Quantizes a tensor t to a given number of bits through
+    scale quantization. See https://arxiv.org/pdf/2004.09602
+    """
+    max: int = 2 ** (bits - 1) - 1
+    scale: float = max / alpha
+    return torch.clamp(torch.round(scale * t), min=-max, max=max)
 
 def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP):
     """Create a deterministic chaotic sequence with the same shape as ``t``."""
