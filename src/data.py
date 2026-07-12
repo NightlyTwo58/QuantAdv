@@ -267,11 +267,14 @@ def plot_summary_results(df_results: pd.DataFrame, output: Path = PLOT_PNG) -> N
 def plot_epsilon_sweep_curves(
     df_sweep: pd.DataFrame, output: Path = SWEEP_PLOT_PNG
 ) -> None:
-    """Plot robustness metrics as a function of attack epsilon."""
+    """Plot robustness metrics as a function of attack epsilon.
+    """
     if df_sweep is None or df_sweep.empty:
         return
     value_cols = [
-        c for c in ["PGD_acc", "Random_Noise_acc", "BPDA_acc"] if c in df_sweep.columns
+        c
+        for c in ["PGD_acc", "PGD_ste_acc", "Random_Noise_acc", "BPDA_acc"]
+        if c in df_sweep.columns
     ]
     if not value_cols:
         return
@@ -439,7 +442,14 @@ def plot_layerwise_grad_profile(
 def plot_component_ablation(
     df_component: pd.DataFrame, output: Path = COMPONENT_ABLATION_PLOT_PNG
 ) -> None:
-    """Plot clean, hard-PGD, and BPDA component-ablation accuracies."""
+    """Plot clean, hard-PGD, STE-PGD, and BPDA component-ablation accuracies.
+
+    ``PGD_ste_acc`` is a budget-matched STE companion to ``PGD_acc``
+    (``PGD_hard_acc``) added alongside ``BPDA_acc``. Expect ``weight_only``
+    to show little gap between ``PGD_acc`` and ``PGD_ste_acc`` (weight
+    rounding doesn't sit on the gradient path back to the input) and
+    ``act_only``/``both`` to show a large one (activation rounding does).
+    """
     required = {"model", "config", "clean_acc", "PGD_acc"}
     if (
         df_component is None
@@ -449,7 +459,9 @@ def plot_component_ablation(
         return
 
     value_vars = [
-        c for c in ["clean_acc", "PGD_acc", "BPDA_acc"] if c in df_component.columns
+        c
+        for c in ["clean_acc", "PGD_acc", "PGD_ste_acc", "BPDA_acc"]
+        if c in df_component.columns
     ]
     df_long = df_component.melt(
         id_vars=["model", "config"],
@@ -482,41 +494,52 @@ def plot_component_ablation(
 def plot_gradient_masking_summary(
     df_results: pd.DataFrame, output: Path = MASKING_SUMMARY_PLOT_PNG
 ) -> None:
-    """Plot metrics that summarize potential gradient masking."""
+    """Plot direct evidence of gradient masking under hard-round quantization.
+    """
     if (
         df_results is None
         or df_results.empty
-        or not {"model", "PGD", "AutoAttack"}.issubset(df_results.columns)
+        or "model" not in df_results.columns
+        or "frac_zero_grad_hard" not in df_results.columns
     ):
         return
 
-    df = df_results.dropna(subset=["PGD", "AutoAttack"]).copy()
+    df = df_results.dropna(subset=["frac_zero_grad_hard"]).copy()
     if df.empty:
         return
 
-    df["PGD_minus_AutoAttack"] = df["PGD"] - df["AutoAttack"]
+    has_norms = {"grad_norm_hard", "grad_norm_ste"}.issubset(df.columns)
+    fig, axes = plt.subplots(
+        1, 2 if has_norms else 1, figsize=MASKING_SUMMARY_FIGSIZE, squeeze=False
+    )
+    axes = axes[0]
 
-    fig, axes = plt.subplots(1, 2, figsize=MASKING_SUMMARY_FIGSIZE)
-    sns.barplot(data=df, x="model", y="PGD_minus_AutoAttack", ax=axes[0])
+    sns.barplot(data=df, x="model", y="frac_zero_grad_hard", ax=axes[0])
     axes[0].axhline(0, color="black", linewidth=MASKING_BASELINE_LINEWIDTH)
+    axes[0].set_ylim(0, 1)
     axes[0].tick_params(axis="x", labelrotation=SUMMARY_XTICK_ROTATION)
-    axes[0].set_title("PGD - AutoAttack Accuracy Gap")
+    axes[0].set_title("Fraction of Zero Input Gradients (Hard Round)")
+    axes[0].set_ylabel("frac_zero_grad_hard")
     axes[0].grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
 
-    if "frac_zero_grad_hard" in df.columns and df["frac_zero_grad_hard"].notna().any():
-        df2 = df.dropna(subset=["frac_zero_grad_hard"])
-        sns.scatterplot(
-            data=df2,
-            x="frac_zero_grad_hard",
-            y="PGD_minus_AutoAttack",
-            hue="model",
-            s=MASKING_SCATTER_SIZE,
-            ax=axes[1],
-        )
-        axes[1].set_title("Masking Gap vs Fraction of Zero Gradients")
-        axes[1].grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
-    else:
-        axes[1].axis("off")
+    if has_norms:
+        df_norm = df.dropna(subset=["grad_norm_hard", "grad_norm_ste"])
+        if not df_norm.empty:
+            long = df_norm.melt(
+                id_vars="model",
+                value_vars=["grad_norm_hard", "grad_norm_ste"],
+                var_name="Regime",
+                value_name="Gradient Norm",
+            )
+            sns.barplot(
+                data=long, x="model", y="Gradient Norm", hue="Regime", ax=axes[1]
+            )
+            axes[1].set_yscale("log")
+            axes[1].tick_params(axis="x", labelrotation=SUMMARY_XTICK_ROTATION)
+            axes[1].set_title("Input Gradient Norm: Hard-Round vs STE")
+            axes[1].grid(axis="y", linestyle="--", alpha=PLOT_GRID_ALPHA)
+        else:
+            axes[1].axis("off")
 
     fig.tight_layout()
     fig.savefig(output, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
@@ -635,6 +658,19 @@ def plot_results_heatmap(
     plt.savefig(output, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.close()
     print(f"wrote {output}")
+
+
+def add_sweep_masking_metrics(df_sweep: pd.DataFrame) -> pd.DataFrame:
+    """Add an explicit masking-gap column to the epsilon-sweep table.
+    """
+    if df_sweep is None or df_sweep.empty:
+        return df_sweep
+    if {"PGD_acc", "PGD_ste_acc"}.issubset(df_sweep.columns):
+        df_sweep = df_sweep.copy()
+        df_sweep["PGD_masking_gap"] = pd.to_numeric(
+            df_sweep["PGD_acc"], errors="coerce"
+        ) - pd.to_numeric(df_sweep["PGD_ste_acc"], errors="coerce")
+    return df_sweep
 
 
 def add_derived_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -950,6 +986,7 @@ def combine_all(data_dir: Path) -> dict[str, pd.DataFrame]:
         ("sweep_*.csv", "sweepresult*.csv"),
         ["model", "epsilon"],
     )
+    df_sweep = add_sweep_masking_metrics(df_sweep)
     df_ablation = combine_ablation(
         data_dir, data_dir / Path(ABLATION_COMBINED_CSV).name
     )
