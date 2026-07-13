@@ -157,8 +157,7 @@ def _torchao_int_dtype(bits):
 
 
 def _make_torchao_fake_quantizer(bits, *, role):
-    """Build TorchAO fake quantization for a weight or activation tensor.
-    """
+    """Build TorchAO fake quantization for a weight or activation tensor."""
     if role == "activation":
         config = IntxFakeQuantizeConfig(
             dtype=_torchao_int_dtype(bits),
@@ -234,7 +233,9 @@ class _QuantizedLayerMixin:
     def _init_quantizers(self, bits):
         self.bits = bits
         self.weight_fake_quantizer = _make_torchao_fake_quantizer(bits, role="weight")
-        self.activation_fake_quantizer = _make_torchao_fake_quantizer(bits, role="activation")
+        self.activation_fake_quantizer = _make_torchao_fake_quantizer(
+            bits, role="activation"
+        )
 
     def _quant_params(self):
         return (
@@ -466,7 +467,9 @@ def quant_layer_chunks(layer_names, n_chunks):
 
 def count_quant_layers(model):
     return sum(
-        isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear))
+        isinstance(
+            mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
+        )
         for mod in model.modules()
     )
 
@@ -494,7 +497,9 @@ def verify_quantization_layers(
 
 def set_quant_components(model, quant_weight, quant_act):
     for mod in model.modules():
-        if isinstance(mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)):
+        if isinstance(
+            mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
+        ):
             mod.quant_weight = quant_weight
             mod.quant_act = quant_act
 
@@ -620,8 +625,7 @@ def add_paired_fp32_mcnemar_tests(df_results):
 def gradient_diagnostics(
     model, loader, fp32_ref=None, max_batches=GRAD_DIAG_MAX_BATCHES
 ):
-    """Ground-truth masking check: compare hard-round vs. STE input gradients.
-    """
+    """Ground-truth masking check: compare hard-round vs. STE input gradients."""
     frac_zero_hard, norm_hard = [], []
     frac_zero_ste, norm_ste = [], []
     cos_sims = []
@@ -674,6 +678,7 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
 
     def make_hook(name):
         """Create a backward hook that records gradient statistics for one layer."""
+
         def hook(module, grad_input, grad_output):
             """Record gradient statistics emitted by a backward hook."""
             gi = grad_input[0]
@@ -731,18 +736,9 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
         set_quant_components(model, qw, qa)
         clean_acc = sanity_check_accuracy(model, loader)
 
+        pgd_hard = run_pgd(model, loader, eps=eps, seeds=SEEDS)
+        pgd_hard_acc = pgd_hard["PGD"]
         with ste_mode(model, False):
-            torch.manual_seed(0)
-            pgd_hard = make_torchattack(
-                torchattacks.PGD,
-                model,
-                eps=eps,
-                alpha=PGD_ALPHA,
-                steps=PGD_STEPS,
-                random_start=PGD_RANDOM_START,
-            )
-            pgd_hard_acc = accuracy_under_attack(model, loader, pgd_hard)
-
             x, y = next(iter(loader))
             x, y = x.to(device), y.to(device)
             x_in = x.clone().requires_grad_(True)
@@ -755,7 +751,7 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
             loader,
             eps=eps,
             n_restarts=1,
-            seeds=SEEDS[:1],
+            seeds=SEEDS,
         )
         rows.append(
             {
@@ -766,6 +762,8 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
                 "clean_acc": clean_acc,
                 "PGD_acc": pgd_hard_acc,
                 "PGD_hard_acc": pgd_hard_acc,
+                "PGD_mean": pgd_hard["PGD_mean"],
+                "PGD_std": pgd_hard["PGD_std"],
                 "BPDA_acc": bpda["BPDA_PGD"],
                 "BPDA_mean": bpda["BPDA_PGD_mean"],
                 "BPDA_std": bpda["BPDA_PGD_std"],
@@ -817,15 +815,10 @@ def run_chunk_quantization_attacks(
             )
             row["clean_acc"] = None
         try:
-            pgd = make_torchattack(
-                torchattacks.PGD,
-                chunk_model,
-                eps=eps,
-                alpha=PGD_ALPHA,
-                steps=PGD_STEPS,
-                random_start=PGD_RANDOM_START,
-            )
-            row["PGD_acc"] = accuracy_under_attack(chunk_model, loader, pgd)
+            pgd = run_pgd(chunk_model, loader, eps=eps, seeds=SEEDS)
+            row["PGD_acc"] = pgd["PGD"]
+            row["PGD_mean"] = pgd["PGD_mean"]
+            row["PGD_std"] = pgd["PGD_std"]
         except Exception as e:
             print(f"  [WARN] chunk PGD failed for {name} {row['chunk_label']}: {e}")
             row["PGD_acc"] = None
@@ -938,9 +931,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     if RUN_EXTRA_WHITEBOX_ATTACKS:
         safe_update(
             results,
-            lambda: run_extra_whitebox_attacks(
-                model, loader, eps=eps, use_ste=False
-            ),
+            lambda: run_extra_whitebox_attacks(model, loader, eps=eps, use_ste=False),
             "CW/DeepFool/JSMA failed",
             context=name,
         )
@@ -1061,9 +1052,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             """Persist PGD and BPDA step-ablation diagnostics."""
             rows = []
             for attack_name, use_ste in (("PGD", False), ("BPDA_PGD", True)):
-                ablation = pgd_steps_ablation(
-                    model, loader, eps=eps, use_ste=use_ste
-                )
+                ablation = pgd_steps_ablation(model, loader, eps=eps, use_ste=use_ste)
                 rows.extend(
                     {
                         "model": name,
@@ -1236,6 +1225,20 @@ def run_epsilon_sweep_for_model_wrapped(model, loader, name, epsilons):
         epsilons,
         count_quant_layers_fn=count_quant_layers,
         safe_set=safe_set,
+    )
+
+
+def completed_sweep_keys(df_sweep):
+    """Return only rows produced by the shared seeded sweep implementation."""
+    required = {"model", "epsilon", "PGD_acc", "PGD_mean", "PGD_std"}
+    if df_sweep.empty or not required.issubset(df_sweep.columns):
+        return set()
+    complete = df_sweep[["PGD_acc", "PGD_mean", "PGD_std"]].notna().all(axis=1)
+    return set(
+        zip(
+            df_sweep.loc[complete, "model"].astype(str),
+            df_sweep.loc[complete, "epsilon"].round(6),
+        )
     )
 
 
@@ -1420,23 +1423,16 @@ def run_chaotic_dither_sweep(fp32_model, loader, arch_key, bits=8):
             .eval()
         )
         clean = sanity_check_accuracy(model, loader)
-        attack = make_torchattack(
-            torchattacks.PGD,
-            model,
-            eps=DEFAULT_EPS,
-            alpha=PGD_ALPHA,
-            steps=PGD_STEPS,
-            random_start=PGD_RANDOM_START,
-        )
-        torch.manual_seed(SEEDS[0])
-        pgd = accuracy_under_attack(model, loader, attack)
+        pgd = run_pgd(model, loader, eps=DEFAULT_EPS, seeds=SEEDS)
         rows.append(
             {
                 "model": arch_key,
                 "bits": bits,
                 "dither_amplitude": amplitude,
                 "clean_acc": clean,
-                "PGD_acc": pgd,
+                "PGD_acc": pgd["PGD"],
+                "PGD_mean": pgd["PGD_mean"],
+                "PGD_std": pgd["PGD_std"],
             }
         )
         del model
@@ -1507,9 +1503,7 @@ def main():
             traceback.print_exc()
             continue
         try:
-            int8_ptq = convert_to_quant(
-                fp32, bits=8, quant_weight=True, quant_act=True
-            )
+            int8_ptq = convert_to_quant(fp32, bits=8, quant_weight=True, quant_act=True)
             verify_quantization_layers(
                 arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names
             )
@@ -1697,9 +1691,7 @@ def main():
         run_metrics = []
     if RUN_EPSILON_SWEEP and os.path.exists(SWEEP_CSV):
         df_sweep = pd.read_csv(SWEEP_CSV)
-        sweep_done = set(
-            zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6))
-        )
+        sweep_done = completed_sweep_keys(df_sweep)
     else:
         df_sweep = pd.DataFrame()
         sweep_done = set()
@@ -1729,9 +1721,7 @@ def main():
                 df_sweep = report_data.upsert_table(
                     SWEEP_CSV, new_sweep, ["model", "epsilon"]
                 )
-                sweep_done = set(
-                    zip(df_sweep["model"].astype(str), df_sweep["epsilon"].round(6))
-                )
+                sweep_done = completed_sweep_keys(df_sweep)
 
         safe_call(
             save_epsilon_sweep,

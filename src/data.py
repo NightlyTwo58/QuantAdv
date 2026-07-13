@@ -197,14 +197,11 @@ def plot_summary_results(df_results: pd.DataFrame, output: Path = PLOT_PNG) -> N
 def plot_epsilon_sweep_curves(
     df_sweep: pd.DataFrame, output: Path = SWEEP_PLOT_PNG
 ) -> None:
-    """Plot robustness metrics as a function of attack epsilon.
-    """
+    """Plot robustness metrics as a function of attack epsilon."""
     if df_sweep is None or df_sweep.empty:
         return
     value_cols = [
-        c
-        for c in ["PGD_acc", "Random_Noise_acc", "BPDA_acc"]
-        if c in df_sweep.columns
+        c for c in ["PGD_acc", "Random_Noise_acc", "BPDA_acc"] if c in df_sweep.columns
     ]
     if not value_cols:
         return
@@ -390,9 +387,7 @@ def plot_component_ablation(
         return
 
     value_vars = [
-        c
-        for c in ["clean_acc", "PGD_acc", "BPDA_acc"]
-        if c in df_component.columns
+        c for c in ["clean_acc", "PGD_acc", "BPDA_acc"] if c in df_component.columns
     ]
     df_long = df_component.melt(
         id_vars=["model", "config"],
@@ -425,8 +420,7 @@ def plot_component_ablation(
 def plot_gradient_masking_summary(
     df_results: pd.DataFrame, output: Path = MASKING_SUMMARY_PLOT_PNG
 ) -> None:
-    """Plot direct evidence of gradient masking under hard-round quantization.
-    """
+    """Plot direct evidence of gradient masking under hard-round quantization."""
     if (
         df_results is None
         or df_results.empty
@@ -592,8 +586,7 @@ def plot_results_heatmap(
 
 
 def add_sweep_masking_metrics(df_sweep: pd.DataFrame) -> pd.DataFrame:
-    """Add an explicit masking-gap column to the epsilon-sweep table.
-    """
+    """Add an explicit masking-gap column to the epsilon-sweep table."""
     if df_sweep is None or df_sweep.empty:
         return df_sweep
     if {"PGD_acc", "BPDA_acc"}.issubset(df_sweep.columns):
@@ -645,9 +638,7 @@ def add_derived_metrics(df: pd.DataFrame) -> pd.DataFrame:
     architecture = (
         df["model"]
         .astype(str)
-        .str.replace(
-            r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT|int4_QAT).*", "", regex=True
-        )
+        .str.replace(r"_(FP32|int8_PTQ|int4_PTQ|int8_QAT|int4_QAT).*", "", regex=True)
     )
     df["Architecture"] = architecture
     if "Worst_Robust_Acc" in df:
@@ -666,9 +657,7 @@ def add_derived_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_paired_tests(df: pd.DataFrame) -> pd.DataFrame:
     """Add paired McNemar tests between each model variant and FP32 baseline."""
-    return qstats.add_paired_mcnemar_tests(
-        df, baseline_name=qstats.fp32_baseline_name
-    )
+    return qstats.add_paired_mcnemar_tests(df, baseline_name=qstats.fp32_baseline_name)
 
 
 def _read_if_present(path: Path) -> pd.DataFrame:
@@ -923,6 +912,7 @@ def combine_csv_family(data_dir: Path, family: CsvFamily) -> pd.DataFrame:
         _write(frame, output)
     return frame
 
+
 CSV_FAMILIES = {
     "results": CsvFamily(
         RESULTS_CSV,
@@ -969,6 +959,7 @@ CSV_FAMILIES = {
     ),
 }
 
+
 def combine_all(data_dir: Path) -> dict[str, pd.DataFrame]:
     """Combine all available experiment result families."""
     data_dir = Path(data_dir)
@@ -995,6 +986,7 @@ class PlotSpec:
     function: Callable[[pd.DataFrame, Path], None]
     output: str
 
+
 PLOT_SPECS = (
     PlotSpec("results", plot_summary_results, PLOT_PNG),
     PlotSpec("sweep", plot_epsilon_sweep_curves, SWEEP_PLOT_PNG),
@@ -1013,11 +1005,14 @@ PLOT_SPECS = (
     PlotSpec("defense", plot_defense_comparison, DEFENSE_PLOT_PNG),
 )
 
+
 def plot_all(dfs: dict[str, pd.DataFrame], output_dir: Path = DATA_DIR) -> None:
     """Generate all summary plots from combined result tables."""
     output_dir = Path(output_dir)
     for spec in PLOT_SPECS:
-        spec.function(dfs.get(spec.table, pd.DataFrame()), output_dir / _name(spec.output))
+        spec.function(
+            dfs.get(spec.table, pd.DataFrame()), output_dir / _name(spec.output)
+        )
 
     overview_dir = output_dir / "visualizations"
     for name, frame in dfs.items():

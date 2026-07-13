@@ -21,7 +21,9 @@ DEVICE_TYPE = device.type
 USE_AMP = torch.cuda.is_available()
 
 CONFIG_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CONFIG_DIR.parent if CONFIG_DIR.name in {"src", "src_old"} else CONFIG_DIR
+PROJECT_ROOT = (
+    CONFIG_DIR.parent if CONFIG_DIR.name in {"src", "src_old"} else CONFIG_DIR
+)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 PYTORCHCV_MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "pytorchcv")
@@ -39,12 +41,8 @@ DATASET_IMAGE_SIZE = 32
 DATASET_RANDOM_CROP_PADDING = 4
 DATASET_MEAN_VALUES = (0.5071, 0.4867, 0.4408)
 DATASET_STD_VALUES = (0.2675, 0.2565, 0.2761)
-DATASET_MEAN = torch.tensor(DATASET_MEAN_VALUES).view(
-    1, DATASET_INPUT_CHANNELS, 1, 1
-)
-DATASET_STD = torch.tensor(DATASET_STD_VALUES).view(
-    1, DATASET_INPUT_CHANNELS, 1, 1
-)
+DATASET_MEAN = torch.tensor(DATASET_MEAN_VALUES).view(1, DATASET_INPUT_CHANNELS, 1, 1)
+DATASET_STD = torch.tensor(DATASET_STD_VALUES).view(1, DATASET_INPUT_CHANNELS, 1, 1)
 DATASET_TRAIN_TRANSFORM = tv_transforms.Compose(
     [
         tv_transforms.RandomCrop(

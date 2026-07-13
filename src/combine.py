@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Recover partial QuantAdv outputs and regenerate report artifacts.
-"""
+"""Recover partial QuantAdv outputs and regenerate report artifacts."""
 
 from __future__ import annotations
 
@@ -17,7 +16,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=Path, default=Path(report_data.DATA_DIR))
     parser.add_argument("--no-plots", action="store_true")
-    parser.add_argument("--quiet", action="store_true", help="Do not print table sizes.")
+    parser.add_argument(
+        "--quiet", action="store_true", help="Do not print table sizes."
+    )
     return parser.parse_args()
 
 

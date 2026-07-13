@@ -88,11 +88,7 @@ class _QuantConv2d(nn.Conv2d):
             else self.weight
         )
         out = self._conv_forward(x, w, self.bias)
-        return (
-            _quantize_tensor(out, self.bits, self.use_ste)
-            if self.quant_act
-            else out
-        )
+        return _quantize_tensor(out, self.bits, self.use_ste) if self.quant_act else out
 
 
 class _QuantLinear(nn.Linear):
@@ -106,11 +102,7 @@ class _QuantLinear(nn.Linear):
             else self.weight
         )
         out = F.linear(x, w, self.bias)
-        return (
-            _quantize_tensor(out, self.bits, self.use_ste)
-            if self.quant_act
-            else out
-        )
+        return _quantize_tensor(out, self.bits, self.use_ste) if self.quant_act else out
 
 
 def _to_quant_module(module, bits):

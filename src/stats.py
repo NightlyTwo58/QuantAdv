@@ -69,7 +69,9 @@ def mcnemar_exact(vector_a, vector_b) -> dict[str, float]:
     a = _as_bool_vector(vector_a)
     b = _as_bool_vector(vector_b)
     if a.shape != b.shape:
-        raise ValueError(f"McNemar vectors must have equal shape, got {a.shape} and {b.shape}")
+        raise ValueError(
+            f"McNemar vectors must have equal shape, got {a.shape} and {b.shape}"
+        )
 
     a_only = int(np.sum(a & ~b))
     b_only = int(np.sum(~a & b))
@@ -128,7 +130,9 @@ def add_paired_mcnemar_tests(
         with np.load(baseline_path) as baseline_vectors, np.load(
             variant_path
         ) as variant_vectors:
-            for metric in sorted(set(baseline_vectors.files) & set(variant_vectors.files)):
+            for metric in sorted(
+                set(baseline_vectors.files) & set(variant_vectors.files)
+            ):
                 a = np.asarray(baseline_vectors[metric], dtype=bool)
                 b = np.asarray(variant_vectors[metric], dtype=bool)
                 if a.shape != b.shape:

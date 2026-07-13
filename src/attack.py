@@ -10,6 +10,7 @@ All adversarial-attack logic
 - diagnostics that are attack-driven (trajectory, margins, staircase, PGD-steps ablation)
 """
 
+import random
 import warnings
 from contextlib import contextmanager
 
@@ -31,8 +32,7 @@ def unwrap_model(model):
 
 
 def set_ste_mode(model, flag):
-    """Toggle straight-through gradients on fake-quantized modules.
-    """
+    """Toggle straight-through gradients on fake-quantized modules."""
     toggled = 0
     for mod in model.modules():
         if hasattr(mod, "use_ste") and hasattr(mod, "bits"):
@@ -42,8 +42,7 @@ def set_ste_mode(model, flag):
 
 
 def get_ste_mode(model):
-    """Return the current ``use_ste`` state of a model's quantized modules.
-    """
+    """Return the current ``use_ste`` state of a model's quantized modules."""
     values = {
         mod.use_ste
         for mod in model.modules()
@@ -127,7 +126,9 @@ def accuracy_from_adv_fn(
                 break
             remaining = max_images - n_seen
             x, y = x[:remaining], y[:remaining]
-        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(
+            device, non_blocking=NON_BLOCKING_TRANSFER
+        )
         x_adv = adv_fn(x, y) if adv_fn is not None else x
         with torch.no_grad():
             if use_autocast:
@@ -156,6 +157,7 @@ def accuracy_under_attack(
     model, loader, attack, target_model=None, max_images=None, return_vector=False
 ):
     """Measure accuracy under a torchattacks-compatible attack object."""
+
     def adv_fn(x, y):
         return attack(x, y)
 
@@ -189,6 +191,94 @@ def seed_averaged_metrics(name, seeds, fn):
     }
 
 
+def _seed_restart(seed):
+    """Seed every RNG used by an explicitly identified attack restart."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _aggregate_restarts(name, accuracies, vectors, return_vector=False):
+    """Aggregate seeded restarts by per-example worst-case correctness."""
+    if not vectors:
+        raise ValueError(f"{name} requires at least one restart seed")
+    worst_vector = np.logical_and.reduce(vectors)
+    out = {
+        name: float(worst_vector.mean()),
+        f"{name}_mean": float(np.mean(accuracies)),
+        f"{name}_std": float(np.std(accuracies)),
+    }
+    if return_vector:
+        out["_vectors"] = {name: worst_vector}
+    return out
+
+
+def _run_seeded_pgd(
+    model,
+    loader,
+    *,
+    eps,
+    alpha,
+    steps,
+    random_start,
+    seeds,
+    use_ste,
+    return_vector,
+):
+    """Single implementation for seeded torchattacks PGD evaluation."""
+    model.eval()
+    accuracies, vectors = [], []
+    with ste_mode(model, use_ste):
+        for seed in seeds:
+            _seed_restart(seed)
+            attack = make_torchattack(
+                torchattacks.PGD,
+                model,
+                eps=eps,
+                alpha=alpha,
+                steps=steps,
+                random_start=random_start,
+            )
+            accuracy, vector = accuracy_under_attack(
+                model, loader, attack, return_vector=True
+            )
+            accuracies.append(accuracy)
+            vectors.append(vector)
+    return _aggregate_restarts("PGD", accuracies, vectors, return_vector)
+
+
+def run_pgd(
+    model,
+    loader,
+    eps=DEFAULT_EPS,
+    alpha=PGD_ALPHA,
+    steps=PGD_STEPS,
+    random_start=PGD_RANDOM_START,
+    seeds=SEEDS,
+    return_vector=False,
+):
+    """Evaluate hard-round PGD with the canonical seeded restart policy.
+
+    Each seed is one restart. ``PGD`` is the intersection of per-example
+    correctness across restarts; ``PGD_mean`` and ``PGD_std`` summarize the
+    individual restart accuracies.
+    """
+    return _run_seeded_pgd(
+        model,
+        loader,
+        eps=eps,
+        alpha=alpha,
+        steps=steps,
+        random_start=random_start,
+        seeds=seeds,
+        use_ste=False,
+        return_vector=return_vector,
+    )
+
+
 def run_fgsm_pgd(
     model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vectors=False, use_ste=False
 ):
@@ -211,35 +301,31 @@ def run_fgsm_pgd(
 
         fgsm_acc, fgsm_vector = attack_vector(fgsm)
         out["FGSM"] = fgsm_acc
-        pgd_vectors = []
-        pgd_accs = []
-        for seed in seeds:
-            torch.manual_seed(seed)
-            pgd = make_torchattack(
-                torchattacks.PGD,
+        pgd_out = (
+            run_pgd(
+                model, loader, eps=eps, seeds=seeds, return_vector=return_vectors
+            )
+            if not use_ste
+            else _run_seeded_pgd(
                 model,
+                loader,
                 eps=eps,
                 alpha=PGD_ALPHA,
                 steps=PGD_STEPS,
                 random_start=PGD_RANDOM_START,
+                seeds=seeds,
+                use_ste=True,
+                return_vector=return_vectors,
             )
-            acc, vector = attack_vector(pgd)
-            pgd_accs.append(acc)
-            pgd_vectors.append(vector)
-        # A multi-restart attack is the intersection of per-restart correctness,
-        # not the mean of restart accuracies.
-        pgd_vector = np.logical_and.reduce(pgd_vectors)
-        out["PGD"] = float(pgd_vector.mean())
-        out["PGD_mean"] = float(np.mean(pgd_accs))
-        out["PGD_std"] = float(np.std(pgd_accs))
+        )
+        pgd_vectors = pgd_out.pop("_vectors", {})
+        out.update(pgd_out)
         if return_vectors:
-            out["_vectors"] = {"FGSM": fgsm_vector, "PGD": pgd_vector}
+            out["_vectors"] = {"FGSM": fgsm_vector, **pgd_vectors}
         return out
 
 
-def run_autoattack(
-    model, loader, eps=DEFAULT_EPS, return_vector=False, use_ste=False
-):
+def run_autoattack(model, loader, eps=DEFAULT_EPS, return_vector=False, use_ste=False):
     """Run AutoAttack in pixel space while reporting normalized-model accuracy."""
     model.eval()
     with ste_mode(model, use_ste):
@@ -369,7 +455,9 @@ def build_uap(
         for x, y in loader:
             if n_seen >= max_images:
                 break
-            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(
+                device, non_blocking=NON_BLOCKING_TRANSFER
+            )
             x_pert = torch.max(torch.min(x + v, clip_max), clip_min)
             with torch.no_grad():
                 pred_orig = model(x).argmax(dim=1)
@@ -446,13 +534,23 @@ def bpda_pgd_attack(
         return projected_pgd_attack(x, y, eps, alpha, steps, grad_fn)
 
 
-def _run_bpda_once(model, loader, eps, n_restarts, return_vector=False):
+def _run_bpda_once(
+    model,
+    loader,
+    eps,
+    n_restarts,
+    alpha=PGD_ALPHA,
+    steps=PGD_STEPS,
+    return_vector=False,
+):
     correct_masks = []
     for x, y in loader:
-        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(
+            device, non_blocking=NON_BLOCKING_TRANSFER
+        )
         worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
         for _ in range(n_restarts):
-            x_adv = bpda_pgd_attack(model, x, y, eps=eps)
+            x_adv = bpda_pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps)
             with torch.no_grad():
                 pred = model(x_adv).argmax(dim=1)
             worst_correct &= pred == y
@@ -473,26 +571,25 @@ def run_bpda(
     n_restarts=BPDA_RESTARTS_DEFAULT,
     seeds=SEEDS,
     return_vector=False,
+    alpha=PGD_ALPHA,
+    steps=PGD_STEPS,
 ):
-    """Evaluate BPDA-PGD with seed-level worst-case correctness aggregation.
-    """
+    """Evaluate BPDA-PGD with seed-level worst-case correctness aggregation."""
     vectors, accuracies = [], []
     for seed in seeds:
-        torch.manual_seed(seed)
+        _seed_restart(seed)
         accuracy, vector = _run_bpda_once(
-            model, loader, eps, n_restarts, return_vector=True
+            model,
+            loader,
+            eps,
+            n_restarts,
+            alpha=alpha,
+            steps=steps,
+            return_vector=True,
         )
         accuracies.append(accuracy)
         vectors.append(vector)
-    worst_vector = np.logical_and.reduce(vectors)
-    out = {
-        "BPDA_PGD": float(worst_vector.mean()),
-        "BPDA_PGD_mean": float(np.mean(accuracies)),
-        "BPDA_PGD_std": float(np.std(accuracies)),
-    }
-    if return_vector:
-        out["_vectors"] = {"BPDA_PGD": worst_vector}
-    return out
+    return _aggregate_restarts("BPDA_PGD", accuracies, vectors, return_vector)
 
 
 def adaptive_pgd_attack(
@@ -912,7 +1009,9 @@ def run_boundary_attack(
     for x, y in loader:
         if total_seen >= max_images:
             break
-        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+        x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(
+            device, non_blocking=NON_BLOCKING_TRANSFER
+        )
         with torch.no_grad():
             pred = model(x).argmax(dim=1)
         for i in range(x.size(0)):
@@ -999,7 +1098,9 @@ def random_noise_attack(
     correct, total, vectors = 0, 0, []
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(
+                device, non_blocking=NON_BLOCKING_TRANSFER
+            )
             worst_correct = torch.ones(y.size(0), dtype=torch.bool, device=device)
             for _ in range(n_restarts):
                 noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
@@ -1021,44 +1122,35 @@ def run_random_noise_seeded(
 ):
     accuracies, vectors = [], []
     for seed in seeds:
+        _seed_restart(seed)
         accuracy, vector = random_noise_attack(
             model, loader, eps=eps, seed=seed, return_vector=True
         )
         accuracies.append(accuracy)
         vectors.append(vector)
-    worst_vector = np.logical_and.reduce(vectors)
-    out = {
-        "Random_Noise": float(worst_vector.mean()),
-        "Random_Noise_mean": float(np.mean(accuracies)),
-        "Random_Noise_std": float(np.std(accuracies)),
-    }
-    if return_vector:
-        out["_vectors"] = {"Random_Noise": worst_vector}
-    return out
+    return _aggregate_restarts("Random_Noise", accuracies, vectors, return_vector)
 
 
 def pgd_steps_ablation(
     model, loader, eps=DEFAULT_EPS, step_list=PGD_ABLATION_STEPS, use_ste=False
 ):
-    """Accuracy vs. PGD step count, at an explicit, chosen gradient regime.
-    """
+    """Accuracy vs. PGD step count, at an explicit, chosen gradient regime."""
     model.eval()
     out = {}
-    with ste_mode(model, use_ste):
-        for steps in step_list:
-            if steps == 0:
-                acc = random_noise_attack(model, loader, eps=eps, seed=0)
-            else:
-                pgd = make_torchattack(
-                    torchattacks.PGD,
-                    model,
-                    eps=eps,
-                    alpha=PGD_ALPHA,
-                    steps=steps,
-                    random_start=PGD_RANDOM_START,
-                )
-                acc = accuracy_under_attack(model, loader, pgd)
-            out[steps] = acc
+    for steps in step_list:
+        if not use_ste:
+            result = run_pgd(model, loader, eps=eps, steps=steps, seeds=SEEDS)
+            out[steps] = result["PGD"]
+        else:
+            result = run_bpda(
+                model,
+                loader,
+                eps=eps,
+                n_restarts=1,
+                seeds=SEEDS,
+                steps=steps,
+            )
+            out[steps] = result["BPDA_PGD"]
     return out
 
 
@@ -1071,8 +1163,7 @@ def pgd_trajectory_diagnostics(
     max_batches=TRAJECTORY_MAX_BATCHES,
     use_ste=False,
 ):
-    """Per-step gradient norm and movement along a PGD trajectory.
-    """
+    """Per-step gradient norm and movement along a PGD trajectory."""
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
     eps_normalized = eps / DATASET_STD.to(device)
@@ -1084,7 +1175,9 @@ def pgd_trajectory_diagnostics(
         for bi, (x, y) in enumerate(loader):
             if bi >= max_batches:
                 break
-            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(
+                device, non_blocking=NON_BLOCKING_TRANSFER
+            )
             noise = torch.empty_like(x).uniform_(-1, 1) * eps_normalized
             x_start = torch.max(torch.min(x + noise, clip_max), clip_min).detach()
             x_adv = x_start.clone()
@@ -1139,8 +1232,7 @@ def confidence_margin_diagnostic(
     max_batches=MARGIN_MAX_BATCHES,
     use_ste=False,
 ):
-    """Compare top-2 softmax margins clean vs. under PGD, at an explicit regime.
-    """
+    """Compare top-2 softmax margins clean vs. under PGD, at an explicit regime."""
     model.eval()
     with ste_mode(model, use_ste):
         pgd = make_torchattack(
@@ -1155,7 +1247,9 @@ def confidence_margin_diagnostic(
         for bi, (x, y) in enumerate(loader):
             if bi >= max_batches:
                 break
-            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+            x, y = x.to(device, non_blocking=NON_BLOCKING_TRANSFER), y.to(
+                device, non_blocking=NON_BLOCKING_TRANSFER
+            )
             with torch.no_grad():
                 top2 = F.softmax(model(x), dim=1).topk(2, dim=1).values
             clean_margins.extend((top2[:, 0] - top2[:, 1]).cpu().tolist())
@@ -1169,21 +1263,10 @@ def confidence_margin_diagnostic(
 def run_epsilon_sweep_for_model(
     model, loader, name, epsilons, count_quant_layers_fn=None, safe_set=None
 ):
-    """
-    `count_quant_layers_fn` and `safe_set` are injected by the caller so this
-    module does not need to import the quantization/report-plumbing code.
-    Falls back to local, dependency-free implementations if not provided.
+    """Evaluate epsilon-sweep metrics with the main suite implementations.
 
-    ``PGD_acc`` is explicitly computed under hard rounding (``use_ste=False``)
-    — this used to be *ambient*: whatever ``use_ste`` was left at by
-    ``run_suite``'s earlier attacks by the time the sweep ran, with no
-    guarantee it was False. For quantized models this is the number that,
-    if it tracks ``Random_Noise_acc`` instead of dropping as epsilon grows,
-    is showing you gradient masking, not robustness.
-
-    ``BPDA_acc`` uses a restart budget (``n_restarts=1``) matched to
-    ``PGD_acc``. The sweep therefore reports only vanilla PGD and BPDA-PGD;
-    it does not execute or report a separate PGD-STE attack.
+    Shared metrics use the same seeded, per-example worst-case aggregation as
+    ``run_suite``, so matching model/epsilon rows are directly comparable.
     """
     if safe_set is None:
 
@@ -1200,41 +1283,43 @@ def run_epsilon_sweep_for_model(
     rows = []
     for eps in epsilons:
         row = {"model": name, "epsilon": eps}
-
-        def run_pgd_sweep(use_ste):
-            with ste_mode(model, use_ste):
-                pgd = make_torchattack(
-                    torchattacks.PGD,
-                    model,
-                    eps=eps,
-                    alpha=PGD_ALPHA,
-                    steps=PGD_STEPS,
-                    random_start=PGD_RANDOM_START,
-                )
-                return accuracy_under_attack(model, loader, pgd)
-
         context = f"{name} eps={eps:.4f}"
-        safe_set(
-            row,
-            "PGD_acc",
-            lambda: run_pgd_sweep(False),
+
+        def add_shared_metrics(result, source_name, output_name):
+            row[output_name] = result[source_name] if result is not None else None
+            row[f"{source_name}_mean"] = (
+                result[f"{source_name}_mean"] if result is not None else None
+            )
+            row[f"{source_name}_std"] = (
+                result[f"{source_name}_std"] if result is not None else None
+            )
+
+        pgd = safe_set(
+            {},
+            "result",
+            lambda: run_pgd(model, loader, eps=eps, seeds=SEEDS),
             "PGD (hard-round) sweep failed",
             context=context,
         )
-        safe_set(
-            row,
-            "Random_Noise_acc",
-            lambda: random_noise_attack(model, loader, eps=eps),
+        add_shared_metrics(pgd, "PGD", "PGD_acc")
+
+        noise = safe_set(
+            {},
+            "result",
+            lambda: run_random_noise_seeded(model, loader, eps=eps, seeds=SEEDS),
             "random_noise sweep failed",
             context=context,
         )
+        add_shared_metrics(noise, "Random_Noise", "Random_Noise_acc")
+
         if is_quant:
-            safe_set(
-                row,
-                "BPDA_acc",
-                lambda: _run_bpda_once(model, loader, eps=eps, n_restarts=1),
+            bpda = safe_set(
+                {},
+                "result",
+                lambda: run_bpda(model, loader, eps=eps, n_restarts=1, seeds=SEEDS),
                 "BPDA sweep failed",
                 context=context,
             )
+            add_shared_metrics(bpda, "BPDA_PGD", "BPDA_acc")
         rows.append(row)
     return rows
