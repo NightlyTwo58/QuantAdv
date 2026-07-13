@@ -67,7 +67,7 @@ def _read_csvs(paths: Iterable[Path], model_prefix: str | None = None) -> pd.Dat
         out = out.drop_duplicates(
             subset=[
                 c
-                for c in ["model", "epsilon", "steps", "layer", "config"]
+                for c in ["model", "epsilon", "steps", "attack", "layer", "config"]
                 if c in out.columns
             ],
             keep="last",
@@ -256,18 +256,26 @@ def plot_epsilon_sweep_curves(
 def plot_pgd_steps_ablation(
     df_ablation: pd.DataFrame, output: Path = ABLATION_PLOT_PNG
 ) -> None:
-    """Plot accuracy as PGD step count changes."""
+    """Plot matched PGD and BPDA accuracy as attack step count changes."""
     if (
         df_ablation is None
         or df_ablation.empty
-        or not {"steps", "acc", "model"}.issubset(df_ablation.columns)
+        or not {"steps", "acc", "model", "attack"}.issubset(df_ablation.columns)
     ):
         return
 
     plt.figure(figsize=ABLATION_FIGSIZE)
-    sns.lineplot(data=df_ablation, x="steps", y="acc", hue="model", marker="o")
-    plt.title("PGD Accuracy vs Number of Steps (Gradient Masking Check)")
-    plt.xlabel("PGD steps")
+    sns.lineplot(
+        data=df_ablation,
+        x="steps",
+        y="acc",
+        hue="model",
+        style="attack",
+        markers=True,
+        dashes=True,
+    )
+    plt.title("PGD vs BPDA Accuracy by Attack Steps (Gradient Masking Check)")
+    plt.xlabel("Attack steps")
     plt.ylabel("Accuracy")
     plt.ylim(0, PLOT_MAX_ACCURACY)
     plt.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
@@ -933,7 +941,7 @@ CSV_FAMILIES = {
     "ablation": CsvFamily(
         ABLATION_COMBINED_CSV,
         ("ablation_*.csv",),
-        ("model", "steps"),
+        ("model", "steps", "attack"),
         model_prefix="ablation_",
     ),
     "layerwise": CsvFamily(

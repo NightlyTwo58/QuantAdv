@@ -32,19 +32,19 @@ def _device():
 
 
 def normalize_pixels(x):
-    """Normalize pixel-space CIFAR tensors with the experiment constants."""
-    return (x - CIFAR_MEAN.to(x.device)) / CIFAR_STD.to(x.device)
+    """Normalize pixel-space tensors with the configured dataset constants."""
+    return (x - DATASET_MEAN.to(x.device)) / DATASET_STD.to(x.device)
 
 
 def denormalize_inputs(x):
-    """Map normalized CIFAR tensors back to pixel space."""
-    return x * CIFAR_STD.to(x.device) + CIFAR_MEAN.to(x.device)
+    """Map normalized dataset tensors back to pixel space."""
+    return x * DATASET_STD.to(x.device) + DATASET_MEAN.to(x.device)
 
 
 def make_attack(attack_cls, model, *args, **kwargs):
-    """Construct a torchattacks object for already-normalized CIFAR inputs."""
+    """Construct a torchattacks object for normalized configured-dataset inputs."""
     attack = attack_cls(model, *args, **kwargs)
-    attack.set_normalization_used(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
+    attack.set_normalization_used(mean=DATASET_MEAN_VALUES, std=DATASET_STD_VALUES)
     return attack
 
 
@@ -248,7 +248,7 @@ class SanitizedModel(nn.Module):
         )
         pixels = F.interpolate(
             pixels,
-            size=(CIFAR_IMAGE_SIZE, CIFAR_IMAGE_SIZE),
+            size=(DATASET_IMAGE_SIZE, DATASET_IMAGE_SIZE),
             mode="bilinear",
             align_corners=False,
         )
@@ -304,7 +304,7 @@ class DetectorCNN(nn.Module):
         """Build the convolutional binary adversarial-example detector."""
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),
+            nn.Conv2d(DATASET_INPUT_CHANNELS, 32, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, padding=1),

@@ -1,5 +1,5 @@
 # QuantAdv
-Quantized models introduce discrete rounding operations into the computational graph, which may produce either genuine robustnes against *inference-time evasion attacks* (coarser weight representation changing the decision boundary geometry) or gradient masking (rounding causing zero gradients that blind attacks). We systematically evaluate several models (ResNet20, ResNet56 MobileNetV2, VGG16_BN, ShuffleNetV2, and RepVGG_A0) across four quantization variants (FP32, int8 PTQ, int4 PTQ, int8 QAT) on the CIFAR-10 image dataset using a layered attack suite (FGSM, PGD, AutoAttack, transfer attacks from FP32, and BPDA-corrected PGD) to test these two explanations.  
+Quantized models introduce discrete rounding operations into the computational graph, which may produce either genuine robustness against *inference-time evasion attacks* (coarser weight representation changing the decision boundary geometry) or gradient masking (rounding causing zero gradients that blind attacks). The current configuration evaluates pretrained TorchCV ResNet56, WRN-28-10, and DenseNet-100 models on CIFAR-100 across FP32, PTQ, and QAT variants using a layered attack suite. Dataset construction, preprocessing, class count, and TorchCV model identifiers are selected centrally in `src/config.py`.
 
 ## Setup
 
@@ -22,15 +22,13 @@ curl -O https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
 or set Download=true
 
 To run  
-`python src/run_experiment.py`  
-`python src/combine_results`  
-`python single/QuantAdv.py`  
+`python src/QuantAdv.py`  
 
-Parallelized (obsolete)  
-`python archive/launcher.py`
+To graph incomplete results  
+`python src/combine.py`  
 
-To combine incomplete results  
-`python single/combine.py`
+Obsolete run    
+`python src_old/launcher.py`
 
 > **Notice:** You may need to adjust pathing or move the scripts to root for obsolete files.
 

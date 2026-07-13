@@ -78,13 +78,13 @@ def ste_mode(model, flag):
 
 
 def normalize_pixels(x):
-    """Normalize pixel-space CIFAR tensors with the experiment constants."""
-    return (x - CIFAR_MEAN.to(x.device)) / CIFAR_STD.to(x.device)
+    """Normalize pixel-space tensors with the configured dataset constants."""
+    return (x - DATASET_MEAN.to(x.device)) / DATASET_STD.to(x.device)
 
 
 def denormalize_inputs(x):
-    """Map normalized CIFAR tensors back to pixel space."""
-    return x * CIFAR_STD.to(x.device) + CIFAR_MEAN.to(x.device)
+    """Map normalized dataset tensors back to pixel space."""
+    return x * DATASET_STD.to(x.device) + DATASET_MEAN.to(x.device)
 
 
 class PixelSpaceModel(nn.Module):
@@ -93,17 +93,17 @@ class PixelSpaceModel(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
-        self.register_buffer("mean", CIFAR_MEAN.clone())
-        self.register_buffer("std", CIFAR_STD.clone())
+        self.register_buffer("mean", DATASET_MEAN.clone())
+        self.register_buffer("std", DATASET_STD.clone())
 
     def forward(self, x):
         return self.model((x - self.mean.to(x.device)) / self.std.to(x.device))
 
 
 def make_torchattack(attack_cls, model, *args, **kwargs):
-    """Create a torchattacks instance configured for normalized CIFAR inputs."""
+    """Create a torchattacks instance for normalized configured-dataset inputs."""
     attack = attack_cls(model, *args, **kwargs)
-    attack.set_normalization_used(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)
+    attack.set_normalization_used(mean=DATASET_MEAN_VALUES, std=DATASET_STD_VALUES)
     return attack
 
 
@@ -414,8 +414,8 @@ def projected_pgd_attack(x, y, eps, alpha, steps, grad_fn):
     """PGD over normalized tensors with an externally supplied gradient function."""
     clip_min = CLIP_MIN.to(device)
     clip_max = CLIP_MAX.to(device)
-    eps_normalized = eps / CIFAR_STD.to(x.device)
-    alpha_normalized = alpha / CIFAR_STD.to(x.device)
+    eps_normalized = eps / DATASET_STD.to(x.device)
+    alpha_normalized = alpha / DATASET_STD.to(x.device)
     x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-1, 1) * eps_normalized
     x_adv = torch.max(torch.min(x_adv, clip_max), clip_min).detach()
     for _ in range(steps):
@@ -710,7 +710,7 @@ class SubstituteCNN(nn.Module):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(
-                3,
+                DATASET_INPUT_CHANNELS,
                 SUBSTITUTE_CONV1_CHANNELS,
                 SUBSTITUTE_KERNEL_SIZE,
                 padding=SUBSTITUTE_CONV_PADDING,
@@ -995,7 +995,7 @@ def random_noise_attack(
         torch.manual_seed(seed)
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
-    eps_normalized = eps / CIFAR_STD.to(device)
+    eps_normalized = eps / DATASET_STD.to(device)
     correct, total, vectors = 0, 0, []
     with torch.no_grad():
         for x, y in loader:
@@ -1075,8 +1075,8 @@ def pgd_trajectory_diagnostics(
     """
     model.eval()
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
-    eps_normalized = eps / CIFAR_STD.to(device)
-    alpha_normalized = alpha / CIFAR_STD.to(device)
+    eps_normalized = eps / DATASET_STD.to(device)
+    alpha_normalized = alpha / DATASET_STD.to(device)
     step_grad_norms = [0.0] * steps
     step_movement = [0.0] * steps
     n_batches = 0
@@ -1118,7 +1118,7 @@ def staircase_diagnostic(
     flat_norm = direction.flatten(1).norm(dim=1).view(-1, *([1] * (x.dim() - 1)))
     direction = direction / flat_norm
     clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
-    radius_normalized = radius / CIFAR_STD.to(device)
+    radius_normalized = radius / DATASET_STD.to(device)
     with torch.no_grad():
         prev_logits = model(x)
         plateau_hits = 0.0

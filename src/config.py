@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 
 import torch
+import torchvision.datasets as tv_datasets
+import torchvision.transforms as tv_transforms
 
 logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
 
@@ -22,8 +24,47 @@ CONFIG_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CONFIG_DIR.parent if CONFIG_DIR.name in {"src", "src_old"} else CONFIG_DIR
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-CIFAR10_DIR = os.path.join(PROJECT_ROOT, "cifar-10-batches-py")
 PYTORCHCV_MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "pytorchcv")
+
+DATASET_NAME = "CIFAR-100"
+DATASET_CLASS = tv_datasets.CIFAR100
+DATASET_ROOT = PROJECT_ROOT
+DATASET_DIR = os.path.join(DATASET_ROOT, "cifar-100-python")
+DATASET_DOWNLOAD = False
+DATASET_TRAIN_KWARGS = {"train": True}
+DATASET_TEST_KWARGS = {"train": False}
+DATASET_NUM_CLASSES = 100
+DATASET_INPUT_CHANNELS = 3
+DATASET_IMAGE_SIZE = 32
+DATASET_RANDOM_CROP_PADDING = 4
+DATASET_MEAN_VALUES = (0.5071, 0.4867, 0.4408)
+DATASET_STD_VALUES = (0.2675, 0.2565, 0.2761)
+DATASET_MEAN = torch.tensor(DATASET_MEAN_VALUES).view(
+    1, DATASET_INPUT_CHANNELS, 1, 1
+)
+DATASET_STD = torch.tensor(DATASET_STD_VALUES).view(
+    1, DATASET_INPUT_CHANNELS, 1, 1
+)
+DATASET_TRAIN_TRANSFORM = tv_transforms.Compose(
+    [
+        tv_transforms.RandomCrop(
+            DATASET_IMAGE_SIZE, padding=DATASET_RANDOM_CROP_PADDING
+        ),
+        tv_transforms.RandomHorizontalFlip(),
+        tv_transforms.ToTensor(),
+        tv_transforms.Normalize(mean=DATASET_MEAN_VALUES, std=DATASET_STD_VALUES),
+    ]
+)
+DATASET_TEST_TRANSFORM = tv_transforms.Compose(
+    [
+        tv_transforms.ToTensor(),
+        tv_transforms.Normalize(mean=DATASET_MEAN_VALUES, std=DATASET_STD_VALUES),
+    ]
+)
+CLIP_MIN = (0.0 - DATASET_MEAN) / DATASET_STD
+CLIP_MAX = (1.0 - DATASET_MEAN) / DATASET_STD
+CLIP_MIN_DEV = CLIP_MIN.to(device)
+CLIP_MAX_DEV = CLIP_MAX.to(device)
 
 RESULTS_CSV = os.path.join(DATA_DIR, "accuracyresult.csv")
 PER_EXAMPLE_DIR = os.path.join(DATA_DIR, "per_example")
@@ -56,19 +97,16 @@ DEFENSE_SUMMARY_CSV = os.path.join(DATA_DIR, "defense_summary.csv")
 SEEDS = [0, 1, 2, 3, 4]
 
 PRETRAINED_NAMES = {
-    "ResNet56": "resnet56_cifar10",
+    "ResNet56_C100": "resnet56_cifar100",
+    "WRN28_10_C100": "wrn28_10_cifar100",
+    "DenseNet100_C100": "densenet100_k12_bc_cifar100",
+}
+PRETRAINED_MODEL_KWARGS = {
+    "pretrained": True,
+    "root": PYTORCHCV_MODEL_DIR,
 }
 
 QUANTIZATION_DEBUG_ONLY = False
-
-CIFAR_MEAN_VALUES = (0.4914, 0.4822, 0.4465)
-CIFAR_STD_VALUES = (0.2023, 0.1994, 0.2010)
-CIFAR_MEAN = torch.tensor(CIFAR_MEAN_VALUES).view(1, 3, 1, 1)
-CIFAR_STD = torch.tensor(CIFAR_STD_VALUES).view(1, 3, 1, 1)
-CLIP_MIN = (0.0 - CIFAR_MEAN) / CIFAR_STD
-CLIP_MAX = (1.0 - CIFAR_MEAN) / CIFAR_STD
-CLIP_MIN_DEV = CLIP_MIN.to(device)
-CLIP_MAX_DEV = CLIP_MAX.to(device)
 
 DEFAULT_BATCH_SIZE = 512
 DEFAULT_EVAL_N = 5000
@@ -78,9 +116,6 @@ MAX_DATA_WORKERS = 8
 PIN_MEMORY = True
 NON_BLOCKING_TRANSFER = PIN_MEMORY and device.type == "cuda"
 
-CIFAR_IMAGE_SIZE = 32
-CIFAR_RANDOM_CROP_PADDING = 4
-CIFAR_DOWNLOAD = False
 TRAIN_SHUFFLE = True
 EVAL_SHUFFLE = False
 
@@ -122,7 +157,7 @@ HEATMAP_LINEWIDTHS = 0.5
 
 DEFAULT_EPS = 8 / 255
 PGD_ALPHA = 2 / 255
-PGD_STEPS = 15
+PGD_STEPS = 20
 PGD_RANDOM_START = True
 
 QAT_EPOCHS_DEFAULT = 3
@@ -194,7 +229,7 @@ RECORD_RUN_METRICS = True
 
 CI_CONFIDENCE = 0.95
 
-SUBSTITUTE_NUM_CLASSES = 10
+SUBSTITUTE_NUM_CLASSES = DATASET_NUM_CLASSES
 SUBSTITUTE_ROUNDS = 6
 SUBSTITUTE_EPOCHS_PER_ROUND = 10
 SUBSTITUTE_LR = 1e-3
@@ -220,6 +255,7 @@ BOUNDARY_SPH_SUCCESS_LOW = 0.2
 GRAD_DIAG_MAX_BATCHES = 3
 GRAD_ZERO_THRESHOLD = 1e-8
 PGD_ABLATION_STEPS = (0, 1, 2, 5, 10, 20, 50)
+PGD_ABLATION_VARIANTS = ("FP32", "int8_PTQ", "int4_PTQ", "int8_QAT", "int4_QAT")
 TRAJECTORY_MAX_BATCHES = 3
 LAYERWISE_MAX_BATCHES = 3
 STAIRCASE_RADIUS = 1 / 255

@@ -4,8 +4,6 @@ import importlib.util
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as T
 import numpy as np
 import pandas as pd
 import copy
@@ -43,7 +41,7 @@ from attack import *
 """QuantAdv experiment runner for quantization and adversarial robustness.
 
 This module builds FP32, post-training quantized, quantization-aware trained,
-and optional defended CIFAR-10 models, then evaluates them with white-box,
+and optional defended image classifiers, then evaluates them with white-box,
 transfer, adaptive, black-box, and diagnostic attacks.  Quantized layers are
 fake-quantized float modules: they simulate integer rounding during forward
 passes while optionally using straight-through gradients for attacks and QAT.
@@ -66,7 +64,7 @@ def defense_summary_csv_path():
 
 
 def check_environment():
-    """Validate runtime packages and local CIFAR-10 data before a full run."""
+    """Validate runtime packages and configured local data before a full run."""
     missing = [
         pkg
         for pkg in ("torchattacks", "autoattack", "pytorchcv", "torchao")
@@ -78,36 +76,27 @@ def check_environment():
         )
     print("All required packages are available.")
     print("device:", device)
-    if not os.path.isdir(CIFAR10_DIR):
-        raise FileNotFoundError(f"Expected extracted CIFAR-10 at {CIFAR10_DIR!r}")
+    if not DATASET_DOWNLOAD and not os.path.isdir(DATASET_DIR):
+        raise FileNotFoundError(
+            f"Expected extracted {DATASET_NAME} data at {DATASET_DIR!r}"
+        )
 
 
 def get_dataloaders(
     batch_size=DEFAULT_BATCH_SIZE, eval_n=DEFAULT_EVAL_N, finetune_n=DEFAULT_FINETUNE_N
 ):
-    """Build CIFAR-10 fine-tuning and evaluation loaders from fixed subsets."""
-    transform_train = T.Compose(
-        [
-            T.RandomCrop(CIFAR_IMAGE_SIZE, padding=CIFAR_RANDOM_CROP_PADDING),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-            T.Normalize(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES),
-        ]
+    """Build fine-tuning and evaluation loaders for the configured dataset."""
+    train_full = DATASET_CLASS(
+        root=DATASET_ROOT,
+        download=DATASET_DOWNLOAD,
+        transform=DATASET_TRAIN_TRANSFORM,
+        **DATASET_TRAIN_KWARGS,
     )
-    transform_test = T.Compose(
-        [T.ToTensor(), T.Normalize(mean=CIFAR_MEAN_VALUES, std=CIFAR_STD_VALUES)]
-    )
-    train_full = torchvision.datasets.CIFAR10(
-        root=PROJECT_ROOT,
-        train=True,
-        download=CIFAR_DOWNLOAD,
-        transform=transform_train,
-    )
-    test_full = torchvision.datasets.CIFAR10(
-        root=PROJECT_ROOT,
-        train=False,
-        download=CIFAR_DOWNLOAD,
-        transform=transform_test,
+    test_full = DATASET_CLASS(
+        root=DATASET_ROOT,
+        download=DATASET_DOWNLOAD,
+        transform=DATASET_TEST_TRANSFORM,
+        **DATASET_TEST_KWARGS,
     )
     finetune_subset = torch.utils.data.Subset(train_full, list(range(finetune_n)))
     eval_subset = torch.utils.data.Subset(test_full, list(range(eval_n)))
@@ -132,15 +121,19 @@ def get_dataloaders(
 
 
 def load_pretrained(arch_key):
-    """Load a supported pretrained CIFAR-10 architecture onto the active device."""
-    if arch_key != "ResNet56":
-        raise ValueError(f"Unsupported architecture {arch_key!r}; expected 'ResNet56'.")
+    """Load a configured pretrained TorchCV architecture onto the active device."""
     if ptcv_get_model is None:
         raise ImportError(
             "Missing package 'pytorchcv'. Install via: pip install -r requirements.txt"
         )
-    model_name = PRETRAINED_NAMES[arch_key]
-    model = ptcv_get_model(model_name, pretrained=True, root=PYTORCHCV_MODEL_DIR)
+    try:
+        model_name = PRETRAINED_NAMES[arch_key]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown architecture {arch_key!r}; configured choices are "
+            f"{tuple(PRETRAINED_NAMES)}"
+        ) from exc
+    model = ptcv_get_model(model_name, **PRETRAINED_MODEL_KWARGS)
     return model.to(device).eval()
 
 
@@ -599,7 +592,7 @@ class CompressedInputModel(nn.Module):
                 kwargs["align_corners"] = COMPRESS_IMAGE_ALIGN_CORNERS
             pixels = F.interpolate(pixels, size=(self.size, self.size), **kwargs)
             pixels = F.interpolate(
-                pixels, size=(CIFAR_IMAGE_SIZE, CIFAR_IMAGE_SIZE), **kwargs
+                pixels, size=(DATASET_IMAGE_SIZE, DATASET_IMAGE_SIZE), **kwargs
             )
         if self.bits is not None:
             pixels = ImageCompressionSTE.apply(pixels, self.bits)
@@ -1057,6 +1050,33 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         context=name,
         defaults=adaptive_defaults,
     )
+
+    if any(
+        name == f"{arch_key}_{variant}"
+        for arch_key in PRETRAINED_NAMES
+        for variant in PGD_ABLATION_VARIANTS
+    ):
+
+        def save_pgd_ablation():
+            """Persist PGD and BPDA step-ablation diagnostics."""
+            rows = []
+            for attack_name, use_ste in (("PGD", False), ("BPDA_PGD", True)):
+                ablation = pgd_steps_ablation(
+                    model, loader, eps=eps, use_ste=use_ste
+                )
+                rows.extend(
+                    {
+                        "model": name,
+                        "attack": attack_name,
+                        "steps": steps,
+                        "acc": accuracy,
+                    }
+                    for steps, accuracy in ablation.items()
+                )
+            pd.DataFrame(rows).to_csv(csv_path(name, "ablation"), index=False)
+
+        safe_call(save_pgd_ablation, "pgd_steps_ablation failed", context=name)
+
     if count_quant_layers(model) > 0:
         safe_update_vectors(
             results,
@@ -1130,14 +1150,6 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
                 defaults={"NES": None},
             )
 
-        def save_pgd_ablation():
-            """Persist PGD step-ablation diagnostics for the current model."""
-            ablation = pgd_steps_ablation(model, loader, eps=eps)
-            pd.DataFrame(
-                [{"model": name, "steps": k, "acc": v} for k, v in ablation.items()]
-            ).to_csv(csv_path(name, "ablation"), index=False)
-
-        safe_call(save_pgd_ablation, "pgd_steps_ablation failed", context=name)
         if RUN_PGD_TRAJECTORY:
 
             def save_trajectory():
