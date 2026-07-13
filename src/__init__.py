@@ -1,3 +1,3 @@
 """
-QuantAdv/src: Active centralized development for ./src_old
+QuantAdv/src: Active centralized development
 """

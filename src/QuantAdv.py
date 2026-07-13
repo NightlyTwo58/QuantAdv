@@ -717,7 +717,7 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     The rows distinguish three interpretations of "testing quantized":
     weight-only quantization, activation-only quantization, and both together.
     For each interpretation the experiment reports ordinary hard-round PGD and
-    a budget-matched STE/BPDA PGD.  A large hard-PGD vs STE-PGD gap is evidence
+    a budget-matched BPDA-PGD. A large PGD vs BPDA-PGD gap is evidence
     of gradient masking, not evidence that quantization itself improves
     robustness.
 
@@ -725,7 +725,7 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     doesn't touch the gradient path back to the input (the conv/linear op is
     still linear in ``x`` for whatever rounded weight value it has), so
     ``weight_only`` should show ``frac_zero_grad_hard`` near the background
-    rate and a small hard-vs-STE gap. Only ``act_only``/``both`` quantize a
+    rate and a small PGD-vs-BPDA gap. Only ``act_only``/``both`` quantize a
     tensor that ``x`` actually flows through, so only those can mask.
     """
     configs = [
@@ -757,18 +757,6 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
             g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
             frac_zero = (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
 
-        with ste_mode(model, True):
-            torch.manual_seed(0)
-            pgd_ste = make_torchattack(
-                torchattacks.PGD,
-                model,
-                eps=eps,
-                alpha=PGD_ALPHA,
-                steps=PGD_STEPS,
-                random_start=PGD_RANDOM_START,
-            )
-            pgd_ste_acc = accuracy_under_attack(model, loader, pgd_ste)
-
         bpda = run_bpda(
             model,
             loader,
@@ -785,15 +773,9 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
                 "clean_acc": clean_acc,
                 "PGD_acc": pgd_hard_acc,
                 "PGD_hard_acc": pgd_hard_acc,
-                "PGD_ste_acc": pgd_ste_acc,
                 "BPDA_acc": bpda["BPDA_PGD"],
                 "BPDA_mean": bpda["BPDA_PGD_mean"],
                 "BPDA_std": bpda["BPDA_PGD_std"],
-                "PGD_minus_STE": (
-                    pgd_hard_acc - pgd_ste_acc
-                    if pgd_hard_acc is not None and pgd_ste_acc is not None
-                    else None
-                ),
                 "PGD_minus_BPDA": (
                     pgd_hard_acc - bpda["BPDA_PGD"]
                     if pgd_hard_acc is not None and bpda["BPDA_PGD"] is not None
@@ -1829,9 +1811,7 @@ def main():
 
     def build_reports():
         """Combine result files and generate final report artifacts."""
-        tables = report_data.combine_all(report_data.DATA_DIR)
-        report_data.plot_all(tables, report_data.DATA_DIR)
-        report_data.print_report(tables)
+        report_data.generate_reports(report_data.DATA_DIR)
 
     safe_call(build_reports, "report generation failed", show_traceback=True)
     print("All done.")

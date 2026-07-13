@@ -1181,13 +1181,9 @@ def run_epsilon_sweep_for_model(
     if it tracks ``Random_Noise_acc`` instead of dropping as epsilon grows,
     is showing you gradient masking, not robustness.
 
-    ``PGD_ste_acc`` is the same sweep with the masking bypassed (single
-    restart, matching ``PGD_acc``'s budget), so you can read the masking
-    gap directly off this table without cross-referencing ``BPDA_acc``.
-    ``BPDA_acc`` is kept for compatibility and now uses a restart budget
-    (``n_restarts=1``) matched to ``PGD_acc``/``PGD_ste_acc`` rather than
-    the previous mismatched default, so any gap you see is attributable to
-    the gradient regime and not to a bigger attack budget.
+    ``BPDA_acc`` uses a restart budget (``n_restarts=1``) matched to
+    ``PGD_acc``. The sweep therefore reports only vanilla PGD and BPDA-PGD;
+    it does not execute or report a separate PGD-STE attack.
     """
     if safe_set is None:
 
@@ -1225,14 +1221,6 @@ def run_epsilon_sweep_for_model(
             "PGD (hard-round) sweep failed",
             context=context,
         )
-        if is_quant:
-            safe_set(
-                row,
-                "PGD_ste_acc",
-                lambda: run_pgd_sweep(True),
-                "PGD (STE) sweep failed",
-                context=context,
-            )
         safe_set(
             row,
             "Random_Noise_acc",
