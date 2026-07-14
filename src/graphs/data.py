@@ -28,6 +28,19 @@ import seaborn as sns
 from ..config import *
 from .. import stats as qstats
 
+def csv_path(model_name, type):
+    """Return the per-model CSV path for an experiment artifact family."""
+    return os.path.join(DATA_DIR, f"{type}_{model_name}.csv")
+
+
+def json_path(model_name, type):
+    """Return the per-model JSON path for an experiment artifact family."""
+    return os.path.join(DATA_DIR, f"{type}_{model_name}.json")
+
+
+def defense_summary_csv_path():
+    """Return the aggregate defense-summary CSV path."""
+    return os.path.join(DATA_DIR, "defense_summary.csv")
 
 def _model_from_prefixed_path(path: Path, prefix: str, suffix: str) -> str:
     """Extract the model name encoded in a result filename."""
@@ -1007,19 +1020,33 @@ PLOT_SPECS = (
 
 
 def plot_all(dfs: dict[str, pd.DataFrame], output_dir: Path = DATA_DIR) -> None:
-    """Generate all summary plots from combined result tables."""
+    """Generate each summary plot independently from combined result tables."""
     output_dir = Path(output_dir)
     for spec in PLOT_SPECS:
-        spec.function(
-            dfs.get(spec.table, pd.DataFrame()), output_dir / _name(spec.output)
-        )
+        try:
+            spec.function(
+                dfs.get(spec.table, pd.DataFrame()), output_dir / _name(spec.output)
+            )
+        except Exception as exc:
+            print(
+                f"[WARN] could not plot {_name(spec.output)} "
+                f"from {spec.table}: {exc}"
+            )
 
     overview_dir = output_dir / "visualizations"
     for name, frame in dfs.items():
-        _plot_metric_grid(
-            frame, name.replace("_", " ").title(), overview_dir / f"{name}.png"
-        )
-        _plot_model_subgraphs(frame, name, overview_dir)
+        try:
+            _plot_metric_grid(
+                frame,
+                name.replace("_", " ").title(),
+                overview_dir / f"{name}.png",
+            )
+        except Exception as exc:
+            print(f"[WARN] could not plot {name} metric overview: {exc}")
+        try:
+            _plot_model_subgraphs(frame, name, overview_dir)
+        except Exception as exc:
+            print(f"[WARN] could not plot {name} model subgraphs: {exc}")
 
 
 def print_report(dfs: dict[str, pd.DataFrame]) -> None:

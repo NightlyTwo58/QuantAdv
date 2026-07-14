@@ -28,6 +28,7 @@ from autoattack import AutoAttack
 
 import defense as dfn
 from src.graphs import data as report_data
+from src.graphs.data import csv_path, defense_summary_csv_path, json_path
 import stats as qstats
 
 from config import *
@@ -46,19 +47,6 @@ passes while optionally using straight-through gradients for attacks and QAT.
 """
 
 
-def csv_path(model_name, type):
-    """Return the per-model CSV path for an experiment artifact family."""
-    return os.path.join(DATA_DIR, f"{type}_{model_name}.csv")
-
-
-def json_path(model_name, type):
-    """Return the per-model JSON path for an experiment artifact family."""
-    return os.path.join(DATA_DIR, f"{type}_{model_name}.json")
-
-
-def defense_summary_csv_path():
-    """Return the aggregate defense-summary CSV path."""
-    return os.path.join(DATA_DIR, "defense_summary.csv")
 
 
 def check_environment():
@@ -214,19 +202,23 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
     handles = []
 
     def make_hook(name):
-        """Create a backward hook that records gradient statistics for one layer."""
+        """Create a forward hook that tracks gradients on a layer's input tensor."""
 
-        def hook(module, grad_input, grad_output):
-            """Record gradient statistics emitted by a backward hook."""
-            gi = grad_input[0]
-            if gi is not None:
-                norms[name].append(gi.flatten(1).norm(dim=1).mean().item())
+        def hook(module, inputs):
+            """Attach directly to the activation without backward-hook view wrapping."""
+            activation = inputs[0]
+            if activation.requires_grad:
+                activation.register_hook(
+                    lambda grad: norms[name].append(
+                        grad.flatten(1).norm(dim=1).mean().item()
+                    )
+                )
 
         return hook
 
     try:
         for n, m in quant_layers:
-            handles.append(m.register_full_backward_hook(make_hook(n)))
+            handles.append(m.register_forward_pre_hook(make_hook(n)))
         model.eval()
         with ste_mode(model, use_ste):
             for bi, (x, y) in enumerate(loader):
@@ -1240,7 +1232,9 @@ def main():
                     n_chunks=CHUNK_QUANT_NUM_CHUNKS,
                     eps=DEFAULT_EPS,
                 )
-                pd.DataFrame(rows).to_csv(out_path, index=False)
+                report_data.upsert_table(
+                    out_path, pd.DataFrame(rows), ["model", "chunk_id"]
+                )
                 print(f"Chunk quantization results saved to {out_path}")
             except Exception as e:
                 print(f"  [FAIL] chunk quantization sweep failed for {arch_key}: {e}")
@@ -1407,11 +1401,7 @@ def main():
     if RUN_EPSILON_SWEEP:
         print("\nEpsilon sweep completed. Results saved to", SWEEP_CSV)
 
-    def build_reports():
-        """Combine result files and generate final report artifacts."""
-        report_data.generate_reports(report_data.DATA_DIR)
-
-    safe_call(build_reports, "report generation failed", show_traceback=True)
+    report_data.generate_reports(report_data.DATA_DIR)
     print("All done.")
 
 
