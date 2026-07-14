@@ -25,8 +25,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from config import *
-import stats as qstats
+from ..config import *
+from .. import stats as qstats
 
 
 def _model_from_prefixed_path(path: Path, prefix: str, suffix: str) -> str:

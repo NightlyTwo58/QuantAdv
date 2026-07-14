@@ -15,28 +15,26 @@ import warnings
 import time
 import threading
 import psutil
-from torch.amp import autocast, GradScaler
-
-from torchao.quantization.qat import IntxFakeQuantizeConfig, IntxFakeQuantizer
-from pytorchcv.model_provider import get_model as ptcv_get_model
-
-import torchattacks
-from autoattack import AutoAttack
-
-import defense as dfn
-import data as report_data
-import stats as qstats
-
-import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from pytorchcv.model_provider import get_model as ptcv_get_model
+
+import torchattacks
+from autoattack import AutoAttack
+
+import defense as dfn
+from src.graphs import data as report_data
+import stats as qstats
+
 from config import *
+from quantization import *
 from ResourceMonitor import ResourceMonitor
 from attack import *
+from attack_cache import AttackResultCache
 
 """QuantAdv experiment runner for quantization and adversarial robustness.
 
@@ -141,467 +139,6 @@ def sanity_check_accuracy(model, loader):
     """Compute clean accuracy with the same evaluation path as attack metrics."""
     model.eval()
     return accuracy_from_adv_fn(model, loader, use_autocast=True)
-
-
-def _torchao_int_dtype(bits):
-    """Return TorchAO's integer dtype corresponding to the requested bit width."""
-    if bits == 8:
-        return torch.int8
-    dtype = getattr(torch, f"int{bits}", None)
-    if dtype is None:
-        raise RuntimeError(
-            f"This PyTorch build does not expose torch.int{bits}; upgrade PyTorch/TorchAO "
-            f"to use {bits}-bit TorchAO fake quantization."
-        )
-    return dtype
-
-
-def _make_torchao_fake_quantizer(bits, *, role):
-    """Build TorchAO fake quantization for a weight or activation tensor."""
-    if role == "activation":
-        config = IntxFakeQuantizeConfig(
-            dtype=_torchao_int_dtype(bits),
-            granularity="per_token",
-            is_symmetric=False,
-            is_dynamic=True,
-            eps=QUANT_SCALE_MIN,
-        )
-    elif role == "weight":
-        config = IntxFakeQuantizeConfig(
-            dtype=_torchao_int_dtype(bits),
-            granularity="per_channel",
-            is_symmetric=True,
-            is_dynamic=True,
-            eps=QUANT_SCALE_MIN,
-        )
-    else:
-        raise ValueError(f"Unknown fake-quantizer role: {role!r}")
-    return IntxFakeQuantizer(config)
-
-
-def _hard_or_ste(fake_quantizer, tensor, use_ste):
-    """Use TorchAO numerics while selecting STE or true hard-round gradients."""
-    quantized = fake_quantizer(tensor)
-    return quantized if use_ste else quantized.detach()
-
-
-def chaotic_sequence_like(t, seed=CHAOTIC_QUANT_SEED, map_name=CHAOTIC_QUANT_MAP):
-    """Create a deterministic chaotic sequence with the same shape as ``t``."""
-    n = t.numel()
-    if n == 0:
-        return torch.empty_like(t)
-    dtype = torch.float32 if t.dtype in (torch.float16, torch.bfloat16) else t.dtype
-    idx = torch.arange(n, device=t.device, dtype=dtype)
-    z = torch.frac(seed + (idx + 1.0) * 0.6180339887498949)
-    z = torch.clamp(z, 1e-6, 1.0 - 1e-6)
-    if map_name == "tent":
-        for _ in range(CHAOTIC_QUANT_WARMUP):
-            z = torch.where(
-                z < 0.5, CHAOTIC_QUANT_MU * z * 0.5, CHAOTIC_QUANT_MU * (1.0 - z) * 0.5
-            )
-    else:
-        for _ in range(CHAOTIC_QUANT_WARMUP):
-            z = CHAOTIC_QUANT_R * z * (1.0 - z)
-    return z.view_as(t).to(dtype=t.dtype)
-
-
-def chaotic_quantize_tensor(
-    t,
-    bits,
-    use_ste,
-    fake_quantizer,
-    quantize=True,
-    dither_amplitude=CHAOTIC_QUANT_DITHER,
-):
-    """Apply subtractive chaotic dither around a TorchAO fake quantizer."""
-    if bits is None or not quantize:
-        return t
-    chaos = chaotic_sequence_like(t)
-    # Dither is expressed in units of the tensor's dynamic range. TorchAO
-    # selects the actual scale/zero-point according to the configured scheme.
-    amplitude = t.detach().abs().amax().clamp_min(QUANT_SCALE_MIN)
-    dither = (chaos - 0.5) * dither_amplitude * amplitude
-    quantized = fake_quantizer(t + dither) - dither
-    return quantized if use_ste else quantized.detach()
-
-
-class _QuantizedLayerMixin:
-    """Shared TorchAO fake-quantization controls for Conv2d/Linear wrappers."""
-
-    chaotic = False
-
-    def _init_quantizers(self, bits):
-        self.bits = bits
-        self.weight_fake_quantizer = _make_torchao_fake_quantizer(bits, role="weight")
-        self.activation_fake_quantizer = _make_torchao_fake_quantizer(
-            bits, role="activation"
-        )
-
-    def _quant_params(self):
-        return (
-            getattr(self, "bits", None),
-            getattr(self, "use_ste", QUANT_DEFAULT_USE_STE),
-            getattr(self, "quant_weight", QUANT_DEFAULT_WEIGHT),
-            getattr(self, "quant_act", QUANT_DEFAULT_ACT),
-        )
-
-    def _quantize_weight(self, tensor, enabled):
-        if not enabled:
-            return tensor
-        original_shape = tensor.shape
-        flattened = tensor.reshape(tensor.shape[0], -1)
-        if self.chaotic:
-            quantized = chaotic_quantize_tensor(
-                flattened,
-                self.bits,
-                self.use_ste,
-                self.weight_fake_quantizer,
-                True,
-                getattr(self, "dither_amplitude", CHAOTIC_QUANT_DITHER),
-            )
-        else:
-            quantized = _hard_or_ste(
-                self.weight_fake_quantizer, flattened, self.use_ste
-            )
-        return quantized.reshape(original_shape)
-
-    def _quantize_activation(self, tensor, enabled):
-        if not enabled:
-            return tensor
-        if self.chaotic:
-            return chaotic_quantize_tensor(
-                tensor,
-                self.bits,
-                self.use_ste,
-                self.activation_fake_quantizer,
-                True,
-                getattr(self, "dither_amplitude", CHAOTIC_QUANT_DITHER),
-            )
-        return _hard_or_ste(self.activation_fake_quantizer, tensor, self.use_ste)
-
-
-class QuantConv2d(_QuantizedLayerMixin, nn.Conv2d):
-    """Conv2d using TorchAO fake quantization for weights and output activations."""
-
-    def forward(self, x):
-        _, _, quant_weight, quant_act = self._quant_params()
-        weight = self._quantize_weight(self.weight, quant_weight)
-        out = self._conv_forward(x, weight, self.bias)
-        return self._quantize_activation(out, quant_act)
-
-
-class ChaoticQuantConv2d(QuantConv2d):
-    chaotic = True
-
-
-class QuantLinear(_QuantizedLayerMixin, nn.Linear):
-    """Linear using TorchAO fake quantization for weights and output activations."""
-
-    def forward(self, x):
-        _, _, quant_weight, quant_act = self._quant_params()
-        weight = self._quantize_weight(self.weight, quant_weight)
-        out = F.linear(x, weight, self.bias)
-        return self._quantize_activation(out, quant_act)
-
-
-class ChaoticQuantLinear(QuantLinear):
-    chaotic = True
-
-
-def _to_quant_module(
-    mod,
-    bits,
-    quant_weight=True,
-    quant_act=True,
-    chaotic=False,
-    dither_amplitude=CHAOTIC_QUANT_DITHER,
-):
-    """Convert Conv2d/Linear to TorchAO-backed fake-quantized wrappers."""
-    if isinstance(mod, nn.Conv2d):
-        cls = ChaoticQuantConv2d if chaotic else QuantConv2d
-        new = cls(
-            mod.in_channels,
-            mod.out_channels,
-            mod.kernel_size,
-            mod.stride,
-            mod.padding,
-            mod.dilation,
-            mod.groups,
-            mod.bias is not None,
-            mod.padding_mode,
-            device=mod.weight.device,
-            dtype=mod.weight.dtype,
-        )
-    elif isinstance(mod, nn.Linear):
-        cls = ChaoticQuantLinear if chaotic else QuantLinear
-        new = cls(
-            mod.in_features,
-            mod.out_features,
-            bias=mod.bias is not None,
-            device=mod.weight.device,
-            dtype=mod.weight.dtype,
-        )
-    else:
-        return None
-
-    new.weight = mod.weight
-    if mod.bias is not None:
-        new.bias = mod.bias
-    new._init_quantizers(bits)
-    new.use_ste = QUANT_DEFAULT_USE_STE
-    new.quant_weight = quant_weight
-    new.quant_act = quant_act
-    new.dither_amplitude = dither_amplitude
-    return new
-
-
-def _replace_recursive(
-    module,
-    bits,
-    quant_weight=True,
-    quant_act=True,
-    chaotic=False,
-    dither_amplitude=CHAOTIC_QUANT_DITHER,
-):
-    for name, child in list(module.named_children()):
-        replacement = _to_quant_module(
-            child,
-            bits,
-            quant_weight,
-            quant_act,
-            chaotic=chaotic,
-            dither_amplitude=dither_amplitude,
-        )
-        if replacement is not None:
-            setattr(module, name, replacement)
-        else:
-            _replace_recursive(
-                child,
-                bits,
-                quant_weight,
-                quant_act,
-                chaotic=chaotic,
-                dither_amplitude=dither_amplitude,
-            )
-
-
-def convert_to_quant(
-    model,
-    bits,
-    quant_weight=True,
-    quant_act=True,
-    chaotic=False,
-    dither_amplitude=CHAOTIC_QUANT_DITHER,
-):
-    """Return a deep-copied model backed by TorchAO fake quantizers."""
-    m = copy.deepcopy(model)
-    _replace_recursive(
-        m,
-        bits,
-        quant_weight,
-        quant_act,
-        chaotic=chaotic,
-        dither_amplitude=dither_amplitude,
-    )
-    return m
-
-
-def convert_to_chaotic_quant(
-    model,
-    bits,
-    quant_weight=True,
-    quant_act=True,
-    dither_amplitude=CHAOTIC_QUANT_DITHER,
-):
-    return convert_to_quant(
-        model,
-        bits,
-        quant_weight=quant_weight,
-        quant_act=quant_act,
-        chaotic=True,
-        dither_amplitude=dither_amplitude,
-    )
-
-
-def quantizable_layer_names(model):
-    quant_types = (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
-    return [
-        name
-        for name, mod in model.named_modules()
-        if isinstance(mod, (nn.Conv2d, nn.Linear)) and not isinstance(mod, quant_types)
-    ]
-
-
-def set_child_module(root, module_name, new_module):
-    parts = module_name.split(".")
-    parent = root
-    for part in parts[:-1]:
-        parent = parent._modules[part]
-    parent._modules[parts[-1]] = new_module
-
-
-def convert_layer_chunk_to_quant(
-    model, layer_names, bits, quant_weight=True, quant_act=True, chaotic=False
-):
-    m = copy.deepcopy(model)
-    targets = set(layer_names)
-    for name, mod in list(m.named_modules()):
-        if name not in targets:
-            continue
-        new_mod = _to_quant_module(mod, bits, quant_weight, quant_act, chaotic=chaotic)
-        if new_mod is not None:
-            set_child_module(m, name, new_mod)
-    return m.to(device).eval()
-
-
-def quant_layer_chunks(layer_names, n_chunks):
-    if not layer_names:
-        return []
-    n_chunks = max(1, min(n_chunks, len(layer_names)))
-    return [
-        list(chunk)
-        for chunk in np.array_split(np.array(layer_names, dtype=object), n_chunks)
-        if len(chunk) > 0
-    ]
-
-
-def count_quant_layers(model):
-    return sum(
-        isinstance(
-            mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
-        )
-        for mod in model.modules()
-    )
-
-
-def verify_quantization_layers(
-    arch_key, fp32_model, quant_model, label, fp32_layer_names=None
-):
-    fp32_layer_names = (
-        quantizable_layer_names(fp32_model)
-        if fp32_layer_names is None
-        else fp32_layer_names
-    )
-    if not fp32_layer_names:
-        raise RuntimeError(f"{arch_key} exposes zero FP32 nn.Conv2d/nn.Linear layers.")
-    quant_count = count_quant_layers(quant_model)
-    threshold = int(np.ceil(0.8 * len(fp32_layer_names)))
-    print(f"  {label} quantized layers: {quant_count}", flush=True)
-    if quant_count < threshold:
-        raise RuntimeError(
-            f"{arch_key} {label} replaced {quant_count}/{len(fp32_layer_names)} "
-            f"quantizable layers; expected at least {threshold}."
-        )
-    return quant_count
-
-
-def set_quant_components(model, quant_weight, quant_act):
-    for mod in model.modules():
-        if isinstance(
-            mod, (QuantConv2d, QuantLinear, ChaoticQuantConv2d, ChaoticQuantLinear)
-        ):
-            mod.quant_weight = quant_weight
-            mod.quant_act = quant_act
-
-
-def prepare_qat(
-    fp32_model,
-    bits,
-    finetune_loader,
-    epochs=QAT_EPOCHS_DEFAULT,
-    lr=QAT_LR,
-    chaotic=False,
-):
-    """Fine-tune a TorchAO fake-quantized copy with STE enabled."""
-    m = (
-        convert_to_chaotic_quant(fp32_model, bits, quant_weight=True, quant_act=True)
-        if chaotic
-        else convert_to_quant(fp32_model, bits, quant_weight=True, quant_act=True)
-    )
-    if torch.cuda.device_count() > 1:
-        m = nn.DataParallel(m)
-    set_ste_mode(m, True)
-    m.train()
-    opt = torch.optim.SGD(
-        m.parameters(),
-        lr=lr,
-        momentum=QAT_MOMENTUM,
-        weight_decay=QAT_WEIGHT_DECAY,
-    )
-    scaler = GradScaler(device=device.type, enabled=device.type == "cuda")
-    for epoch in range(epochs):
-        running = 0.0
-        for batch_idx, (x, y) in enumerate(finetune_loader):
-            x = x.to(device, non_blocking=NON_BLOCKING_TRANSFER)
-            y = y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
-            opt.zero_grad(set_to_none=True)
-            with autocast(device_type=device.type, enabled=device.type == "cuda"):
-                loss = F.cross_entropy(m(x), y)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            running += loss.item()
-            if batch_idx == 0 or (batch_idx + 1) % QAT_LOG_EVERY_BATCHES == 0:
-                print(
-                    f"  QAT epoch {epoch + 1}/{epochs} batch "
-                    f"{batch_idx + 1}/{len(finetune_loader)} loss {loss.item():.4f}",
-                    flush=True,
-                )
-        print(
-            f"  QAT epoch {epoch + 1}/{epochs} avg loss "
-            f"{running / len(finetune_loader):.4f}",
-            flush=True,
-        )
-    set_ste_mode(m, False)
-    return m.eval()
-
-
-class ImageCompressionSTE(torch.autograd.Function):
-    """Quantize pixel values with identity gradients for compression defenses."""
-
-    @staticmethod
-    def forward(ctx, x, bits):
-        """Apply image compression in the forward pass for input preprocessing."""
-        levels = float(2**bits - 1)
-        return torch.round(x * levels).div(levels)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Pass gradients through image compression unchanged."""
-        return grad_output, None
-
-
-class CompressedInputModel(nn.Module):
-    """Wrap a classifier with resize and pixel-bit-depth input compression."""
-
-    def __init__(
-        self,
-        model,
-        size=COMPRESS_IMAGE_SIZE,
-        bits=COMPRESS_IMAGE_BITS,
-        mode=COMPRESS_IMAGE_MODE,
-    ):
-        """Wrap a model with differentiable image-compression preprocessing."""
-        super().__init__()
-        self.model = model
-        self.size = size
-        self.bits = bits
-        self.mode = mode
-
-    def forward(self, x):
-        """Compress inputs before forwarding them to the wrapped model."""
-        pixels = denormalize_inputs(x).clamp(0.0, 1.0)
-        if self.size and self.size < pixels.shape[-1]:
-            kwargs = {"mode": self.mode}
-            if self.mode in ("linear", "bilinear", "bicubic", "trilinear"):
-                kwargs["align_corners"] = COMPRESS_IMAGE_ALIGN_CORNERS
-            pixels = F.interpolate(pixels, size=(self.size, self.size), **kwargs)
-            pixels = F.interpolate(
-                pixels, size=(DATASET_IMAGE_SIZE, DATASET_IMAGE_SIZE), **kwargs
-            )
-        if self.bits is not None:
-            pixels = ImageCompressionSTE.apply(pixels, self.bits)
-        return self.model(normalize_pixels(pixels.clamp(0.0, 1.0)))
 
 
 def with_image_compression(
@@ -709,11 +246,60 @@ def layerwise_grad_profile(model, loader, use_ste, max_batches=LAYERWISE_MAX_BAT
     }
 
 
+def component_ablation_row(
+    name, label, quant_weight, quant_act, clean_acc, pgd, bpda, frac_zero_grad_hard
+):
+    """Build one consistently shaped quantization-component ablation row."""
+    pgd_acc = pgd.get("PGD")
+    bpda_acc = bpda.get("BPDA_PGD")
+    return {
+        "model": name,
+        "config": label,
+        "quant_weight": quant_weight,
+        "quant_act": quant_act,
+        "clean_acc": clean_acc,
+        "PGD_acc": pgd_acc,
+        "PGD_hard_acc": pgd_acc,
+        "PGD_mean": pgd.get("PGD_mean"),
+        "PGD_std": pgd.get("PGD_std"),
+        "BPDA_acc": bpda_acc,
+        "BPDA_mean": bpda.get("BPDA_PGD_mean"),
+        "BPDA_std": bpda.get("BPDA_PGD_std"),
+        "PGD_minus_BPDA": (
+            pgd_acc - bpda_acc
+            if pgd_acc is not None and bpda_acc is not None
+            else None
+        ),
+        "frac_zero_grad_hard": frac_zero_grad_hard,
+    }
+
+
+def main_both_component_ablation_row(name, results):
+    """Reuse main-suite metrics for the already evaluated fully quantized model."""
+    return component_ablation_row(
+        name,
+        "both",
+        True,
+        True,
+        results.get("clean_acc"),
+        {
+            key: results.get(key)
+            for key in ("PGD", "PGD_mean", "PGD_std")
+        },
+        {
+            key: results.get(key)
+            for key in ("BPDA_PGD", "BPDA_PGD_mean", "BPDA_PGD_std")
+        },
+        results.get("frac_zero_grad_hard"),
+    )
+
+
 def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     """Evaluate which quantized components are responsible for observed effects.
 
-    The rows distinguish three interpretations of "testing quantized":
-    weight-only quantization, activation-only quantization, and both together.
+    The final artifact distinguishes weight-only, activation-only, and fully
+    quantized models. This function computes only the first two; the ``both``
+    row is populated from the main suite rather than attacked a second time.
     For each interpretation the experiment reports ordinary hard-round PGD and
     a budget-matched BPDA-PGD. A large PGD vs BPDA-PGD gap is evidence
     of gradient masking, not evidence that quantization itself improves
@@ -726,57 +312,39 @@ def run_quant_component_ablation(model, loader, name, eps=DEFAULT_EPS):
     rate and a small PGD-vs-BPDA gap. Only ``act_only``/``both`` quantize a
     tensor that ``x`` actually flows through, so only those can mask.
     """
-    configs = [
-        ("weight_only", True, False),
-        ("act_only", False, True),
-        ("both", True, True),
-    ]
+    configs = [("weight_only", True, False), ("act_only", False, True)]
     rows = []
-    for label, qw, qa in configs:
-        set_quant_components(model, qw, qa)
-        clean_acc = sanity_check_accuracy(model, loader)
+    try:
+        for label, qw, qa in configs:
+            set_quant_components(model, qw, qa)
+            clean_acc = sanity_check_accuracy(model, loader)
 
-        pgd_hard = run_pgd(model, loader, eps=eps, seeds=SEEDS)
-        pgd_hard_acc = pgd_hard["PGD"]
-        with ste_mode(model, False):
-            x, y = next(iter(loader))
-            x, y = x.to(device), y.to(device)
-            x_in = x.clone().requires_grad_(True)
-            loss = F.cross_entropy(model(x_in), y)
-            g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
-            frac_zero = (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
+            pgd_hard = run_pgd(model, loader, eps=eps, seeds=SEEDS)
+            with ste_mode(model, False):
+                x, y = next(iter(loader))
+                x, y = x.to(device), y.to(device)
+                x_in = x.clone().requires_grad_(True)
+                loss = F.cross_entropy(model(x_in), y)
+                g_hard = torch.autograd.grad(loss, x_in)[0].flatten()
+                frac_zero = (
+                    (g_hard.abs() < GRAD_ZERO_THRESHOLD).float().mean().item()
+                )
 
-        bpda = run_bpda(
-            model,
-            loader,
-            eps=eps,
-            n_restarts=1,
-            seeds=SEEDS,
-        )
-        rows.append(
-            {
-                "model": name,
-                "config": label,
-                "quant_weight": qw,
-                "quant_act": qa,
-                "clean_acc": clean_acc,
-                "PGD_acc": pgd_hard_acc,
-                "PGD_hard_acc": pgd_hard_acc,
-                "PGD_mean": pgd_hard["PGD_mean"],
-                "PGD_std": pgd_hard["PGD_std"],
-                "BPDA_acc": bpda["BPDA_PGD"],
-                "BPDA_mean": bpda["BPDA_PGD_mean"],
-                "BPDA_std": bpda["BPDA_PGD_std"],
-                "PGD_minus_BPDA": (
-                    pgd_hard_acc - bpda["BPDA_PGD"]
-                    if pgd_hard_acc is not None and bpda["BPDA_PGD"] is not None
-                    else None
-                ),
-                "frac_zero_grad_hard": frac_zero,
-            }
-        )
-    # restore original (both quantized) state
-    set_quant_components(model, True, True)
+            bpda = run_bpda(
+                model,
+                loader,
+                eps=eps,
+                n_restarts=1,
+                seeds=SEEDS,
+            )
+            rows.append(
+                component_ablation_row(
+                    name, label, qw, qa, clean_acc, pgd_hard, bpda, frac_zero
+                )
+            )
+    finally:
+        # Never leave the shared registry model in an ablated state after failure.
+        set_quant_components(model, True, True)
     return rows
 
 
@@ -893,7 +461,9 @@ def save_json(path, data, *, indent=None):
         json.dump(data, handle, indent=indent)
 
 
-def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
+def run_suite(
+    model, loader, name, fp32_ref=None, eps=DEFAULT_EPS, attack_cache=None
+):
     """Run the full attack and diagnostic suite for one model."""
     model.eval()
     results = {"model": name}
@@ -912,7 +482,8 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
         results,
         vectors,
         lambda: run_fgsm_pgd(
-            model, loader, eps=eps, return_vectors=True, use_ste=False
+            model, loader, eps=eps, return_vectors=True, use_ste=False,
+            cache=attack_cache,
         ),
         "FGSM/PGD failed",
         context=name,
@@ -963,6 +534,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
                 eps=eps,
                 return_vector=True,
                 use_ste=False,
+                cache=attack_cache,
             ),
             "transfer_attack failed",
             context=name,
@@ -978,6 +550,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
                 eps=eps,
                 return_vector=True,
                 use_ste=False,
+                cache=attack_cache,
             ),
             "MIM transfer_attack failed",
             context=name,
@@ -986,7 +559,9 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             safe_set(
                 results,
                 "UAP_Transfer",
-                lambda: transfer_uap_attack(fp32_ref, model, loader, eps=eps),
+                lambda: transfer_uap_attack(
+                    fp32_ref, model, loader, eps=eps, cache=attack_cache
+                ),
                 "UAP transfer_attack failed",
                 context=name,
             )
@@ -1019,7 +594,9 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     safe_update_vectors(
         results,
         vectors,
-        lambda: run_random_noise_seeded(model, loader, eps=eps, return_vector=True),
+        lambda: run_random_noise_seeded(
+            model, loader, eps=eps, return_vector=True, cache=attack_cache
+        ),
         "random_noise_attack failed",
         context=name,
         defaults={"Random_Noise": None},
@@ -1076,6 +653,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
                 eps=eps,
                 n_restarts=1,
                 return_vector=True,
+                cache=attack_cache,
             ),
             "BPDA failed",
             context=name,
@@ -1177,6 +755,7 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
             def save_component_ablation():
                 """Persist quantization component-ablation diagnostics for the current model."""
                 rows = run_quant_component_ablation(model, loader, name, eps=eps)
+                rows.append(main_both_component_ablation_row(name, results))
                 pd.DataFrame(rows).to_csv(
                     csv_path(name, "component_ablation"), index=False
                 )
@@ -1216,7 +795,9 @@ def run_suite(model, loader, name, fp32_ref=None, eps=DEFAULT_EPS):
     return results
 
 
-def run_epsilon_sweep_for_model_wrapped(model, loader, name, epsilons):
+def run_epsilon_sweep_for_model_wrapped(
+    model, loader, name, epsilons, attack_cache=None
+):
     """Run and annotate an epsilon sweep for one named model."""
     return run_epsilon_sweep_for_model(
         model,
@@ -1225,6 +806,7 @@ def run_epsilon_sweep_for_model_wrapped(model, loader, name, epsilons):
         epsilons,
         count_quant_layers_fn=count_quant_layers,
         safe_set=safe_set,
+        cache=attack_cache,
     )
 
 
@@ -1696,6 +1278,8 @@ def main():
         df_sweep = pd.DataFrame()
         sweep_done = set()
 
+    attack_cache = AttackResultCache()
+
     def run_pending_epsilon_sweep(name, model):
         """Run an epsilon sweep for a model that still needs one."""
         nonlocal df_sweep, sweep_done
@@ -1714,7 +1298,7 @@ def main():
             """Persist epsilon-sweep diagnostics for pending models."""
             nonlocal df_sweep, sweep_done
             rows = run_epsilon_sweep_for_model_wrapped(
-                model, eval_loader, name, pending_eps
+                model, eval_loader, name, pending_eps, attack_cache=attack_cache
             )
             if rows:
                 new_sweep = pd.DataFrame(rows)
@@ -1740,9 +1324,21 @@ def main():
         try:
             if RECORD_RUN_METRICS:
                 with monitor:
-                    res = run_suite(model, eval_loader, name, fp32_ref=ref)
+                    res = run_suite(
+                        model,
+                        eval_loader,
+                        name,
+                        fp32_ref=ref,
+                        attack_cache=attack_cache,
+                    )
             else:
-                res = run_suite(model, eval_loader, name, fp32_ref=ref)
+                res = run_suite(
+                    model,
+                    eval_loader,
+                    name,
+                    fp32_ref=ref,
+                    attack_cache=attack_cache,
+                )
         except Exception as e:
             print(f"  [FAIL] run_suite failed for {name}: {e}")
             traceback.print_exc()

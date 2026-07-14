@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import data as report_data
+from . import data as report_data
 
 
 def parse_args() -> argparse.Namespace:

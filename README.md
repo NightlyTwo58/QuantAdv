@@ -24,8 +24,11 @@ or set Download=true
 To run  
 `python src/QuantAdv.py`  
 
-To graph incomplete results  
-`python src/combine.py`  
+To graph incomplete results
+`python -m src.graphs.combine`
+
+To generate the consolidated formal figures
+`python -m src.graphs.formaldata`
 
 Obsolete run    
 `python src_old/launcher.py`

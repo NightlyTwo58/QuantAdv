@@ -12,7 +12,6 @@ All adversarial-attack logic
 
 import random
 import warnings
-from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -24,56 +23,13 @@ from autoattack import AutoAttack
 import defense as dfn
 from torch.amp import autocast
 from config import *
+from quantization import get_ste_mode, set_ste_mode, ste_mode
+from attack_cache import AttackKey, AttackResultCache
 
 
 def unwrap_model(model):
     """Return the underlying module when ``model`` is wrapped in DataParallel."""
     return model.module if isinstance(model, nn.DataParallel) else model
-
-
-def set_ste_mode(model, flag):
-    """Toggle straight-through gradients on fake-quantized modules."""
-    toggled = 0
-    for mod in model.modules():
-        if hasattr(mod, "use_ste") and hasattr(mod, "bits"):
-            mod.use_ste = flag
-            toggled += 1
-    return toggled
-
-
-def get_ste_mode(model):
-    """Return the current ``use_ste`` state of a model's quantized modules."""
-    values = {
-        mod.use_ste
-        for mod in model.modules()
-        if hasattr(mod, "use_ste") and hasattr(mod, "bits")
-    }
-    if not values:
-        return None
-    if len(values) > 1:
-        return "mixed"
-    return next(iter(values))
-
-
-@contextmanager
-def ste_mode(model, flag):
-    """Run a block with an explicit, restored ``use_ste`` state.
-
-    Every attack or diagnostic that cares whether gradients are computed
-    through the true (masking) rounding op or through the straight-through
-    bypass should wrap its gradient computation in this, e.g.::
-        with ste_mode(model, False):   # real hard-round gradient
-        with ste_mode(model, True):    # STE / BPDA-style bypass
-    """
-    previous = get_ste_mode(model)
-    set_ste_mode(model, flag)
-    try:
-        yield
-    finally:
-        # Restore exactly what was there before (True/False), or leave
-        # everything at False if the model had no quantized layers / no
-        # prior state to speak of.
-        set_ste_mode(model, previous if isinstance(previous, bool) else False)
 
 
 def normalize_pixels(x):
@@ -171,6 +127,49 @@ def accuracy_under_attack(
     )
 
 
+def _cache_adversarial_batches(loader, adv_fn):
+    """Generate adversarial examples once and retain device-independent batches."""
+    batches = []
+    for x, y in loader:
+        x = x.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+        y = y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+        x_adv = adv_fn(x, y)
+        batches.append((x_adv.detach().cpu(), y.detach().cpu()))
+    return batches
+
+
+def _evaluate_cached_batches(target_model, batches, return_vector=False):
+    """Evaluate a target model on previously generated adversarial batches."""
+    correct, total = 0, 0
+    correct_vectors = []
+    target_model.eval()
+    for x_adv, y in batches:
+        x_adv = x_adv.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+        y = y.to(device, non_blocking=NON_BLOCKING_TRANSFER)
+        with torch.no_grad():
+            batch_correct = target_model(x_adv).argmax(dim=1) == y
+        correct += batch_correct.sum().item()
+        total += y.size(0)
+        if return_vector:
+            correct_vectors.append(batch_correct.detach().cpu())
+    accuracy = correct / total if total else None
+    if not return_vector:
+        return accuracy
+    vector = (
+        torch.cat(correct_vectors).numpy().astype(bool)
+        if correct_vectors
+        else np.empty(0, dtype=bool)
+    )
+    return accuracy, vector
+
+
+def _cached_transfer_batches(cache, key, loader, adv_fn):
+    """Return cached examples for a transfer attack, generating them on a miss."""
+    if cache is None:
+        return _cache_adversarial_batches(loader, adv_fn)
+    return cache.get_or_compute(key, lambda: _cache_adversarial_batches(loader, adv_fn))
+
+
 def evaluate_normalized_attack(model, loader, attack_fn):
     """Evaluate an attack function that consumes and returns normalized tensors."""
     model.eval()
@@ -216,6 +215,16 @@ def _aggregate_restarts(name, accuracies, vectors, return_vector=False):
     return out
 
 
+def _copy_cached_result(result, return_vector):
+    """Return a caller-owned result dictionary without mutating cached state."""
+    copied = dict(result)
+    if "_vectors" in copied:
+        copied["_vectors"] = dict(copied["_vectors"])
+    if not return_vector:
+        copied.pop("_vectors", None)
+    return copied
+
+
 def _run_seeded_pgd(
     model,
     loader,
@@ -227,27 +236,33 @@ def _run_seeded_pgd(
     seeds,
     use_ste,
     return_vector,
+    cache=None,
 ):
     """Single implementation for seeded torchattacks PGD evaluation."""
-    model.eval()
-    accuracies, vectors = [], []
-    with ste_mode(model, use_ste):
-        for seed in seeds:
-            _seed_restart(seed)
-            attack = make_torchattack(
-                torchattacks.PGD,
-                model,
-                eps=eps,
-                alpha=alpha,
-                steps=steps,
-                random_start=random_start,
-            )
-            accuracy, vector = accuracy_under_attack(
-                model, loader, attack, return_vector=True
-            )
-            accuracies.append(accuracy)
-            vectors.append(vector)
-    return _aggregate_restarts("PGD", accuracies, vectors, return_vector)
+    key = AttackKey.create(
+        model_id=id(unwrap_model(model)), attack_name="PGD_RESULT", loader=loader,
+        epsilon=eps, alpha=alpha, steps=steps, seeds=seeds,
+        restarts=len(tuple(seeds)), use_ste=use_ste,
+        attack_parameters={"random_start": random_start},
+    )
+    def compute():
+        model.eval()
+        accuracies, vectors = [], []
+        with ste_mode(model, use_ste):
+            for seed in seeds:
+                _seed_restart(seed)
+                attack = make_torchattack(
+                    torchattacks.PGD, model, eps=eps, alpha=alpha, steps=steps,
+                    random_start=random_start,
+                )
+                accuracy, vector = accuracy_under_attack(
+                    model, loader, attack, return_vector=True
+                )
+                accuracies.append(accuracy)
+                vectors.append(vector)
+        return _aggregate_restarts("PGD", accuracies, vectors, True)
+    result = compute() if cache is None else cache.get_or_compute(key, compute)
+    return _copy_cached_result(result, return_vector)
 
 
 def run_pgd(
@@ -259,6 +274,7 @@ def run_pgd(
     random_start=PGD_RANDOM_START,
     seeds=SEEDS,
     return_vector=False,
+    cache=None,
 ):
     """Evaluate hard-round PGD with the canonical seeded restart policy.
 
@@ -276,11 +292,13 @@ def run_pgd(
         seeds=seeds,
         use_ste=False,
         return_vector=return_vector,
+        cache=cache,
     )
 
 
 def run_fgsm_pgd(
-    model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vectors=False, use_ste=False
+    model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vectors=False,
+    use_ste=False, cache=None
 ):
     """Run FGSM and multi-restart PGD, aggregating PGD by worst-case correctness.
 
@@ -303,7 +321,8 @@ def run_fgsm_pgd(
         out["FGSM"] = fgsm_acc
         pgd_out = (
             run_pgd(
-                model, loader, eps=eps, seeds=seeds, return_vector=return_vectors
+                model, loader, eps=eps, seeds=seeds, return_vector=return_vectors,
+                cache=cache,
             )
             if not use_ste
             else _run_seeded_pgd(
@@ -316,6 +335,7 @@ def run_fgsm_pgd(
                 seeds=seeds,
                 use_ste=True,
                 return_vector=return_vectors,
+                cache=cache,
             )
         )
         pgd_vectors = pgd_out.pop("_vectors", {})
@@ -386,24 +406,40 @@ def transfer_attack(
     eps=DEFAULT_EPS,
     return_vector=False,
     use_ste=False,
+    cache=None,
 ):
-    """Generate PGD examples on ``source_model`` and evaluate ``target_model``."""
-    with ste_mode(source_model, use_ste):
-        pgd = make_torchattack(
-            torchattacks.PGD,
-            source_model,
-            eps=eps,
-            alpha=PGD_ALPHA,
-            steps=PGD_STEPS,
-            random_start=PGD_RANDOM_START,
-        )
-        return accuracy_under_attack(
-            source_model,
-            loader,
-            pgd,
-            target_model=target_model,
-            return_vector=return_vector,
-        )
+    """Generate/cache FP32-source PGD examples and evaluate ``target_model``."""
+    key = AttackKey.create(
+        model_id=id(unwrap_model(source_model)),
+        attack_name="PGD_TRANSFER_ARTIFACTS",
+        loader=loader,
+        epsilon=eps,
+        alpha=PGD_ALPHA,
+        steps=PGD_STEPS,
+        use_ste=use_ste,
+        attack_parameters={"random_start": PGD_RANDOM_START},
+    )
+    if cache is None:
+        with ste_mode(source_model, use_ste):
+            pgd = make_torchattack(
+                torchattacks.PGD,
+                source_model,
+                eps=eps,
+                alpha=PGD_ALPHA,
+                steps=PGD_STEPS,
+                random_start=PGD_RANDOM_START,
+            )
+            batches = _cached_transfer_batches(cache, key, loader, pgd)
+    else:
+        def generate():
+            with ste_mode(source_model, use_ste):
+                pgd = make_torchattack(
+                    torchattacks.PGD, source_model, eps=eps, alpha=PGD_ALPHA,
+                    steps=PGD_STEPS, random_start=PGD_RANDOM_START,
+                )
+                return _cache_adversarial_batches(loader, pgd)
+        batches = cache.get_or_compute(key, generate)
+    return _evaluate_cached_batches(target_model, batches, return_vector)
 
 
 def transfer_attack_mim(
@@ -413,23 +449,39 @@ def transfer_attack_mim(
     eps=DEFAULT_EPS,
     return_vector=False,
     use_ste=False,
+    cache=None,
 ):
-    with ste_mode(source_model, use_ste):
-        mim = make_torchattack(
-            torchattacks.MIFGSM,
-            source_model,
-            eps=eps,
-            alpha=PGD_ALPHA,
-            steps=PGD_STEPS,
-            decay=MIFGSM_DECAY,
-        )
-        return accuracy_under_attack(
-            source_model,
-            loader,
-            mim,
-            target_model=target_model,
-            return_vector=return_vector,
-        )
+    key = AttackKey.create(
+        model_id=id(unwrap_model(source_model)),
+        attack_name="MIM_TRANSFER_ARTIFACTS",
+        loader=loader,
+        epsilon=eps,
+        alpha=PGD_ALPHA,
+        steps=PGD_STEPS,
+        use_ste=use_ste,
+        attack_parameters={"decay": MIFGSM_DECAY},
+    )
+    if cache is None:
+        with ste_mode(source_model, use_ste):
+            mim = make_torchattack(
+                torchattacks.MIFGSM,
+                source_model,
+                eps=eps,
+                alpha=PGD_ALPHA,
+                steps=PGD_STEPS,
+                decay=MIFGSM_DECAY,
+            )
+            batches = _cached_transfer_batches(cache, key, loader, mim)
+    else:
+        def generate():
+            with ste_mode(source_model, use_ste):
+                mim = make_torchattack(
+                    torchattacks.MIFGSM, source_model, eps=eps, alpha=PGD_ALPHA,
+                    steps=PGD_STEPS, decay=MIFGSM_DECAY,
+                )
+                return _cache_adversarial_batches(loader, mim)
+        batches = cache.get_or_compute(key, generate)
+    return _evaluate_cached_batches(target_model, batches, return_vector)
 
 
 def build_uap(
@@ -487,15 +539,48 @@ def _run_uap_attack(
 
 
 def run_uap_attack(model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES):
-    return _run_uap_attack(model, model, loader, eps=eps, max_images=max_images)
+    with ste_mode(model, False):
+        return _run_uap_attack(model, model, loader, eps=eps, max_images=max_images)
 
 
 def transfer_uap_attack(
-    source_model, target_model, loader, eps=DEFAULT_EPS, max_images=UAP_MAX_IMAGES
+    source_model,
+    target_model,
+    loader,
+    eps=DEFAULT_EPS,
+    max_images=UAP_MAX_IMAGES,
+    cache=None,
 ):
-    return _run_uap_attack(
-        source_model, target_model, loader, eps=eps, max_images=max_images
-    )
+    with ste_mode(source_model, False):
+        key = AttackKey.create(
+            model_id=id(unwrap_model(source_model)),
+            attack_name="UAP_TRANSFER_ARTIFACTS",
+            loader=loader,
+            epsilon=eps,
+            attack_parameters={
+                "delta": UAP_DELTA, "max_iter": UAP_MAX_ITER,
+                "deepfool_steps": UAP_DEEPFOOL_STEPS,
+                "overshoot": UAP_OVERSHOOT, "max_images": max_images,
+            },
+        )
+        if cache is None:
+            v = build_uap(source_model, loader, eps=eps, max_images=max_images)
+            clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+
+            def apply_uap(x, _y):
+                return torch.max(torch.min(x + v, clip_max), clip_min)
+
+            batches = _cached_transfer_batches(cache, key, loader, apply_uap)
+        else:
+            def generate():
+                v = build_uap(source_model, loader, eps=eps, max_images=max_images)
+                clip_min, clip_max = CLIP_MIN.to(device), CLIP_MAX.to(device)
+                return _cache_adversarial_batches(
+                    loader,
+                    lambda x, _y: torch.max(torch.min(x + v, clip_max), clip_min),
+                )
+            batches = cache.get_or_compute(key, generate)
+    return _evaluate_cached_batches(target_model, batches)
 
 
 def projected_pgd_attack(x, y, eps, alpha, steps, grad_fn):
@@ -573,23 +658,27 @@ def run_bpda(
     return_vector=False,
     alpha=PGD_ALPHA,
     steps=PGD_STEPS,
+    cache=None,
 ):
     """Evaluate BPDA-PGD with seed-level worst-case correctness aggregation."""
-    vectors, accuracies = [], []
-    for seed in seeds:
-        _seed_restart(seed)
-        accuracy, vector = _run_bpda_once(
-            model,
-            loader,
-            eps,
-            n_restarts,
-            alpha=alpha,
-            steps=steps,
-            return_vector=True,
-        )
-        accuracies.append(accuracy)
-        vectors.append(vector)
-    return _aggregate_restarts("BPDA_PGD", accuracies, vectors, return_vector)
+    key = AttackKey.create(
+        model_id=id(unwrap_model(model)), attack_name="BPDA_PGD_RESULT", loader=loader,
+        epsilon=eps, alpha=alpha, steps=steps, seeds=seeds,
+        restarts=n_restarts, use_ste=True,
+    )
+    def compute():
+        vectors, accuracies = [], []
+        for seed in seeds:
+            _seed_restart(seed)
+            accuracy, vector = _run_bpda_once(
+                model, loader, eps, n_restarts, alpha=alpha, steps=steps,
+                return_vector=True,
+            )
+            accuracies.append(accuracy)
+            vectors.append(vector)
+        return _aggregate_restarts("BPDA_PGD", accuracies, vectors, True)
+    result = compute() if cache is None else cache.get_or_compute(key, compute)
+    return _copy_cached_result(result, return_vector)
 
 
 def adaptive_pgd_attack(
@@ -644,7 +733,7 @@ def run_eot_pgd(model, loader, eps=DEFAULT_EPS, eot_samples=ADAPTIVE_EOT_SAMPLES
                 loss = loss + F.cross_entropy(base_model(noisy), labels)
             return loss / eot_samples
 
-        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps, use_ste=True)
 
     return {"EOT_PGD": evaluate_normalized_attack(model, loader, attack)}
 
@@ -664,7 +753,7 @@ def run_adaptive_guardrail(
             ).mean()
             return F.cross_entropy(logits, labels) - lam * guardrail_penalty
 
-        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps, use_ste=True)
 
     return {"Adaptive_Guardrail": evaluate_normalized_attack(model, loader, attack)}
 
@@ -681,7 +770,7 @@ def run_adaptive_detect_guard(
             detector_penalty = F.cross_entropy(defense_model.detector(x_adv), benign)
             return F.cross_entropy(logits, labels) - lam * detector_penalty
 
-        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps)
+        return adaptive_pgd_attack(model, x, y, loss_fn, eps=eps, use_ste=True)
 
     return {"Adaptive_DetectGuard": evaluate_normalized_attack(model, loader, attack)}
 
@@ -1118,17 +1207,25 @@ def random_noise_attack(
 
 
 def run_random_noise_seeded(
-    model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vector=False
+    model, loader, eps=DEFAULT_EPS, seeds=SEEDS, return_vector=False, cache=None
 ):
-    accuracies, vectors = [], []
-    for seed in seeds:
-        _seed_restart(seed)
-        accuracy, vector = random_noise_attack(
-            model, loader, eps=eps, seed=seed, return_vector=True
-        )
-        accuracies.append(accuracy)
-        vectors.append(vector)
-    return _aggregate_restarts("Random_Noise", accuracies, vectors, return_vector)
+    key = AttackKey.create(
+        model_id=id(unwrap_model(model)), attack_name="RANDOM_NOISE_RESULT",
+        loader=loader, epsilon=eps, seeds=seeds, restarts=len(tuple(seeds)),
+        attack_parameters={"distribution": "uniform_linf"},
+    )
+    def compute():
+        accuracies, vectors = [], []
+        for seed in seeds:
+            _seed_restart(seed)
+            accuracy, vector = random_noise_attack(
+                model, loader, eps=eps, seed=seed, return_vector=True
+            )
+            accuracies.append(accuracy)
+            vectors.append(vector)
+        return _aggregate_restarts("Random_Noise", accuracies, vectors, True)
+    result = compute() if cache is None else cache.get_or_compute(key, compute)
+    return _copy_cached_result(result, return_vector)
 
 
 def pgd_steps_ablation(
@@ -1261,7 +1358,8 @@ def confidence_margin_diagnostic(
 
 
 def run_epsilon_sweep_for_model(
-    model, loader, name, epsilons, count_quant_layers_fn=None, safe_set=None
+    model, loader, name, epsilons, count_quant_layers_fn=None, safe_set=None,
+    cache=None,
 ):
     """Evaluate epsilon-sweep metrics with the main suite implementations.
 
@@ -1297,7 +1395,7 @@ def run_epsilon_sweep_for_model(
         pgd = safe_set(
             {},
             "result",
-            lambda: run_pgd(model, loader, eps=eps, seeds=SEEDS),
+            lambda: run_pgd(model, loader, eps=eps, seeds=SEEDS, cache=cache),
             "PGD (hard-round) sweep failed",
             context=context,
         )
@@ -1306,7 +1404,9 @@ def run_epsilon_sweep_for_model(
         noise = safe_set(
             {},
             "result",
-            lambda: run_random_noise_seeded(model, loader, eps=eps, seeds=SEEDS),
+            lambda: run_random_noise_seeded(
+                model, loader, eps=eps, seeds=SEEDS, cache=cache
+            ),
             "random_noise sweep failed",
             context=context,
         )
@@ -1316,7 +1416,9 @@ def run_epsilon_sweep_for_model(
             bpda = safe_set(
                 {},
                 "result",
-                lambda: run_bpda(model, loader, eps=eps, n_restarts=1, seeds=SEEDS),
+                lambda: run_bpda(
+                    model, loader, eps=eps, n_restarts=1, seeds=SEEDS, cache=cache
+                ),
                 "BPDA sweep failed",
                 context=context,
             )
