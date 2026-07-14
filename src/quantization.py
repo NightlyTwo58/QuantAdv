@@ -261,6 +261,27 @@ def get_ste_mode(model):
               if hasattr(m, "bits") and hasattr(m, "use_ste")}
     return None if not values else next(iter(values)) if len(values) == 1 else "mixed"
 
+class CompressedInputModel(nn.Module):
+    """Wrap a classifier with pixel-space downsample/bit-depth-reduce/upsample compression."""
+
+    def __init__(self, model, size=COMPRESS_IMAGE_SIZE, bits=COMPRESS_IMAGE_BITS,
+                 mode=COMPRESS_IMAGE_MODE):
+        super().__init__()
+        self.model = model
+        self.size = size
+        self.bits = bits
+        self.mode = mode
+        self.align_corners = COMPRESS_IMAGE_ALIGN_CORNERS if mode != "nearest" else None
+
+    def forward(self, x):
+        pixels = (x * DATASET_STD.to(x.device) + DATASET_MEAN.to(x.device)).clamp(0.0, 1.0)
+        pixels = F.interpolate(pixels, size=(self.size, self.size), mode=self.mode,
+                                align_corners=self.align_corners)
+        pixels = F.interpolate(pixels, size=(DATASET_IMAGE_SIZE, DATASET_IMAGE_SIZE),
+                                mode=self.mode, align_corners=self.align_corners)
+        levels = float(2 ** self.bits - 1)
+        pixels = torch.round(pixels.clamp(0.0, 1.0) * levels).div(levels)
+        return self.model((pixels - DATASET_MEAN.to(x.device)) / DATASET_STD.to(x.device))
 
 @contextmanager
 def ste_mode(model, flag):
