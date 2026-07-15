@@ -1055,8 +1055,74 @@ def main():
     """Run the command-line entry point for this module."""
     check_environment()
     finetune_loader, eval_loader = get_dataloaders()
-    model_registry = {}
+    if os.path.exists(RESULTS_CSV):
+        df_results = report_data.read_table(RESULTS_CSV)
+        done = set(
+            df_results.loc[
+                df_results.get(
+                    "clean_acc_n", pd.Series(index=df_results.index)
+                ).notna(),
+                "model",
+            ].astype(str)
+        )
+    else:
+        df_results = pd.DataFrame(columns=["model"])
+        done = set()
+    if os.path.exists(PERFORMANCE_CSV):
+        existing_run_metrics = pd.read_csv(PERFORMANCE_CSV)
+        run_metrics = (
+            existing_run_metrics.to_dict("records")
+            if "run_seconds" in existing_run_metrics.columns
+            else []
+        )
+    else:
+        run_metrics = []
+    if RUN_EPSILON_SWEEP and os.path.exists(SWEEP_CSV):
+        df_sweep = pd.read_csv(SWEEP_CSV)
+        sweep_done = completed_sweep_keys(df_sweep)
+    else:
+        df_sweep = pd.DataFrame()
+        sweep_done = set()
+    chunk_model_names = []
+    dither_rows = []
+    defense_summary_frames = []
+
+    def run_pending_epsilon_sweep(name, model):
+        """Run an epsilon sweep for a model that still needs one."""
+        nonlocal df_sweep, sweep_done
+        if not RUN_EPSILON_SWEEP:
+            return
+        pending_eps = [
+            eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done
+        ]
+        if not pending_eps:
+            print(f"  Skipping epsilon sweep for {name} (already done)")
+            return
+        print(f"\nSweeping {name} ...")
+
+        def save_epsilon_sweep():
+            nonlocal df_sweep, sweep_done
+            rows = run_epsilon_sweep_for_model_wrapped(
+                model, eval_loader, name, pending_eps, attack_cache=attack_cache
+            )
+            if rows:
+                df_sweep = report_data.upsert_table(
+                    SWEEP_CSV, pd.DataFrame(rows), ["model", "epsilon"]
+                )
+                sweep_done = completed_sweep_keys(df_sweep)
+
+        safe_call(
+            save_epsilon_sweep,
+            "epsilon sweep failed",
+            context=name,
+            show_traceback=True,
+        )
+
     for arch_key in PRETRAINED_NAMES:
+        # Keep only one architecture's family resident at a time.  References
+        # among variants still keep their shared FP32 baseline alive as needed.
+        model_registry = {}
+        attack_cache = AttackResultCache()
         print(f"\n>>> {arch_key} <<<")
         try:
             fp32 = load_pretrained(arch_key)
@@ -1072,6 +1138,7 @@ def main():
             acc = sanity_check_accuracy(fp32, eval_loader)
             print(f"  loaded pretrained {arch_key}, clean acc: {acc:.3f}")
             model_registry[f"{arch_key}_FP32"] = (fp32, None)
+            torch.cuda.empty_cache()
         except Exception as e:
             print(f"  [FAIL] could not load {arch_key}: {e}")
             traceback.print_exc()
@@ -1107,6 +1174,7 @@ def main():
                 arch_key, fp32, int8_qat, "int8 QAT", fp32_layer_names
             )
             model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
+            torch.cuda.empty_cache()
         except Exception as e:
             print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
             traceback.print_exc()
@@ -1122,16 +1190,21 @@ def main():
                 arch_key, fp32, int4_qat, "int4 QAT", fp32_layer_names
             )
             model_registry[f"{arch_key}_int4_QAT"] = (int4_qat, fp32)
+            torch.cuda.empty_cache()
         except Exception as e:
             print(f"  [FAIL] int4 QAT for {arch_key}: {e}")
             traceback.print_exc()
             raise
         if QUANTIZATION_DEBUG_ONLY:
             print(
-                "\nQUANTIZATION_DEBUG_ONLY=True; exiting before defenses, attacks, sweeps, and plots."
+                "\nQUANTIZATION_DEBUG_ONLY=True; skipping defenses, attacks, sweeps, and plots."
             )
-            print("Registry built:", list(model_registry.keys()))
-            return
+            print("Architecture registry built:", list(model_registry.keys()))
+            del model_registry, attack_cache
+            fp32 = int8_ptq = int4_ptq = int8_qat = int4_qat = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
         try:
             model_registry[f"{arch_key}_FP32_Compressed"] = (
                 with_image_compression(fp32),
@@ -1184,176 +1257,93 @@ def main():
                     chaotic_int8_qat,
                     fp32,
                 )
+                torch.cuda.empty_cache()
             except Exception as e:
                 print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
                 traceback.print_exc()
-    if RUN_DEFENSE_SUITE:
-        try:
-            model_registry, df_defense_summary = run_defense_suite(
-                model_registry, finetune_loader, eval_loader
-            )
-            if not df_defense_summary.empty:
-                print(
-                    "\nDefense summary (guardrail/detector flag rates, certified accuracy):"
+        if RUN_DEFENSE_SUITE:
+            try:
+                model_registry, df_defense_summary = run_defense_suite(
+                    model_registry, finetune_loader, eval_loader
                 )
-                print(df_defense_summary.to_string(index=False))
-        except Exception as e:
-            print(f"  [FAIL] run_defense_suite failed: {e}")
-            traceback.print_exc()
-    if RUN_CHAOTIC_DITHER_SWEEP:
-        dither_rows = []
-        for arch_key in PRETRAINED_NAMES:
-            entry = model_registry.get(f"{arch_key}_FP32")
-            if entry is not None:
-                dither_rows.extend(
-                    run_chaotic_dither_sweep(entry[0], eval_loader, arch_key)
-                )
-        pd.DataFrame(dither_rows).to_csv(CHAOTIC_DITHER_SWEEP_CSV, index=False)
-    chunk_model_names = []
-    if RUN_CHUNK_QUANTIZATION:
-        for arch_key in PRETRAINED_NAMES:
-            entry = model_registry.get(f"{arch_key}_FP32")
-            if entry is None:
-                continue
+                if not df_defense_summary.empty:
+                    defense_summary_frames.append(df_defense_summary)
+                    print("\nDefense summary:")
+                    print(df_defense_summary.to_string(index=False))
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"  [FAIL] run_defense_suite failed for {arch_key}: {e}")
+                traceback.print_exc()
+        if RUN_CHAOTIC_DITHER_SWEEP:
+            dither_rows.extend(run_chaotic_dither_sweep(fp32, eval_loader, arch_key))
+        if RUN_CHUNK_QUANTIZATION:
             chunk_model_names.append(arch_key)
             out_path = csv_path(arch_key, "chunk_quant")
             if os.path.exists(out_path):
-                print(
-                    f"Skipping chunk quantization for {arch_key} (already in {out_path})"
-                )
-                continue
-            print(f"\nChunk quantization sweep for {arch_key} ...")
-            try:
-                rows = run_chunk_quantization_attacks(
-                    entry[0],
-                    eval_loader,
-                    arch_key,
-                    bits=8,
-                    n_chunks=CHUNK_QUANT_NUM_CHUNKS,
-                    eps=DEFAULT_EPS,
-                )
-                report_data.upsert_table(
-                    out_path, pd.DataFrame(rows), ["model", "chunk_id"]
-                )
-                print(f"Chunk quantization results saved to {out_path}")
-            except Exception as e:
-                print(f"  [FAIL] chunk quantization sweep failed for {arch_key}: {e}")
-                traceback.print_exc()
-    print("\nRegistry built:", list(model_registry.keys()))
-    for k in model_registry:
-        m, r = model_registry[k]
-        model_registry[k] = (parallelize(m), parallelize(r) if r else None)
-    if os.path.exists(RESULTS_CSV):
-        df_results = report_data.read_table(RESULTS_CSV)
-        done = set(
-            df_results.loc[
-                df_results.get(
-                    "clean_acc_n", pd.Series(index=df_results.index)
-                ).notna(),
-                "model",
-            ].astype(str)
-        )
-    else:
-        df_results = pd.DataFrame(columns=["model"])
-        done = set()
-    if os.path.exists(PERFORMANCE_CSV):
-        existing_run_metrics = pd.read_csv(PERFORMANCE_CSV)
-        run_metrics = (
-            existing_run_metrics.to_dict("records")
-            if "run_seconds" in existing_run_metrics.columns
-            else []
-        )
-    else:
-        run_metrics = []
-    if RUN_EPSILON_SWEEP and os.path.exists(SWEEP_CSV):
-        df_sweep = pd.read_csv(SWEEP_CSV)
-        sweep_done = completed_sweep_keys(df_sweep)
-    else:
-        df_sweep = pd.DataFrame()
-        sweep_done = set()
-
-    attack_cache = AttackResultCache()
-
-    def run_pending_epsilon_sweep(name, model):
-        """Run an epsilon sweep for a model that still needs one."""
-        nonlocal df_sweep, sweep_done
-        if not RUN_EPSILON_SWEEP:
-            return
-        pending_eps = [
-            eps for eps in SWEEP_EPSILONS if (name, round(eps, 6)) not in sweep_done
-        ]
-        if not pending_eps:
-            print(f"  Skipping epsilon sweep for {name} (already done)")
-            return
-
-        print(f"\nSweeping {name} ...")
-
-        def save_epsilon_sweep():
-            """Persist epsilon-sweep diagnostics for pending models."""
-            nonlocal df_sweep, sweep_done
-            rows = run_epsilon_sweep_for_model_wrapped(
-                model, eval_loader, name, pending_eps, attack_cache=attack_cache
-            )
-            if rows:
-                new_sweep = pd.DataFrame(rows)
-                df_sweep = report_data.upsert_table(
-                    SWEEP_CSV, new_sweep, ["model", "epsilon"]
-                )
-                sweep_done = completed_sweep_keys(df_sweep)
-
-        safe_call(
-            save_epsilon_sweep,
-            "epsilon sweep failed",
-            context=name,
-            show_traceback=True,
-        )
-
-    for name, (model, ref) in list(model_registry.items()):
-        if name in done:
-            print(f"Skipping {name} (already in {RESULTS_CSV})")
-            run_pending_epsilon_sweep(name, model)
-            continue
-        print(f"\nEvaluating {name} ...")
-        monitor = ResourceMonitor(model, name)
-        try:
-            if RECORD_RUN_METRICS:
-                with monitor:
-                    res = run_suite(
-                        model,
-                        eval_loader,
-                        name,
-                        fp32_ref=ref,
-                        attack_cache=attack_cache,
-                    )
+                print(f"Skipping chunk quantization for {arch_key} (already in {out_path})")
             else:
-                res = run_suite(
-                    model,
-                    eval_loader,
-                    name,
-                    fp32_ref=ref,
-                    attack_cache=attack_cache,
-                )
-        except Exception as e:
-            print(f"  [FAIL] run_suite failed for {name}: {e}")
-            traceback.print_exc()
-            res = {"model": name}
-        finally:
-            if RECORD_RUN_METRICS and monitor.metrics is not None:
-                run_metrics = [
-                    row for row in run_metrics if str(row.get("model")) != name
-                ]
-                run_metrics.append(monitor.metrics)
-                report_data.upsert_table(
-                    PERFORMANCE_CSV, pd.DataFrame([monitor.metrics]), ["model"]
-                )
-                print("Run metrics:")
-                print(pd.DataFrame([monitor.metrics]).to_string(index=False))
-        new_row = pd.DataFrame([res])
-        df_results = report_data.upsert_table(RESULTS_CSV, new_row, ["model"])
-        print("Result:")
-        print(new_row.to_string(index=False))
-        run_pending_epsilon_sweep(name, model)
-        print("-" * 100)
+                print(f"\nChunk quantization sweep for {arch_key} ...")
+                try:
+                    rows = run_chunk_quantization_attacks(
+                        fp32, eval_loader, arch_key, bits=8,
+                        n_chunks=CHUNK_QUANT_NUM_CHUNKS, eps=DEFAULT_EPS,
+                    )
+                    report_data.upsert_table(out_path, pd.DataFrame(rows), ["model", "chunk_id"])
+                except Exception as e:
+                    print(f"  [FAIL] chunk quantization sweep failed for {arch_key}: {e}")
+                    traceback.print_exc()
+
+        print("\nArchitecture registry built:", list(model_registry.keys()))
+        model_registry = {
+            name: (parallelize(model), parallelize(ref) if ref else None)
+            for name, (model, ref) in model_registry.items()
+        }
+        for name, (model, ref) in model_registry.items():
+            if name in done:
+                print(f"Skipping {name} (already in {RESULTS_CSV})")
+                run_pending_epsilon_sweep(name, model)
+                continue
+            print(f"\nEvaluating {name} ...")
+            monitor = ResourceMonitor(model, name)
+            try:
+                if RECORD_RUN_METRICS:
+                    with monitor:
+                        res = run_suite(model, eval_loader, name, fp32_ref=ref, attack_cache=attack_cache)
+                else:
+                    res = run_suite(model, eval_loader, name, fp32_ref=ref, attack_cache=attack_cache)
+            except Exception as e:
+                print(f"  [FAIL] run_suite failed for {name}: {e}")
+                traceback.print_exc()
+                res = {"model": name}
+            finally:
+                if RECORD_RUN_METRICS and monitor.metrics is not None:
+                    run_metrics = [row for row in run_metrics if str(row.get("model")) != name]
+                    run_metrics.append(monitor.metrics)
+                    report_data.upsert_table(PERFORMANCE_CSV, pd.DataFrame([monitor.metrics]), ["model"])
+            new_row = pd.DataFrame([res])
+            df_results = report_data.upsert_table(RESULTS_CSV, new_row, ["model"])
+            print("Result:")
+            print(new_row.to_string(index=False))
+            run_pending_epsilon_sweep(name, model)
+            print("-" * 100)
+
+        # Dropping this architecture-local registry (and cache) releases its
+        # model family before the next architecture is constructed.
+        del model_registry, attack_cache
+        fp32 = int8_ptq = int4_ptq = int8_qat = int4_qat = None
+        chaotic_int8_ptq = chaotic_int4_ptq = compressed_chaotic_int8 = None
+        chaotic_int8_qat = model = ref = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if QUANTIZATION_DEBUG_ONLY:
+        return
+    if dither_rows:
+        pd.DataFrame(dither_rows).to_csv(CHAOTIC_DITHER_SWEEP_CSV, index=False)
+    if defense_summary_frames:
+        pd.concat(defense_summary_frames, ignore_index=True).to_csv(
+            defense_summary_csv_path(), index=False
+        )
     print("\nFinal results:")
     print(df_results)
     adaptive_cols = [
