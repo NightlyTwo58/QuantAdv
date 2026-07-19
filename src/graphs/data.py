@@ -25,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from ..config import *
+from .. config import *
 from .. import stats as qstats
 
 def csv_path(model_name, type):
@@ -196,7 +196,9 @@ def plot_summary_results(df_results: pd.DataFrame, output: Path = PLOT_PNG) -> N
         return
 
     plt.figure(figsize=SUMMARY_PLOT_FIGSIZE)
-    sns.barplot(data=df_plot, x="model", y="Accuracy", hue="Attack")
+    sns.barplot(
+        data=df_plot, x="model", y="Accuracy", hue="Attack", palette=ATTACK_PALETTE
+    )
     plt.xticks(rotation=SUMMARY_XTICK_ROTATION, ha="right")
     plt.title("Model Accuracy under Various Adversarial Attacks")
     plt.ylim(0, PLOT_MAX_ACCURACY)
@@ -225,6 +227,8 @@ def plot_epsilon_sweep_curves(
         var_name="Attack",
         value_name="Accuracy",
     )
+    quantized = df_long["model"].astype(str).str.contains(r"_int\d+_", case=False)
+    df_long = df_long[~(quantized & df_long["Attack"].eq("PGD_acc"))]
     df_long = df_long.dropna(subset=["Accuracy"])
     if df_long.empty:
         return
@@ -530,6 +534,7 @@ def plot_confidence_margin_diagnostic(
             )
         ax.set_title(model)
         ax.set_xlabel("Top1 - Top2 Softmax Margin")
+        ax.set_ylabel("Probability Density")
         ax.legend(fontsize=PLOT_LEGEND_FONT_SIZE)
         ax.grid(linestyle="--", alpha=PLOT_GRID_ALPHA)
 

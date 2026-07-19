@@ -969,11 +969,6 @@ def run_defense_suite(model_registry, finetune_loader, eval_loader):
     return model_registry, df_defense
 
 
-def _palette_for(values):
-    """Choose a plotting palette sized to the provided values."""
-    return {v: ATTACK_PALETTE[v] for v in values if v in ATTACK_PALETTE}
-
-
 def parallelize(model):
     """Wrap a model in DataParallel when multiple CUDA devices are available."""
     if torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel):
