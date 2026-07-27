@@ -349,7 +349,8 @@ def plot_layerwise_grad_profile(
     df_layer: pd.DataFrame, output: Path = LAYERWISE_PLOT_PNG
 ) -> None:
     """Plot per-layer gradient magnitudes for diagnosed models."""
-    required = {"model", "layer", "grad_norm_hard", "grad_norm_ste"}
+    required = {"model", "layer", "grad_norm_ste"}
+    # grad_norm_hard
     if df_layer is None or df_layer.empty or not required.issubset(df_layer.columns):
         return
 
@@ -367,7 +368,7 @@ def plot_layerwise_grad_profile(
         df = df_layer[df_layer["model"] == model].reset_index(drop=True)
         ax = axes[i // cols][i % cols]
         x = np.arange(len(df))
-        ax.plot(x, df["grad_norm_hard"], marker="o", label="hard-round")
+        # ax.plot(x, df["grad_norm_hard"], marker="o", label="hard-round")
         ax.plot(x, df["grad_norm_ste"], marker="o", label="STE")
         ax.set_yscale("log")
         ax.set_xticks(x)
@@ -788,6 +789,12 @@ def _plot_model_subgraphs(df: pd.DataFrame, table_name: str, output_dir: Path) -
 
 def plot_performance(df: pd.DataFrame, output: Path = PERFORMANCE_PLOT_PNG) -> None:
     """Plot performance and resource metrics for evaluated models."""
+    labels = {
+        "run_seconds": ("Run time", "Seconds"),
+        "rss_peak_mib": ("Peak RSS", "MiB"),
+        "cuda_allocated_peak_mib": ("Peak CUDA allocation", "MiB"),
+        "average_cpu_cores_used": ("Average CPU usage", "CPU cores"),
+    }
     columns = [
         c
         for c in (
@@ -812,6 +819,10 @@ def plot_performance(df: pd.DataFrame, output: Path = PERFORMANCE_PLOT_PNG) -> N
         col_wrap=2,
         sharey=False,
     )
+    for metric, ax in grid.axes_dict.items():
+        title, unit = labels[metric]
+        ax.set_title(title)
+        ax.set_ylabel(unit)
     grid.set_xticklabels(rotation=45, ha="right")
     grid.savefig(output, dpi=PLOT_DPI, bbox_inches=PLOT_BBOX_INCHES)
     plt.close(grid.fig)
@@ -1009,7 +1020,7 @@ PLOT_SPECS = (
     PlotSpec("results", plot_summary_results, PLOT_PNG),
     PlotSpec("sweep", plot_epsilon_sweep_curves, SWEEP_PLOT_PNG),
     PlotSpec("ablation", plot_pgd_steps_ablation, ABLATION_PLOT_PNG),
-    PlotSpec("trajectory", plot_pgd_trajectory, TRAJECTORY_PLOT_PNG),
+    # PlotSpec("trajectory", plot_pgd_trajectory, TRAJECTORY_PLOT_PNG),
     PlotSpec("layerwise", plot_layerwise_grad_profile, LAYERWISE_PLOT_PNG),
     PlotSpec(
         "component_ablation", plot_component_ablation, COMPONENT_ABLATION_PLOT_PNG
@@ -1019,7 +1030,7 @@ PLOT_SPECS = (
     PlotSpec("results", plot_results_heatmap, HEATMAP_PLOT_PNG),
     PlotSpec("performance", plot_performance, PERFORMANCE_PLOT_PNG),
     PlotSpec("dither", plot_dither_sweep, DITHER_PLOT_PNG),
-    PlotSpec("chunk_quant", plot_chunk_quantization_attacks, CHUNK_QUANT_PLOT_PNG),
+    # PlotSpec("chunk_quant", plot_chunk_quantization_attacks, CHUNK_QUANT_PLOT_PNG),
     PlotSpec("defense", plot_defense_comparison, DEFENSE_PLOT_PNG),
 )
 
