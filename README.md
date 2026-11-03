@@ -55,11 +55,11 @@ integer model.
 $$
 s_{\mathrm{weight}} =
 \max\left(
-\frac{2\max(|x_{\min}|,|x_{\max}|)}
-{q_{\max}-q_{\min}},
+\frac{2\max(|x_{\mathrm{min}}|,|x_{\mathrm{max}}|)}
+{q_{\mathrm{max}}-q_{\mathrm{min}}},
 \mathrm{QUANT\_SCALE\_MIN}
 \right),
-\qquad z=0.
+\qquad z=0
 $$
 
 ### Even More Notes
