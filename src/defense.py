@@ -18,7 +18,7 @@ import torchvision.transforms as T
 import torchattacks
 from torch.amp import autocast, GradScaler
 
-from config import *
+from .config import *
 
 
 def _cfg(name, default):

@@ -25,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from .. config import *
+from ..config import *
 from .. import stats as qstats
 
 def csv_path(model_name, type):

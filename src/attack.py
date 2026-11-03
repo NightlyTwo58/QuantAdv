@@ -20,11 +20,11 @@ import torch.nn.functional as F
 import torchattacks
 from autoattack import AutoAttack
 
-import defense as dfn
 from torch.amp import autocast
-from config import *
-from quantization import get_ste_mode, set_ste_mode, ste_mode
-from attack_cache import AttackKey, AttackResultCache
+from . import defense as dfn
+from .config import *
+from .quantization import get_ste_mode, set_ste_mode, ste_mode
+from .attack_cache import AttackKey, AttackResultCache
 
 
 def unwrap_model(model):

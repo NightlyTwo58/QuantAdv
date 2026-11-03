@@ -24,7 +24,7 @@ curl -O https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
 or set `DATASET_DOWNLOAD=true` in `./src/config.py`
 
 To run (and automatically generate visualizations)  
-`python src/QuantAdv.py`  
+`python -m src.QuantAdv`  
 
 To graph from incomplete results  
 `python -m src.graphs.combine`
@@ -53,11 +53,11 @@ arithmetic or measure the speed/memory gains of a deployed
 integer model.
 
 $$
-s_{\text{weight}} =
+s_{\mathrm{weight}} =
 \max\left(
-    \frac{2\max(|x_{\min}|,|x_{\max}|)}
-    {q_{\max}-q_{\min}},
-    \text{QUANT_SCALE_MIN}
+\frac{2\max(|x_{\min}|,|x_{\max}|)}
+{q_{\max}-q_{\min}},
+\mathrm{QUANT\_SCALE\_MIN}
 \right),
 \qquad z=0.
 $$

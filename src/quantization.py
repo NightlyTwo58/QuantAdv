@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torchao.quantization.qat import IntxFakeQuantizeConfig, IntxFakeQuantizer
 
-from config import *
+from .config import *
 
 WEIGHT = "weight"
 ACTIVATION = "activation"

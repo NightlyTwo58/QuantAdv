@@ -20,22 +20,20 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
 from pytorchcv.model_provider import get_model as ptcv_get_model
 
 import torchattacks
 from autoattack import AutoAttack
 
-import defense as dfn
-from src.graphs import data as report_data
-from src.graphs.data import csv_path, defense_summary_csv_path, json_path
-import stats as qstats
-
-from config import *
-from quantization import *
-from ResourceMonitor import ResourceMonitor
-from attack import *
-from attack_cache import AttackResultCache
+from . import stats as qstats
+from . import defense as dfn
+from .config import *
+from .quantization import *
+from .ResourceMonitor import ResourceMonitor
+from .attack import *
+from .attack_cache import AttackResultCache
+from .graphs import data as report_data
+from .graphs.data import csv_path, defense_summary_csv_path, json_path
 
 """QuantAdv experiment runner for quantization and adversarial robustness.
 
