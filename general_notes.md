@@ -1,0 +1,22 @@
+- ### Folders and Files
+- `src/QuantAdv.py`, Main runner: loads models/ data; builds variants; runs evaluations and optional analyses; saves resumable CSV/JSON results, statistics, performance metrics, and plots.
+- `src/config.py`, Central settings: CIFAR-100 preprocessing, 3 architectures (ResNet56, WRN-28-10, DenseNet-100), batch/sample sizes, attack parameters, plot settings, and feature switches.
+- `src/quantization.py`, Fake 8-/4-bit weight and activation quantization; PTQ/QAT; STE gradients; optional chaotic quantization/dither; quantize selected layer chunks; input compression.
+- `src/attack.py`, Clean/adversarial evaluation; FGSM, PGD, AutoAttack, CW, DeepFool, JSMA; BPDA/STE, EOT and adaptive attacks; transfer/MIM/UAP/surrogate attacks; NES, boundary attack, random noise; epsilon sweeps and PGD/margin/staircase diagnostics.
+- `src/defense.py`, Optional adversarial training, input sanitization, smoothing, guardrail and detector-based defenses, with evaluation helpers.
+- `src/attack_cache.py`, In-memory cache for attack results/adversarial batches, keyed by model, dataset indices, and attack settings.
+- `src/stats.py`, Binomial confidence intervals, correctness-vector saving, paired exact McNemar tests.
+- `src/ResourceMonitor.py`, Runtime, CPU, memory, and CUDA resource monitoring.
+- `graphs/data.py`, Combines partial per-model outputs, derives metrics, and produces summary plots/model subgraphs.
+- `graphs/combine.py`, CLI for recovering/combining results; supports `--data-dir`, `--no-plots`, `--quiet`.
+- `graphs/formaldata.py`, Groups metrics into consolidated figures for publication.
+- `src_old/`, Earlier modular implementation of config/data/model loading, attacks, defenses, diagnostics, experiment runner, result merging, and plots.
+- `archive/`, Older benchmark runner, notebook, custom ResNet20 and QAT code, plus a launcher.
+- `demo/`, Poster, example plots, and a brief document.
+- `data/`, `benchmarking/`, `models/`, CIFAR folders, Existing result/plot artifacts, benchmark outputs, pretrained weights, and local datasets. `.gitignore` excludes these, along with `.venv` and bytecode.
+- `README.md`, `requirements.txt`, `datasets.txt`, `Dockerfile`, Setup/run instructions, dependencies, dataset download notes, and container setup.
+
+### Configuration
+- `src/config.py`: FP32, int8/int4 (PTQ and QAT), image-compressed FP32. 5 seeds, $\varepsilon = 8/255$, PGD 20 steps, and AutoAttack. `QUANTIZATION_DEBUG_ONLY` can stop after model construction.
+  - **Enabled:** extra white-box, surrogate, and reverse-transfer attacks, PGD trajectory, layerwise gradients, confidence margins, component ablation, epsilon sweep, run metrics.
+  - **Disabled:** chaotic compression, UAP, boundary/NES, defense suite, chunk quantization, chaotic-dither sweep.
