@@ -1046,6 +1046,16 @@ def add_general_scores(df_results):
 
 def main():
     """Run the command-line entry point for this module."""
+    unknown_variants = set(MODEL_VARIANTS) - set(SUPPORTED_MODEL_VARIANTS)
+    if unknown_variants:
+        choices = ", ".join(SUPPORTED_MODEL_VARIANTS)
+        raise ValueError(
+            f"Unknown MODEL_VARIANTS: {sorted(unknown_variants)}. Supported: {choices}"
+        )
+    if len(MODEL_VARIANTS) != len(set(MODEL_VARIANTS)):
+        raise ValueError("MODEL_VARIANTS contains duplicate entries")
+    if not MODEL_VARIANTS:
+        raise ValueError("MODEL_VARIANTS must select at least one model variant")
     check_environment()
     finetune_loader, eval_loader = get_dataloaders()
     if os.path.exists(RESULTS_CSV):
@@ -1130,64 +1140,67 @@ def main():
                 )
             acc = sanity_check_accuracy(fp32, eval_loader)
             print(f"  loaded pretrained {arch_key}, clean acc: {acc:.3f}")
-            model_registry[f"{arch_key}_FP32"] = (fp32, None)
             torch.cuda.empty_cache()
         except Exception as e:
             print(f"  [FAIL] could not load {arch_key}: {e}")
             traceback.print_exc()
             continue
-        try:
-            int8_ptq = convert_to_quant(fp32, bits=8, quant_weight=True, quant_act=True)
-            verify_quantization_layers(
-                arch_key, fp32, int8_ptq, "int8 PTQ", fp32_layer_names
-            )
-            model_registry[f"{arch_key}_int8_PTQ"] = (int8_ptq, fp32)
-        except Exception as e:
-            print(f"  [FAIL] int8 PTQ for {arch_key}: {e}")
-            traceback.print_exc()
-            raise
-        try:
-            int4_ptq = convert_to_quant(fp32, bits=4, quant_weight=True, quant_act=True)
-            verify_quantization_layers(
-                arch_key, fp32, int4_ptq, "int4 PTQ", fp32_layer_names
-            )
-            model_registry[f"{arch_key}_int4_PTQ"] = (int4_ptq, fp32)
-        except Exception as e:
-            print(f"  [FAIL] int4 PTQ for {arch_key}: {e}")
-            traceback.print_exc()
-            raise
-        try:
-            int8_qat = prepare_qat(
-                fp32,
-                bits=8,
-                finetune_loader=finetune_loader,
-                epochs=QAT_MAIN_EPOCHS,
-            )
-            verify_quantization_layers(
-                arch_key, fp32, int8_qat, "int8 QAT", fp32_layer_names
-            )
-            model_registry[f"{arch_key}_int8_QAT"] = (int8_qat, fp32)
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  [FAIL] int8 QAT for {arch_key}: {e}")
-            traceback.print_exc()
-            raise
-        try:
-            int4_qat = prepare_qat(
-                fp32,
-                bits=4,
-                finetune_loader=finetune_loader,
-                epochs=QAT_MAIN_EPOCHS,
-            )
-            verify_quantization_layers(
-                arch_key, fp32, int4_qat, "int4 QAT", fp32_layer_names
-            )
-            model_registry[f"{arch_key}_int4_QAT"] = (int4_qat, fp32)
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  [FAIL] int4 QAT for {arch_key}: {e}")
-            traceback.print_exc()
-            raise
+        if "FP32" in MODEL_VARIANTS:
+            model_registry[f"{arch_key}_FP32"] = (fp32, None)
+
+        variant_specs = {
+            "int8_PTQ": (8, False, False, False),
+            "int4_PTQ": (4, False, False, False),
+            "int8_QAT": (8, True, False, False),
+            "int4_QAT": (4, True, False, False),
+            "chaotic_int8_PTQ": (8, False, True, False),
+            "chaotic_int4_PTQ": (4, False, True, False),
+            "chaotic_int8_PTQ_Compressed": (8, False, True, True),
+            "chaotic_int8_QAT": (8, True, True, False),
+        }
+        for variant in MODEL_VARIANTS:
+            if variant in ("FP32", "FP32_Compressed"):
+                if variant == "FP32_Compressed":
+                    try:
+                        model_registry[f"{arch_key}_{variant}"] = (
+                            with_image_compression(fp32),
+                            fp32,
+                        )
+                    except Exception as exc:
+                        print(f"  [FAIL] {variant} for {arch_key}: {exc}")
+                        traceback.print_exc()
+                        raise
+                continue
+            bits, qat, chaotic, compressed = variant_specs[variant]
+            try:
+                if qat:
+                    candidate = prepare_qat(
+                        fp32,
+                        bits=bits,
+                        finetune_loader=finetune_loader,
+                        epochs=QAT_MAIN_EPOCHS,
+                        chaotic=chaotic,
+                    )
+                elif chaotic:
+                    candidate = convert_to_chaotic_quant(
+                        fp32, bits=bits, quant_weight=True, quant_act=True
+                    )
+                else:
+                    candidate = convert_to_quant(
+                        fp32, bits=bits, quant_weight=True, quant_act=True
+                    )
+                verify_quantization_layers(
+                    arch_key, fp32, candidate, variant, fp32_layer_names
+                )
+                if compressed:
+                    candidate = with_image_compression(candidate)
+                model_registry[f"{arch_key}_{variant}"] = (candidate, fp32)
+                if qat:
+                    torch.cuda.empty_cache()
+            except Exception as exc:
+                print(f"  [FAIL] {variant} for {arch_key}: {exc}")
+                traceback.print_exc()
+                raise
         if QUANTIZATION_DEBUG_ONLY:
             print(
                 "\nQUANTIZATION_DEBUG_ONLY=True; skipping defenses, attacks, sweeps, and plots."
@@ -1198,62 +1211,6 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             continue
-        try:
-            model_registry[f"{arch_key}_FP32_Compressed"] = (
-                with_image_compression(fp32),
-                fp32,
-            )
-        except Exception as e:
-            print(f"  [FAIL] compressed FP32 for {arch_key}: {e}")
-        if RUN_CHAOTIC_COMPRESS:
-            try:
-                chaotic_int8_ptq = convert_to_chaotic_quant(
-                    fp32, bits=8, quant_weight=True, quant_act=True
-                )
-                model_registry[f"{arch_key}_chaotic_int8_PTQ"] = (
-                    chaotic_int8_ptq,
-                    fp32,
-                )
-            except Exception as e:
-                print(f"  [FAIL] chaotic int8 PTQ for {arch_key}: {e}")
-            try:
-                chaotic_int4_ptq = convert_to_chaotic_quant(
-                    fp32, bits=4, quant_weight=True, quant_act=True
-                )
-                model_registry[f"{arch_key}_chaotic_int4_PTQ"] = (
-                    chaotic_int4_ptq,
-                    fp32,
-                )
-            except Exception as e:
-                print(f"  [FAIL] chaotic int4 PTQ for {arch_key}: {e}")
-            try:
-                compressed_chaotic_int8 = with_image_compression(
-                    convert_to_chaotic_quant(
-                        fp32, bits=8, quant_weight=True, quant_act=True
-                    )
-                )
-                model_registry[f"{arch_key}_chaotic_int8_PTQ_Compressed"] = (
-                    compressed_chaotic_int8,
-                    fp32,
-                )
-            except Exception as e:
-                print(f"  [FAIL] compressed chaotic int8 PTQ for {arch_key}: {e}")
-            try:
-                chaotic_int8_qat = prepare_qat(
-                    fp32,
-                    bits=8,
-                    finetune_loader=finetune_loader,
-                    epochs=QAT_MAIN_EPOCHS,
-                    chaotic=True,
-                )
-                model_registry[f"{arch_key}_chaotic_int8_QAT"] = (
-                    chaotic_int8_qat,
-                    fp32,
-                )
-                torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"  [FAIL] chaotic int8 QAT for {arch_key}: {e}")
-                traceback.print_exc()
         if RUN_DEFENSE_SUITE:
             try:
                 model_registry, df_defense_summary = run_defense_suite(
